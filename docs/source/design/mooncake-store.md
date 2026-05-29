@@ -103,8 +103,16 @@ struct ReplicateConfig {
     bool with_soft_pin{false};               // Whether to enable soft pin mechanism for this object
     bool with_hard_pin{false};               // Whether to enable hard pin (never evicted)
     std::string preferred_segment{};         // Preferred segment for allocation
+    std::optional<std::vector<std::string>> group_ids{};  // Optional per-key metadata routing groups
 };
 ```
+
+The `group_ids` field is optional. When it is set, each entry maps to the key
+at the same position in the write request; for batch writes, the number of
+group IDs must match the number of keys. Empty string (`""`) leaves the
+corresponding key ungrouped. Group routing is tenant-scoped in the Master, so
+different tenants can reuse the same group ID without sharing metadata routing
+or lease-refresh state.
 
 ### Upsert
 
@@ -781,6 +789,7 @@ struct ReplicateConfig {
     bool with_soft_pin{false};               // Whether to enable soft pin mechanism for this object
     bool with_hard_pin{false};               // Whether to enable hard pin (never evicted)
     std::string preferred_segment{};         // Preferred segment for allocation
+    std::optional<std::vector<std::string>> group_ids{};  // Optional per-key metadata routing groups
 };
 ```
 

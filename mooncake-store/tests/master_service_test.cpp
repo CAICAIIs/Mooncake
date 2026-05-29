@@ -108,6 +108,28 @@ class MasterServiceTest : public ::testing::Test {
         return key + "_fallback_group";
     }
 
+    size_t LegacyShardIndexForTest(MasterService& service,
+                                   const std::string& key) const {
+        return service.getShardIndex(key);
+    }
+
+    size_t GroupShardIndexForTest(MasterService& service,
+                                  const std::string& tenant_id,
+                                  const std::string& group_id) const {
+        return service.getGroupShardIndex(tenant_id, group_id);
+    }
+
+    size_t MetadataShardIndexForTest(MasterService& service,
+                                     const std::string& key) const {
+        return service.getMetadataShardIndex(key);
+    }
+
+    size_t MetadataShardIndexForTest(MasterService& service,
+                                     const std::string& tenant_id,
+                                     const std::string& key) const {
+        return service.getMetadataShardIndex(tenant_id, key);
+    }
+
     void PutCompletedObject(MasterService& service, const UUID& client_id,
                             const std::string& key,
                             const ReplicateConfig& config,
@@ -662,6 +684,72 @@ TEST_F(MasterServiceTest, GroupRoutingIsTenantScopedForSameUserKey) {
     ASSERT_TRUE(service_->Remove(key, tenant_a, /*force=*/true).has_value());
     EXPECT_FALSE(service_->GetReplicaList(key, tenant_a).has_value());
     EXPECT_TRUE(service_->GetReplicaList(key, tenant_b).has_value());
+}
+
+TEST_F(MasterServiceTest, GroupRoutingShardUsesTenantScopedGroupId) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    const std::string group_id = "shared_tenant_group_route";
+    const std::string default_key = "default_tenant_group_shard_key";
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.group_ids = std::vector<std::string>{group_id};
+
+    PutCompletedObject(*service_, client_id, default_key, config);
+    EXPECT_EQ(MetadataShardIndexForTest(*service_, default_key),
+              LegacyShardIndexForTest(*service_, group_id));
+    EXPECT_EQ(MetadataShardIndexForTest(*service_, "default", default_key),
+              LegacyShardIndexForTest(*service_, group_id));
+
+    const std::string tenant_a = "tenant_group_shard_a";
+    const size_t tenant_a_group_shard =
+        GroupShardIndexForTest(*service_, tenant_a, group_id);
+    std::string tenant_b;
+    bool found_different_shard = false;
+    for (int i = 0; i < 10000; ++i) {
+        tenant_b = "tenant_group_shard_b_" + std::to_string(i);
+        if (GroupShardIndexForTest(*service_, tenant_b, group_id) !=
+            tenant_a_group_shard) {
+            found_different_shard = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(found_different_shard);
+    ASSERT_NE(GroupShardIndexForTest(*service_, tenant_b, group_id),
+              tenant_a_group_shard);
+
+    const std::string key_a = "tenant_group_shard_key_a";
+    const std::string key_b = "tenant_group_shard_key_b";
+    ASSERT_TRUE(service_->PutStart(client_id, key_a, tenant_a, 1024, config)
+                    .has_value());
+    ASSERT_TRUE(
+        service_->PutEnd(client_id, key_a, tenant_a, ReplicaType::MEMORY)
+            .has_value());
+    ASSERT_TRUE(service_->PutStart(client_id, key_b, tenant_b, 2048, config)
+                    .has_value());
+    ASSERT_TRUE(
+        service_->PutEnd(client_id, key_b, tenant_b, ReplicaType::MEMORY)
+            .has_value());
+
+    EXPECT_EQ(MetadataShardIndexForTest(*service_, tenant_a, key_a),
+              GroupShardIndexForTest(*service_, tenant_a, group_id));
+    EXPECT_EQ(MetadataShardIndexForTest(*service_, tenant_b, key_b),
+              GroupShardIndexForTest(*service_, tenant_b, group_id));
+    EXPECT_TRUE(service_->GetReplicaList(key_a, tenant_a).has_value());
+    EXPECT_TRUE(service_->GetReplicaList(key_b, tenant_b).has_value());
+
+    const std::string upsert_key = "tenant_group_shard_upsert_key";
+    ASSERT_TRUE(
+        service_->UpsertStart(client_id, upsert_key, tenant_a, 4096, config)
+            .has_value());
+    ASSERT_TRUE(
+        service_->PutEnd(client_id, upsert_key, tenant_a, ReplicaType::MEMORY)
+            .has_value());
+    EXPECT_EQ(MetadataShardIndexForTest(*service_, tenant_a, upsert_key),
+              GroupShardIndexForTest(*service_, tenant_a, group_id));
+    EXPECT_TRUE(service_->GetReplicaList(upsert_key, tenant_a).has_value());
 }
 
 TEST_F(MasterServiceTest,

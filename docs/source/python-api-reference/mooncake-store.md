@@ -592,7 +592,7 @@ config.prefer_alloc_in_same_node = "True"
 #### group_ids
 **Type:** `List[str] | None`
 **Default:** `None`
-**Description:** Optionally assigns object metadata to routing groups during writes. When this field is unset, Mooncake Store preserves the default ungrouped behavior. When it is set, each group ID maps to the object at the same position in the write request. Empty string (`""`) explicitly stores that object as ungrouped.
+**Description:** Optionally assigns object metadata to routing groups during writes. When this field is unset, Mooncake Store preserves the default ungrouped behavior. When it is set, each group ID maps to the object at the same position in the write request. Empty string (`""`) explicitly stores that object as ungrouped. Routing groups are scoped by tenant on the master side, so different tenants can reuse the same group ID without sharing routing or lease-refresh state.
 
 For batch write APIs, the number of group IDs must match the number of keys:
 

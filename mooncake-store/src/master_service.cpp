@@ -602,7 +602,7 @@ size_t MasterService::getMetadataShardIndex(const std::string& tenant_id,
     if (it == object_group_ids_.end()) {
         return getShardIndex(normalized_tenant, key);
     }
-    return getShardIndex(it->second);
+    return getGroupShardIndex(normalized_tenant, it->second);
 }
 
 std::optional<std::string> MasterService::GetGroupRoute(
@@ -1616,7 +1616,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
             const size_t target_shard_idx =
                 group_id.empty()
                     ? getShardIndex(object_id.tenant_id, object_id.user_key)
-                    : getShardIndex(group_id);
+                    : getGroupShardIndex(object_id.tenant_id, group_id);
             if (target_shard_idx != lookup_shard_idx) {
                 retry_shard_idx = target_shard_idx;
                 if (tenant_state.Empty()) {
@@ -2006,7 +2006,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
             const size_t case_a_shard_idx =
                 group_id.empty()
                     ? getShardIndex(object_id.tenant_id, object_id.user_key)
-                    : getShardIndex(group_id);
+                    : getGroupShardIndex(object_id.tenant_id, group_id);
             if (case_a_shard_idx != lookup_shard_idx) {
                 case_a_retry_shard_idx = case_a_shard_idx;
                 if (tenant_state.Empty()) {

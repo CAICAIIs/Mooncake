@@ -49,6 +49,7 @@ class EvictionStrategy;
 namespace test {
 class MasterServiceSnapshotTestBase;
 class SnapshotChildProcessTest;
+class MasterServiceTest;
 // Friended so the promotion-on-hit tests can drive a serialize/reset/
 // deserialize cycle directly via the otherwise-private
 // MetadataSerializer, and inspect private clamp fields. This avoids
@@ -69,6 +70,9 @@ class MasterService {
     friend class test::MasterServiceSnapshotTestBase;
     friend class test::SnapshotChildProcessTest;
     friend class test::PromotionOnHitTest;
+    // Uses fixture-local accessors to assert shard routing without exposing
+    // test-only routing helpers on MasterService's public API.
+    friend class test::MasterServiceTest;
 
    public:
     using NoFProbeFn =
@@ -1215,6 +1219,13 @@ class MasterService {
     // Legacy helper routes plain keys to the default tenant.
     size_t getShardIndex(const std::string& key) const {
         return std::hash<std::string>{}(key) % kNumShards;
+    }
+
+    // Grouped metadata uses the group id as the shard key, scoped by tenant.
+    // The default tenant path is intentionally legacy-compatible.
+    size_t getGroupShardIndex(const std::string& tenant_id,
+                              const std::string& group_id) const {
+        return getShardIndex(tenant_id, group_id);
     }
 
     size_t getMetadataShardIndex(const std::string& key) const;
