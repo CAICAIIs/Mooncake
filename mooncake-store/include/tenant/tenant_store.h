@@ -89,7 +89,7 @@ class TenantStore {
 
     // The object route is a flat map key -> strong ObjectEntry handle. Read
     // pins the entry under the shared route lock (fast), releases it, then
-    // takes the tenant lock; the strong handle keeps the entry alive across
+    // takes the per-object lock; the strong handle keeps the entry alive across
     // that handoff.
     std::shared_ptr<ObjectEntry> Pin(const std::string& key) const {
         std::shared_lock<std::shared_mutex> lock(route_lock_);
@@ -157,7 +157,7 @@ class TenantStore {
     // Visit every live object under this tenant. Collect the strong handles
     // under the shared route lock, then run the visitor after releasing it, so
     // the visitor never holds the route lock and may freely re-enter route ops.
-    // Processing under the tenant's mutex is the caller's responsibility.
+    // Processing under each ObjectEntry::mutex is the caller's responsibility.
     void VisitObjects(
         const std::function<void(const std::shared_ptr<ObjectEntry>&)>& visitor)
         const {
@@ -267,8 +267,8 @@ class TenantStore {
     }
 
     // Object route: the strong entry handles keyed by object key, guarded by a
-    // single shared_mutex. The mutation boundary is the per-tenant
-    // TenantState::mutex (one lock per object is a follow-up).
+    // single shared_mutex. Per-object mutation is finer-grained
+    // (ObjectEntry::mutex).
     mutable std::shared_mutex route_lock_;
     std::unordered_map<std::string, std::shared_ptr<ObjectEntry>> route_;
 

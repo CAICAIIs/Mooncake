@@ -93,7 +93,7 @@ class MasterServiceTest : public ::testing::Test {
         if (!entry || !entry->has_metadata()) {
             return std::nullopt;
         }
-        std::shared_lock<SharedMutex> entry_lock(tenant_handle->mutex);
+        std::shared_lock<std::shared_mutex> entry_lock(entry->mutex);
         return entry->metadata()->GetCommittedSoftPinTimeout();
     }
 
@@ -113,7 +113,7 @@ class MasterServiceTest : public ::testing::Test {
             service.GetOrCreateTenantStateHandle(normalized_tenant);
         auto entry = tenant_handle->Pin(key);
         ASSERT_TRUE(entry != nullptr && entry->has_metadata());
-        std::unique_lock<SharedMutex> entry_lock(tenant_handle->mutex);
+        std::unique_lock<std::shared_mutex> entry_lock(entry->mutex);
         auto& metadata = *entry->metadata();
         {
             SpinLocker locker(&metadata.lock);
@@ -189,6 +189,43 @@ class MasterServiceTest : public ::testing::Test {
     // would bind to an orphan entry not in the route. It must re-Pin the
     // existing entry instead. Lives on the fixture (a MasterService friend) so
     // it can reach the private MetadataAccessorRW.
+    void AccessorCreateRePinsWinnerEntry(MasterService& service) {
+        const UUID client_id = generate_uuid();
+        const std::string key = "accessor_create_repin_winner";
+        const TenantId tenant_id("tenant_accessor_create_repin");
+        const MasterService::ObjectIdentity object_id =
+            service.MakeObjectIdentityForRequest(key, tenant_id);
+        const TenantId normalized = object_id.tenant_id;
+
+        // Build the accessor while the object does not yet exist.
+        MasterService::MetadataAccessorRW accessor(&service, object_id);
+        ASSERT_FALSE(accessor.Exists());
+
+        // A concurrent writer wins and publishes the key first, with valid
+        // metadata (a LOCAL_DISK replica keeps IsValid() true).
+        auto winner = std::make_shared<mooncake::tenant::ObjectEntry>(key, "");
+        std::vector<Replica> winner_replicas;
+        winner_replicas.emplace_back(
+            Replica(client_id, 4096, "host:port", ReplicaStatus::COMPLETE));
+        winner->SetMetadata(std::make_unique<ObjectMetadata>(
+            client_id, std::chrono::system_clock::now(), 4096,
+            std::move(winner_replicas)));
+        auto tenant_handle = service.GetOrCreateTenantStateHandle(normalized);
+        ASSERT_TRUE(tenant_handle->InsertObject(key, winner));
+
+        // Create() must re-Pin the route winner, not bind the orphan.
+        accessor.Create(client_id, 4096, std::vector<Replica>{});
+
+        EXPECT_TRUE(accessor.Exists());
+        EXPECT_EQ(accessor.GetEntry(), winner);
+        EXPECT_EQ(accessor.Get().GetAllReplicas().size(), 1u);
+        // The route holds exactly one entry for the key (the winner).
+        auto pinned = tenant_handle->Pin(key);
+        ASSERT_NE(pinned, nullptr);
+        EXPECT_EQ(pinned, winner);
+        EXPECT_EQ(tenant_handle->ObjectCount(), 1u);
+    }
+
     void UpsertSoftPinDeadlineIndexForTest(
         MasterService& service, const std::string& key,
         const std::chrono::system_clock::time_point& deadline,

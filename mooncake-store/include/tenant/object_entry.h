@@ -3,14 +3,14 @@
 // ObjectEntry: the per-object unit that consolidates the per-key runtime task
 // state that previously lived as N separate MasterService TenantState maps
 // keyed by the same string. The host still owns ObjectMetadata (the cache/data
-// envelope), wired in by the caller. In this intermediate state the mutation
-// boundary is the tenant mutex; a follow-up narrows it to one lock per object
-// (ObjectEntry::mutex). Reusing the shared task types avoids a duplicate
-// authoritative definition of the per-key state.
+// envelope), wired in by the caller; the per-object mutex is the mutation
+// boundary. Reusing the shared task types avoids a duplicate authoritative
+// definition of the per-key state.
 
 #include <chrono>
 #include <memory>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <utility>
 
@@ -29,7 +29,7 @@ class ObjectEntry {
         : key_(std::move(key)), group_id_(std::move(group_id)) {}
     ~ObjectEntry() = default;
 
-    // Not copyable/movable: it owns per-object state.
+    // Not copyable/movable: it owns per-object state and a per-object lock.
     ObjectEntry(const ObjectEntry&) = delete;
     ObjectEntry& operator=(const ObjectEntry&) = delete;
     ObjectEntry(ObjectEntry&&) = delete;
@@ -53,6 +53,12 @@ class ObjectEntry {
     std::optional<DynamicReplicaPending> dynamic_replication_pending;
     std::chrono::steady_clock::time_point dynamic_replication_cooldown{};
 
+    // Per-object mutation boundary: the narrowest lock a point operation may
+    // hold after pinning this entry. ObjectMetadata has its own SpinLock for
+    // its enclosed lease/soft-pin state; a path that touches both holds this
+    // mutex and then takes the metadata lock (never the reverse).
+    mutable std::shared_mutex mutex;
+
     // Metadata is NON-movable / NON-copyable and self-locking, so it is owned
     // through a pointer here. A live routed object has metadata wired in; an
     // entry that has not yet materialized metadata (teardown, or a module-level
@@ -72,12 +78,12 @@ class ObjectEntry {
     }
 
     // Callback-scoped test/diagnostic access; production paths pin + lock
-    // explicitly. Runs `fn(*metadata())` while the tenant mutation boundary is
-    // held;
+    // explicitly. Runs `fn(*metadata())` while the per-object mutex is held;
     // the metadata reference must not escape the callback scope. No-op when
     // metadata is not yet wired.
     template <typename Fn>
     void WithMetadata(Fn&& fn) const {
+        std::unique_lock<std::shared_mutex> lock(mutex);
         if (metadata_) {
             std::forward<Fn>(fn)(*metadata_);
         }

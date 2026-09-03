@@ -602,7 +602,7 @@ class MasterServiceHATest : public ::testing::Test {
             entry = std::make_shared<mooncake::tenant::ObjectEntry>(key, "");
             tenant_state.InsertObject(key, entry);
         }
-        std::unique_lock<SharedMutex> entry_lock(tenant_handle->mutex);
+        std::unique_lock<std::shared_mutex> entry_lock(entry->mutex);
         entry->promotion_task = mooncake::PromotionTask{
             .source_id = 0,
             .alloc_id = alloc_id,
@@ -770,7 +770,7 @@ class MasterServiceHATest : public ::testing::Test {
         return std::unique_lock<std::shared_mutex>(service.snapshot_mutex_);
     }
 
-    static std::unique_lock<SharedMutex> LockMetadataShardForTesting(
+    static std::unique_lock<std::shared_mutex> LockMetadataShardForTesting(
         MasterService& service, const TenantId& tenant_id,
         const std::string& key) {
         // TenantStore's route lock. Holding it EXCLUSIVE gates PutStart at its

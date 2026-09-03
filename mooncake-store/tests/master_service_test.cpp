@@ -1130,6 +1130,14 @@ TEST_F(MasterServiceTest,
     EXPECT_TRUE(service_->GetReplicaList(key, tenant_id).has_value());
 }
 
+TEST_F(MasterServiceTest, AccessorCreateRePinsWinnerOnLostInsert) {
+    // Create() must re-Pin the route winner when a concurrent writer wins the
+    // create race, instead of binding an orphan entry.
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    AccessorCreateRePinsWinnerEntry(*service_);
+}
+
 TEST_F(MasterServiceTest,
        GroupedEvictionExpandsSafeMembersAndSkipsLeasedGroup) {
     auto service_config =

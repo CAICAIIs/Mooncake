@@ -120,12 +120,12 @@ class BatchEvictBench;
  * 1. client_mutex_
  * 2. tenant_quota_policy_mutex_
  * 3. snapshot_mutex_
- * 4. per-tenant TenantState::mutex (via TenantState::object_route Pin)
+ * 4. per-object ObjectEntry::mutex (via TenantState::object_route Pin)
  * 5. tenant_quota_recompute_mutex_
  * 6. ShardedTenantQuotaTable internal mutex or segment_mutex_
  * 7. soft_pin_deadline_index_ mutex
  *
- * The per-tenant lock is never held together with the object route lock
+ * The per-object lock is never held together with the object route lock
  * (TenantState::object_route): acquire one at a time, releasing before the
  * route mutation. Strict tenant admission and policy mutation paths that need
  * both tenant_quota_policy_mutex_ and snapshot_mutex_ must acquire the tenant
@@ -1050,13 +1050,9 @@ class MasterService {
     struct TenantState {
         TenantQuotaHandle quota_account{nullptr};
 
-        // Per-tenant mutation boundary: the coarse lock a point operation holds
-        // while touching this tenant's container. A follow-up narrows this to
-        // one lock per object (ObjectEntry::mutex).
-        mutable SharedMutex mutex;
-
-        // Per-object route (one ObjectEntry per key, with the thin flat group
-        // membership: one shared Lease + member keys).
+        // Per-object route with a per-object mutation boundary
+        // (ObjectEntry::mutex) and the thin flat group membership (one shared
+        // Lease + member keys).
         mooncake::tenant::TenantStore object_route;
 
         // Count of objects with >=1 completed LOCAL_DISK replica; the eviction
@@ -1179,8 +1175,8 @@ class MasterService {
     std::array<std::mutex, kObjectOperationLockStripes> object_operation_locks_;
 
     // Thin, non-locking per-tenant helper; it only maintains the tenant-scoped
-    // atomic disk_object_count. Object metadata is guarded by the per-tenant
-    // TenantState::mutex and the route by TenantStore::route_lock_.
+    // atomic disk_object_count. Object metadata is guarded by the per-object
+    // ObjectEntry::mutex and the route by TenantStore::route_lock_.
     class TenantStateAccessorRW {
        public:
         explicit TenantStateAccessorRW(TenantState* tenant_state)
@@ -1284,11 +1280,12 @@ class MasterService {
     };
 
     // Evicts every member of `group_id`, reading the membership from the
-    // tenant's own object_route. It must be called WITHOUT holding any tenant
-    // lock; each member is re-looked-up and re-validated under the tenant's
-    // coarse mutation boundary (the per-tenant mutex, which a follow-up
-    // narrows to a per-object lock). Because all members live in one tenant
-    // container, there is no cross-shard lock ordering to worry about.
+    // tenant's own object_route. It must be called WITHOUT holding any
+    // per-object lock; each member is re-looked-up and re-validated under its
+    // own `ObjectEntry::mutex`, which is released before the member is erased.
+    // Because all members live in one tenant container, there is no cross-shard
+    // lock ordering to worry about — the only ordering invariant is that
+    // `entry->mutex` and `route_lock_` are never held together.
     //
     // Each member is re-looked-up and re-validated under its own lock (lease,
     // hard/soft pin, evictable replica — all against `now`) because state may
@@ -1342,11 +1339,11 @@ class MasterService {
     TenantState& GetOrCreateTenantState(const TenantId& tenant_id);
     std::shared_ptr<TenantState> GetOrCreateTenantStateHandle(
         const TenantId& tenant_id);
-    // Test-only seam (friend of MasterServiceHATest): return the tenant's
-    // coarse mutation lock EXCLUSIVE, so the test can gate a PutStart at its
-    // first Pin inside the snapshot barrier. In this intermediate state the
-    // accessor holds the tenant mutex, so the test gates on that.
-    std::unique_lock<SharedMutex> LockObjectRouteForTesting(
+    // Test-only seam (friend of MasterServiceHATest): return the tenant object
+    // route lock EXCLUSIVE, so the test can gate a PutStart at its first Pin
+    // inside the snapshot barrier. Delegates to TenantStore's private
+    // LockRouteForTesting.
+    std::unique_lock<std::shared_mutex> LockObjectRouteForTesting(
         TenantState& tenant_state) const;
     TenantQuotaHandle GetBoundTenantQuotaHandle(
         const TenantState& tenant_state) const;
@@ -1607,16 +1604,16 @@ class MasterService {
               entry_(tenant_state_ != nullptr
                          ? tenant_state_->Pin(object_id_.user_key)
                          : nullptr),
-              lock_(tenant_handle_
-                        ? std::unique_lock<SharedMutex>(tenant_handle_->mutex)
-                        : std::unique_lock<SharedMutex>()) {
+              lock_(entry_ != nullptr
+                        ? std::unique_lock<std::shared_mutex>(entry_->mutex)
+                        : std::unique_lock<std::shared_mutex>()) {
             if (tenant_state_ != nullptr) {
                 service_->GetBoundTenantQuotaHandle(*tenant_state_);
             }
             // Automatically clean up invalid handles (memory replicas only).
             // Note: We only check memory replicas here to avoid lock order
             // violation (client_mutex_ must be acquired before the tenant
-            // accessor / tenant mutex).
+            // accessor / per-object mutex).
             // local_disk replicas are cleaned up by ClearInvalidHandles() in
             // ClientMonitorFunc.
             if (!(service_->enable_ha_ && service_->enable_oplog_) &&
@@ -1717,9 +1714,10 @@ class MasterService {
         // Delete current metadata (for PutRevoke or Remove operations)
         void Erase(const std::vector<std::string>& previous_media_hint = {})
             NO_THREAD_SAFETY_ANALYSIS {
-            // The tenant mutex is held for the whole accessor lifetime, so
-            // EraseMetadata mutates the route under the same lock (there is no
-            // per-object re-lock dance in this intermediate state).
+            // Release the per-object lock first; EraseMetadata re-locks it for
+            // teardown and releases it before the route mutation. The two locks
+            // are never held together.
+            lock_ = std::unique_lock<std::shared_mutex>();
             service_->EraseMetadata(*tenant_state_, entry_,
                                     object_id_.tenant_id, QuotaEraseMode::kFull,
                                     &tenant_guard_, previous_media_hint);
@@ -1756,21 +1754,28 @@ class MasterService {
                 client_id, now, total_length, std::move(replicas), std::nullopt,
                 enable_hard_pin, data_type, group_id, object_id_.tenant_id,
                 object_id_.user_key));
-            // The tenant mutex is held across the whole creation window, so a
-            // concurrent writer cannot publish this key between our Pin and the
-            // insert. Keep a defensive check for that impossible case rather
-            // than re-pinning the winner (that race is handled in the
-            // narrow-to-per-object follow-up).
             if (!tenant_state_->InsertObject(object_id_.user_key, entry)) {
-                throw std::logic_error(
-                    "Create(): key already inserted despite holding the tenant "
-                    "mutex");
+                // A concurrent writer already inserted this key. Re-pin the
+                // existing entry and use it instead of the orphan we built.
+                // Drop any lock EnsureTenantState() took first, or the same
+                // thread would re-lock a mutex it already holds.
+                lock_ = std::unique_lock<std::shared_mutex>();
+                entry_.reset();
+                entry_ = tenant_state_->Pin(object_id_.user_key);
+                if (entry_ == nullptr) {
+                    throw std::logic_error(
+                        "Create(): winner entry disappeared after failed "
+                        "insert");
+                }
+                lock_ = std::unique_lock<std::shared_mutex>(entry_->mutex);
+                return;
             }
             // Create() is only used by the offload replica-registration path,
             // which materializes a completed LOCAL_DISK object (not a primary
             // write in flight), so it must not be marked processing. Primary
             // write processing is set by the PutStart/Upsert paths.
             entry_ = entry;
+            lock_ = std::unique_lock<std::shared_mutex>(entry_->mutex);
             // Keep the metadata lease in sync with the group's shared lease so
             // the read path (ObjectMetadata::lease_) agrees with the group.
             if (!group_id.empty()) {
@@ -1783,14 +1788,19 @@ class MasterService {
             if (tenant_state_ != nullptr) {
                 return;
             }
-            // Materialize (or re-route to) the tenant and hold its coarse
-            // tenant mutex as the accessor's mutation boundary.
+            // Rebind the handle to the (now-existing) tenant. Dropping the lock
+            // is not needed because tenant_guard_ is a non-locking
+            // disk-counter.
+            entry_.reset();
+            lock_ = std::unique_lock<std::shared_mutex>();
             tenant_handle_ =
                 service_->GetOrCreateTenantStateHandle(object_id_.tenant_id);
             tenant_state_ = tenant_handle_.get();
-            lock_ = std::unique_lock<SharedMutex>(tenant_handle_->mutex);
             tenant_guard_ = TenantStateAccessorRW(tenant_state_);
             entry_ = tenant_state_->Pin(object_id_.user_key);
+            if (entry_ != nullptr) {
+                lock_ = std::unique_lock<std::shared_mutex>(entry_->mutex);
+            }
         }
 
         void MaybeEraseEmptyTenant() NO_THREAD_SAFETY_ANALYSIS {
@@ -1800,8 +1810,7 @@ class MasterService {
             service_->tenant_directory_.Remove(object_id_.tenant_id);
             tenant_state_ = nullptr;
             entry_.reset();
-            lock_ = std::unique_lock<SharedMutex>();
-            tenant_handle_.reset();
+            lock_ = std::unique_lock<std::shared_mutex>();
             tenant_guard_ = TenantStateAccessorRW(nullptr);
         }
 
@@ -1813,10 +1822,10 @@ class MasterService {
         TenantState* tenant_state_;
         // Non-locking disk-count helper bound to tenant_state_.
         TenantStateAccessorRW tenant_guard_;
-        // Pinned ObjectEntry (keeps the object alive); the coarse tenant mutex
-        // is the accessor's mutation boundary in this intermediate state.
+        // Pinned ObjectEntry (keeps the object alive) whose per-object mutex is
+        // held for the accessor's lifetime.
         std::shared_ptr<mooncake::tenant::ObjectEntry> entry_;
-        std::unique_lock<SharedMutex> lock_;
+        std::unique_lock<std::shared_mutex> lock_;
     };
 
     class MetadataSerializer {
@@ -1871,12 +1880,12 @@ class MasterService {
               tenant_handle_(
                   service_->tenant_directory_.Lookup(object_id_.tenant_id)),
               tenant_state_(tenant_handle_ ? tenant_handle_.get() : nullptr),
-              lock_(tenant_handle_
-                        ? std::shared_lock<SharedMutex>(tenant_handle_->mutex)
-                        : std::shared_lock<SharedMutex>()),
               entry_(tenant_state_ != nullptr
                          ? tenant_state_->Pin(object_id_.user_key)
-                         : nullptr) {}
+                         : nullptr),
+              lock_(entry_ != nullptr
+                        ? std::shared_lock<std::shared_mutex>(entry_->mutex)
+                        : std::shared_lock<std::shared_mutex>()) {}
 
         // Check if metadata exists
         bool Exists() const NO_THREAD_SAFETY_ANALYSIS {
@@ -1908,7 +1917,7 @@ class MasterService {
         std::shared_ptr<TenantState> tenant_handle_;
         const TenantState* tenant_state_;
         std::shared_ptr<mooncake::tenant::ObjectEntry> entry_;
-        std::shared_lock<SharedMutex> lock_;
+        std::shared_lock<std::shared_mutex> lock_;
     };
 
     friend class MetadataAccessorRW;
@@ -2299,7 +2308,7 @@ class MasterService {
     static size_t KvTenantEpochSlot(const std::string& tenant) {
         return std::hash<std::string>{}(tenant) % kKvTenantEpochSlots;
     }
-    // Called while the object's tenant mutex is held, before the `stored`
+    // Called while the object's per-object mutex is held, before the `stored`
     // status is enqueued, so any clear that observes the old epoch has not yet
     // published.
     void BumpKvTenantEpoch(const std::string& tenant) {
