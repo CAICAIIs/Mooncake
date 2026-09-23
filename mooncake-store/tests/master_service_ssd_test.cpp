@@ -529,8 +529,8 @@ TEST_F(LocalDiskUnmountInterleavingTest,
 //      buffer is absent or has an invalid allocator, so get_segment_names()
 //      yields a single nullopt entry and the loop body is skipped for it.
 //
-// In both cases the caller's `if (result)` branch fired and executed
-// inc_refcnt() + offloading_tasks.emplace() for work that was never submitted,
+// In both cases the caller's `if (result)` branch fired and recorded
+// inc_refcnt() plus an offloading task for work that was never submitted,
 // leaking the source replica's refcount until the 600s TTL reaper cleared the
 // phantom task. The fix returns UNABLE_OFFLOADING from both paths.
 //

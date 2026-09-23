@@ -270,15 +270,14 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
             bytes);
     }
 
-    TenantQuotaHandle GetOrCreateTenantStateHandleForTest(
-        MasterService& service, size_t shard_idx, const TenantId& tenant_id) {
-        MasterServiceTestPeer::MetadataShardAccessorRW shard(&service,
-                                                             shard_idx);
-        auto& tenant_state =
-            MasterServiceTestPeer(service).GetOrCreateTenantState(shard.get(),
-                                                                  tenant_id);
+    // Creates (or finds) the tenant's own registration and returns the quota
+    // handle bound to it.
+    TenantQuotaHandle GetOrCreateTenantHandleForTest(
+        MasterService& service, const TenantId& tenant_id) {
+        auto tenant_handle =
+            MasterServiceTestPeer(service).GetOrCreateTenantHandle(tenant_id);
         return MasterServiceTestPeer(service).GetBoundTenantQuotaHandle(
-            tenant_state);
+            *tenant_handle);
     }
 
     tl::expected<void, ErrorCode> ChargeBoundTenantQuotaForTest(
@@ -295,12 +294,15 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
     void DiscardExpiredProcessingForTest(MasterService& service,
                                          const TenantId& tenant_id,
                                          const std::string& key) {
-        const size_t shard_idx =
-            MasterServiceTestPeer(service).getShardIndex(tenant_id, key);
-        MasterServiceTestPeer::MetadataShardAccessorRW shard(&service,
-                                                             shard_idx);
+        (void)key;  // a tenant holds one object route, so the sweep is
+                    // tenant-wide
+        auto tenant_handle =
+            MasterServiceTestPeer::Tenants(service).Lookup(tenant_id);
+        if (tenant_handle == nullptr) {
+            return;
+        }
         MasterServiceTestPeer(service).DiscardExpiredProcessingReplicas(
-            shard, std::chrono::system_clock::time_point::max());
+            *tenant_handle, std::chrono::system_clock::time_point::max());
     }
 
     void FinalizeExpiredProcessingForTest(MasterService& service,
@@ -309,27 +311,34 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
         OpLogEntry entry;
         entry.tenant_id = tenant_id.value();
         entry.object_key = key;
+        // The production path no-ops when the key is not routed to this entry,
+        // so a missing entry would make the caller's assertions vacuous.
+        auto entry_handle =
+            MasterServiceTestPeer(service).GetEntryForTesting(tenant_id, key);
+        ASSERT_NE(entry_handle, nullptr);
         MasterServiceTestPeer(service)
             .FinalizeExpiredProcessingReplicasAfterDurable(
-                entry, std::chrono::system_clock::now());
+                std::move(entry_handle), entry,
+                std::chrono::system_clock::now());
     }
 
     void FinalizeRemovedMemoryReplicasForTest(MasterService& service,
                                               const TenantId& tenant_id,
                                               const std::string& key) {
         std::vector<ReplicaID> removed_ids;
-        {
-            MasterServiceTestPeer::MetadataAccessorRW accessor(
-                &service,
-                MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
-            ASSERT_TRUE(accessor.Exists());
-            accessor.Get().VisitReplicas(
-                &Replica::fn_is_memory_replica,
-                [&removed_ids](Replica& replica) {
-                    removed_ids.push_back(replica.id());
-                    replica.mark_removed();
-                });
-        }
+        // The visit mutates the replicas, so it runs under the entry's own
+        // write lock and both reads happen inside that one section.
+        auto object_entry =
+            MasterServiceTestPeer(service).GetEntryForTesting(tenant_id, key);
+        ASSERT_NE(object_entry, nullptr);
+        object_entry->WithExclusiveAccess(
+            [&](ObjectMetadata& metadata, ObjectEntry::State&) {
+                metadata.VisitReplicas(&Replica::fn_is_memory_replica,
+                                       [&removed_ids](Replica& replica) {
+                                           removed_ids.push_back(replica.id());
+                                           replica.mark_removed();
+                                       });
+            });
         ASSERT_FALSE(removed_ids.empty());
 
         OpLogEntry entry;
@@ -473,16 +482,15 @@ TEST_F(MasterServiceTenantQuotaTest,
     PutComplete(service, client_id, "ok", TenantId("tenant-a"), 10);
 }
 
-TEST_F(MasterServiceTenantQuotaTest,
-       SameTenantStatesAcrossMetadataShardsShareBoundHandle) {
+TEST_F(MasterServiceTenantQuotaTest, SameTenantHandlesShareBoundHandle) {
     const TenantId tenant_id("tenant-a");
     MasterService service(MakeConfig({{tenant_id, 1000}}));
     MountSegment(service);
 
-    auto* first_handle =
-        GetOrCreateTenantStateHandleForTest(service, 0, tenant_id);
-    auto* second_handle =
-        GetOrCreateTenantStateHandleForTest(service, 1, tenant_id);
+    // A tenant is registered once, so two independent get-or-create calls must
+    // hand back the same handle carrying the same bound account.
+    auto* first_handle = GetOrCreateTenantHandleForTest(service, tenant_id);
+    auto* second_handle = GetOrCreateTenantHandleForTest(service, tenant_id);
 
     ASSERT_NE(first_handle, nullptr);
     EXPECT_EQ(first_handle, second_handle);
@@ -1175,7 +1183,7 @@ TEST_F(MasterServiceTenantQuotaTest,
     EXPECT_EQ(delete_future.wait_for(std::chrono::milliseconds(200)),
               std::future_status::timeout)
         << "tenant deletion passed the metadata scan while zero-charge "
-           "PutStart still held the target metadata shard";
+           "PutStart still held the object's entry";
 
     blocking_strategy_ptr->AllowAllocation();
     put_thread.join();
@@ -1272,6 +1280,58 @@ TEST_F(MasterServiceTenantQuotaTest,
                     .Remove("orphan-key", TenantId("tenant-b"),
                             /*force=*/true)
                     .has_value());
+}
+
+// Regression: a tenant-scoped RemoveAll holds the snapshot barrier only
+// shared, so clearing one tenant must not pause point operations of another.
+TEST_F(MasterServiceTenantQuotaTest, TenantRemoveAllDoesNotBlockOtherTenants) {
+    const TenantId tenant_a("tenant-a");
+    const TenantId tenant_b("tenant-b");
+    MasterService service(MakeConfig({{tenant_a, 100000}, {tenant_b, 100000}}));
+    UUID client = MountSegment(service, 4096, "rmall_segment");
+    auto put = [&](const std::string& key, const TenantId& tenant) {
+        auto started =
+            service.PutStart(client, key, tenant, 64, MemoryConfig());
+        if (!started.has_value()) {
+            return false;
+        }
+        return service.PutEnd(client, key, tenant, ReplicaType::MEMORY)
+            .has_value();
+    };
+    ASSERT_TRUE(put("a-1", tenant_a));
+    ASSERT_TRUE(put("b-1", tenant_b));
+
+    // Pause tenant A's cleanup inside the scan: the entry lock is held from a
+    // helper thread, so RemoveAll blocks on the first object it tries to tear
+    // down.
+    std::promise<void> parked;
+    std::promise<void> release;
+    auto release_future = release.get_future().share();
+    std::thread gate_holder([&] {
+        MasterServiceTestPeer(service).WithEntryLockedForTesting(
+            tenant_a, "a-1", [&] {
+                parked.set_value();
+                release_future.wait();
+            });
+    });
+    parked.get_future().wait();
+
+    std::thread remover(
+        [&] { (void)service.RemoveAll(tenant_a, /*force=*/true); });
+
+    // While A's cleanup is parked on the gate, a point write against tenant
+    // B must still complete.
+    std::atomic<bool> written{false};
+    auto writer =
+        std::async(std::launch::async, [&] { written = put("b-2", tenant_b); });
+    EXPECT_EQ(writer.wait_for(std::chrono::milliseconds(500)),
+              std::future_status::ready);
+    writer.get();
+    EXPECT_TRUE(written);
+
+    release.set_value();
+    gate_holder.join();
+    remover.join();
 }
 
 // --- Tenant-scoped eviction watermark -------------------------------------
