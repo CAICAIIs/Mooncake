@@ -12,10 +12,15 @@
 #include <utility>
 #include <vector>
 
+#include "common/shrink_buckets.h"
 #include "common/transparent_string_hash.h"
 #include "object_entry.h"
 
 namespace mooncake {
+
+namespace metadata {
+class Tenant;  // the only caller allowed to hold the route lock raw
+}
 
 // The object route for one tenant: a flat map from object key to a strong
 // ObjectEntry handle.
@@ -112,6 +117,21 @@ class ObjectIndex {
         return route_.empty();
     }
 
+    // Rehash the route down to roughly twice its live size, for a caller that
+    // erased most of the tenant's objects in one sweep or eviction cycle.
+    void ShrinkRouteTableIfSparse() {
+        std::unique_lock<std::shared_mutex> lock(route_lock_);
+        ShrinkBucketsIfSparse(route_);
+    }
+
+    // The route's bucket count, read under the route lock. The bucket array is
+    // the only observable of ShrinkRouteTableIfSparse, since erasing never
+    // returns bucket memory.
+    [[nodiscard]] size_t RouteBucketCountForTesting() const {
+        std::shared_lock<std::shared_mutex> lock(route_lock_);
+        return route_.bucket_count();
+    }
+
     // Collect strong handles to every object currently routed. The route lock
     // is released before returning, so a caller can take each entry's own
     // mutex without holding the route lock.
@@ -127,6 +147,15 @@ class ObjectIndex {
     }
 
    private:
+    // Test-only seam: take the route lock exclusively so a concurrent
+    // Get/Insert/Erase/Contains blocks at that boundary. Reached only through
+    // Tenant::LockRouteForTesting().
+    friend class metadata::Tenant;
+
+    std::unique_lock<std::shared_mutex> LockRouteForTesting() const {
+        return std::unique_lock<std::shared_mutex>(route_lock_);
+    }
+
     // Object route: the strong entry handles keyed by object key, guarded by a
     // single shared_mutex. Mutating one object's state is finer-grained: each
     // entry guards its own.
