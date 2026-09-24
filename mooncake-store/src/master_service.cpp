@@ -5595,33 +5595,352 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
 
     [[maybe_unused]] auto object_operation_lock =
         AcquireObjectOperationLock(object_id.tenant_id, object_id.user_key);
+    // What the read-modify-write region on an already-published entry answered.
+    // It stays empty when that entry was erased there or is no longer routed,
+    // and then Case A below allocates a fresh object.
+    using PutAllocation =
+        tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
+    std::optional<PutAllocation> settled;
+    // Case C's handoff. Its erase ends the entry's lock, so publishing the
+    // replacement cannot run inside the region that erased the old object.
+    bool reallocating = false;
+    ReplicateConfig merged_config;
+    std::string existing_group_id;
+    std::optional<std::chrono::system_clock::time_point>
+        committed_soft_pin_timeout;
+    std::optional<std::vector<Replica>> replacement_replicas;
+    uint64_t replacement_pending_quota_charge = 0;
+    bool has_replacement_charge = false;
+    TenantQuotaLedger replacement_charge;
+    std::optional<std::chrono::system_clock::time_point>
+        case_a_committed_soft_pin_timeout;
+    // Read under client_mutex_ and held for the rest of the operation.
+    std::unordered_set<UUID, boost::hash<UUID>> retaining_clients;
+    std::chrono::system_clock::time_point now;
+
+    // The whole read-modify-write region runs under the entry's own lock — the
+    // stale cleanup, the safety checks, the preemption and the in-place rewrite
+    // — so a concurrent Get/PutEnd/Remove on this key serializes behind it.
+    auto rewrite = [&](metadata::Tenant& tenant,
+                       const std::shared_ptr<ObjectEntry>& entry,
+                       ObjectMetadata& metadata, ObjectEntry::State& state) {
+        // --- Step 0: stale handle cleanup ---
+        auto cleanup_plan =
+            BuildStaleHandleCleanupPlan(metadata, retaining_clients);
+        if (!cleanup_plan.removed_ids.empty()) {
+            auto persist_result = PersistStaleHandleCleanupForHA(
+                "UpsertStart(stale cleanup)", object_id.tenant_id, key,
+                metadata, cleanup_plan);
+            if (!persist_result) {
+                settled.emplace(tl::make_unexpected(persist_result.error()));
+                return;
+            }
+            if (enable_oplog_) {
+                settled.emplace(
+                    tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS));
+                return;
+            }
+            if (CleanupStaleHandles(key, object_id.tenant_id, tenant, metadata,
+                                    state, retaining_clients)) {
+                // EraseMetadata handles the processing flag,
+                // replication and offloading tasks (with
+                // dec_refcnt), and promotion task cleanup.
+                EraseMetadata(tenant, entry, metadata, state,
+                              object_id.tenant_id, QuotaEraseMode::kFull);
+                return;
+            }
+        }
+
+        // --- Step 1: safety checks and preemption ---
+        // Reject if the caller tries to change group
+        // membership. Group membership is immutable while an
+        // object exists.
+        if (config.group_ids.has_value() && metadata.group_id != group_id) {
+            LOG(ERROR) << "key=" << key
+                       << ", error=group_membership_is_immutable";
+            settled.emplace(tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+            return;
+        }
+
+        // Reject if a Copy/Move task is actively reading this
+        // key's replicas.
+        if (state.replication_task.has_value()) {
+            LOG(INFO) << "key=" << key << ", error=object_has_replication_task";
+            settled.emplace(
+                tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK));
+            return;
+        }
+
+        if (state.promotion_task.has_value()) {
+            LOG(INFO) << "key=" << key << ", error=object_has_promotion_task";
+            settled.emplace(
+                tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK));
+            return;
+        }
+
+        // An in-place Upsert returns and overwrites the
+        // existing buffers, so every completed Client-owned
+        // target must still be serving before any queue or
+        // metadata state is changed.
+        if (metadata.size == slice_length &&
+            metadata.HasReplica([](const Replica& replica) {
+                if (!replica.is_completed() ||
+                    (!replica.is_memory_replica() &&
+                     !replica.is_local_disk_replica())) {
+                    return false;
+                }
+                Replica::Descriptor descriptor;
+                return !replica.getDescriptorIfAvailable(descriptor);
+            })) {
+            settled.emplace(
+                tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS));
+            return;
+        }
+
+        // Cancel a still-queued offload so the upsert can take
+        // the key over. Once a store worker owns the task it is
+        // reading the source buffer for its SSD write, so the
+        // upsert waits for NotifyOffloadSuccess to clear the
+        // marker instead.
+        if (!CancelQueuedOffloadTask(metadata, state, object_id)) {
+            LOG(INFO) << "key=" << key << ", error=object_has_offloading_task";
+            settled.emplace(
+                tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK));
+            return;
+        }
+
+        // Preempt an in-progress Put/Upsert on the same key.
+        // The previous writer's PROCESSING replicas are moved
+        // to discarded_replicas_ with a TTL so they are not
+        // freed while the old writer may still be doing RDMA
+        // writes.  Unlike PutStart (which only preempts after a
+        // timeout), UpsertStart preempts immediately.
+        if (state.is_processing) {
+            auto processing_replicas =
+                metadata.PopReplicas(&Replica::fn_is_processing);
+            metadata.ClearPendingSoftPinAction();
+            if (!processing_replicas.empty()) {
+                FreeDfsReplicas(key, processing_replicas);
+                std::lock_guard lock(discarded_replicas_mutex_);
+                discarded_replicas_.emplace_back(
+                    std::move(processing_replicas),
+                    now + put_start_release_timeout_sec_);
+            }
+            state.is_processing = false;
+
+            // If no COMPLETE replicas survive the preemption,
+            // this key effectively does not exist — fall
+            // through to Case A.
+            if (!metadata.HasReplica(&Replica::fn_is_completed)) {
+                case_a_committed_soft_pin_timeout =
+                    metadata.GetCommittedSoftPinTimeout();
+                if (case_a_committed_soft_pin_timeout &&
+                    *case_a_committed_soft_pin_timeout <= now) {
+                    case_a_committed_soft_pin_timeout.reset();
+                }
+                EraseMetadata(tenant, entry, metadata, state,
+                              object_id.tenant_id, QuotaEraseMode::kFull);
+                return;
+            }
+            auto settle_result =
+                SettlePrimaryWriteQuotaIfReady(tenant, metadata);
+            if (!settle_result) {
+                settled.emplace(tl::make_unexpected(settle_result.error()));
+                return;
+            }
+        }
+
+        // --- Step 2: key exists with COMPLETE replicas →
+        // Case B or C ---
+        // Reject if any reader holds a reference (refcnt > 0).
+        // Overwriting a buffer that an RDMA read is streaming
+        // from would cause data corruption. The client should
+        // retry after readers finish.
+        if (metadata.HasReplica(&Replica::fn_is_busy)) {
+            LOG(INFO) << "key=" << key << ", error=object_replica_busy";
+            settled.emplace(
+                tl::make_unexpected(ErrorCode::OBJECT_REPLICA_BUSY));
+            return;
+        }
+
+        if (metadata.size == slice_length) {
+            // Validate same-size DFS topology before changing
+            // storage.
+            const size_t existing_dfs_replicas =
+                metadata.CountReplicas(&Replica::fn_is_dfs_replica);
+            if (config.dfs_replica_num > 0 || existing_dfs_replicas > 0) {
+                const size_t existing_memory_replicas =
+                    metadata.CountReplicas(&Replica::fn_is_memory_replica);
+                const size_t existing_nof_replicas =
+                    metadata.CountReplicas(&Replica::fn_is_nof_replica);
+                if (existing_memory_replicas != config.replica_num ||
+                    existing_nof_replicas != config.nof_replica_num ||
+                    existing_dfs_replicas != config.dfs_replica_num) {
+                    LOG(ERROR)
+                        << "key=" << key << ", error="
+                        << "dfs_upsert_topology_mismatch"
+                        << ", existing_memory=" << existing_memory_replicas
+                        << ", requested_memory=" << config.replica_num
+                        << ", existing_nof=" << existing_nof_replicas
+                        << ", requested_nof=" << config.nof_replica_num
+                        << ", existing_dfs=" << existing_dfs_replicas
+                        << ", requested_dfs=" << config.dfs_replica_num;
+                    settled.emplace(
+                        tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+                    return;
+                }
+            }
+        }
+
+        const bool has_read_lease = !metadata.IsLeaseExpired(now);
+        if (has_read_lease && metadata.HasReplica([](const Replica& replica) {
+                return !replica.is_memory_replica();
+            })) {
+            // File-backed reads can resolve storage by key, so
+            // they cannot retain an old version across
+            // replacement.
+            settled.emplace(tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE));
+            return;
+        }
+
+        if (metadata.size == slice_length && !has_read_lease) {
+            metadata.client_id = client_id;
+            metadata.put_start_time = now;
+
+            const auto previous_kv_media = KvMediaSnapshot(metadata);
+
+            // Mark COMPLETE → PROCESSING so readers won't see
+            // stale data mid-transfer.  The key becomes
+            // unreadable until UpsertEnd.
+            std::unordered_set<ReplicaID> eligible_replica_ids;
+            metadata.VisitReplicas(
+                &Replica::fn_is_completed,
+                [&eligible_replica_ids](Replica& replica) {
+                    eligible_replica_ids.insert(replica.id());
+                    replica.mark_processing();
+                });
+            metadata.BeginSoftPinAction(*soft_pin_request,
+                                        std::move(eligible_replica_ids));
+            SyncCacheTotalAccounting(metadata);
+            SyncKvObjectState(key, metadata, object_id.tenant_id,
+                              previous_kv_media);
+
+            state.is_processing = true;
+
+            // Answer with the existing descriptors — same
+            // buffer addresses as before.
+            std::vector<Replica::Descriptor> replica_list;
+            const auto& all_replicas = metadata.GetAllReplicas();
+            replica_list.reserve(all_replicas.size());
+            for (const auto& replica : all_replicas) {
+                replica_list.emplace_back(replica.get_descriptor());
+            }
+
+            VLOG(1) << "key=" << key << ", action=upsert_start_case_b_inplace";
+            settled.emplace(std::move(replica_list));
+            return;
+        }
+
+        // --- Case C: different size or active readers —
+        // reallocate ---
+        // Old buffers cannot be reused.  Move them to
+        // discarded_replicas_ for delayed release (readers may
+        // still hold descriptors without refcnt), then allocate
+        // fresh buffers at the new size.
+        //
+        // Preserve hard_pin and soft_pin from the old metadata
+        // so that eviction protection survives a size-changing
+        // upsert (RFC §2.2.2).
+        merged_config = config;
+        merged_config.with_hard_pin =
+            merged_config.with_hard_pin || metadata.IsHardPinned();
+        committed_soft_pin_timeout = metadata.GetCommittedSoftPinTimeout();
+        if (committed_soft_pin_timeout && *committed_soft_pin_timeout <= now) {
+            committed_soft_pin_timeout.reset();
+        }
+
+        existing_group_id = metadata.group_id;
+        const auto previous_kv_media = KvMediaSnapshot(metadata);
+        has_replacement_charge = enable_multi_tenants_ &&
+                                 metadata.quota_ledger.TotalChargedBytes() != 0;
+        auto* quota_account = GetBoundTenantQuotaHandle(tenant);
+
+        // A leased memory snapshot still references the old
+        // replica descriptors. Allocate the replacement before
+        // removing the old metadata so an allocation failure
+        // leaves the old object readable instead of turning it
+        // into OBJECT_NOT_FOUND.
+        if (has_read_lease) {
+            replacement_pending_quota_charge =
+                RequestedMemoryQuotaCharge(slice_length, merged_config);
+            auto quota_result = ChargeTenantQuota(
+                quota_account, replacement_pending_quota_charge);
+            if (!quota_result) {
+                settled.emplace(tl::make_unexpected(quota_result.error()));
+                return;
+            }
+            auto allocation_result = AllocateReplicas(
+                key, slice_length, merged_config, writer_host_id);
+            if (!allocation_result) {
+                ReleaseTenantQuota(quota_account,
+                                   replacement_pending_quota_charge);
+                settled.emplace(tl::make_unexpected(allocation_result.error()));
+                return;
+            }
+            replacement_replicas.emplace(std::move(allocation_result.value()));
+        }
+
+        if (has_replacement_charge) {
+            auto transfer_result =
+                metadata.quota_ledger.TransferReplacementCharge(
+                    quota_account, replacement_charge);
+            if (!transfer_result) {
+                LogTenantQuotaLedgerError(transfer_result,
+                                          "transfer_replacement_out",
+                                          object_id.tenant_id, key);
+                if (replacement_replicas.has_value()) {
+                    FreeDfsReplicas(key, *replacement_replicas);
+                    ReleaseTenantQuota(quota_account,
+                                       replacement_pending_quota_charge);
+                }
+                settled.emplace(tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
+                return;
+            }
+        }
+        // A query granted before this write lock can retain its
+        // descriptor for a full read TTL. Keep the old
+        // allocation for at least that long as well as the
+        // writer grace period.
+        const auto release_at =
+            std::chrono::system_clock::now() +
+            std::max(std::chrono::milliseconds(default_kv_lease_ttl_),
+                     std::chrono::duration_cast<std::chrono::milliseconds>(
+                         put_start_release_timeout_sec_));
+        auto old_replicas = PopReplicasWithCacheTotalAccounting(metadata);
+        if (!old_replicas.empty()) {
+            FreeDfsReplicas(key, old_replicas);
+            std::lock_guard lock(discarded_replicas_mutex_);
+            discarded_replicas_.emplace_back(std::move(old_replicas),
+                                             release_at);
+        }
+        // The erase ends this callback: the replacement is
+        // published after it, once the entry's lock is gone, so
+        // a reader in between finds the key absent. Only this
+        // call's own per-key operation lock keeps another
+        // PutStart or UpsertStart out of that window.
+        EraseMetadata(tenant, entry, metadata, state, object_id.tenant_id,
+                      QuotaEraseMode::kPreserveOld, previous_kv_media);
+        reallocating = true;
+    };
+
     auto admit =
         [&]() -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
-        auto now = std::chrono::system_clock::now();
-        std::optional<std::chrono::system_clock::time_point>
-            case_a_committed_soft_pin_timeout;
-        // What the read-modify-write region on an already-published entry
-        // answered. It stays empty when that entry was erased there or is no
-        // longer routed, and then Case A below allocates a fresh object.
-        using PutAllocation =
-            tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
-        std::optional<PutAllocation> settled;
-        // Case C's handoff. Its erase ends the entry's lock, so publishing the
-        // replacement cannot run inside the region that erased the old object.
-        bool reallocating = false;
-        ReplicateConfig merged_config;
-        std::string existing_group_id;
-        std::optional<std::chrono::system_clock::time_point>
-            committed_soft_pin_timeout;
-        std::optional<std::vector<Replica>> replacement_replicas;
-        uint64_t replacement_pending_quota_charge = 0;
-        bool has_replacement_charge = false;
-        TenantQuotaLedger replacement_charge;
+        now = std::chrono::system_clock::now();
         {
             // --- Lock acquisition ---
             std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
             std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-            auto retaining_clients = GetRetainingClientIdsLocked();
+            retaining_clients = GetRetainingClientIdsLocked();
             client_lock.unlock();
             // group_id does not affect routing: the key is the only thing the
             // tenant's route is indexed by.
@@ -5633,379 +5952,11 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
             }
 
             if (tenant->Get(key) != nullptr) {
-                // The whole read-modify-write region runs under the entry's own
-                // lock — the stale cleanup, the safety checks, the preemption
-                // and the in-place rewrite — so a concurrent Get/PutEnd/Remove
-                // on this key serializes behind it.
                 (void)tenant->WithPublishedEntry(
                     key,
                     [&](const std::shared_ptr<ObjectEntry>& entry,
                         ObjectMetadata& metadata, ObjectEntry::State& state) {
-                        // --- Step 0: stale handle cleanup ---
-                        auto cleanup_plan = BuildStaleHandleCleanupPlan(
-                            metadata, retaining_clients);
-                        if (!cleanup_plan.removed_ids.empty()) {
-                            auto persist_result =
-                                PersistStaleHandleCleanupForHA(
-                                    "UpsertStart(stale cleanup)",
-                                    object_id.tenant_id, key, metadata,
-                                    cleanup_plan);
-                            if (!persist_result) {
-                                settled.emplace(tl::make_unexpected(
-                                    persist_result.error()));
-                                return;
-                            }
-                            if (enable_oplog_) {
-                                settled.emplace(tl::make_unexpected(
-                                    ErrorCode::OBJECT_ALREADY_EXISTS));
-                                return;
-                            }
-                            if (CleanupStaleHandles(key, object_id.tenant_id,
-                                                    *tenant, metadata, state,
-                                                    retaining_clients)) {
-                                // EraseMetadata handles the processing flag,
-                                // replication and offloading tasks (with
-                                // dec_refcnt), and promotion task cleanup.
-                                EraseMetadata(*tenant, entry, metadata, state,
-                                              object_id.tenant_id,
-                                              QuotaEraseMode::kFull);
-                                return;
-                            }
-                        }
-
-                        // --- Step 1: safety checks and preemption ---
-                        // Reject if the caller tries to change group
-                        // membership. Group membership is immutable while an
-                        // object exists.
-                        if (config.group_ids.has_value() &&
-                            metadata.group_id != group_id) {
-                            LOG(ERROR)
-                                << "key=" << key
-                                << ", error=group_membership_is_immutable";
-                            settled.emplace(
-                                tl::make_unexpected(ErrorCode::INVALID_PARAMS));
-                            return;
-                        }
-
-                        // Reject if a Copy/Move task is actively reading this
-                        // key's replicas.
-                        if (state.replication_task.has_value()) {
-                            LOG(INFO) << "key=" << key
-                                      << ", error=object_has_replication_task";
-                            settled.emplace(tl::make_unexpected(
-                                ErrorCode::OBJECT_HAS_REPLICATION_TASK));
-                            return;
-                        }
-
-                        if (state.promotion_task.has_value()) {
-                            LOG(INFO) << "key=" << key
-                                      << ", error=object_has_promotion_task";
-                            settled.emplace(tl::make_unexpected(
-                                ErrorCode::OBJECT_HAS_REPLICATION_TASK));
-                            return;
-                        }
-
-                        // An in-place Upsert returns and overwrites the
-                        // existing buffers, so every completed Client-owned
-                        // target must still be serving before any queue or
-                        // metadata state is changed.
-                        if (metadata.size == slice_length &&
-                            metadata.HasReplica([](const Replica& replica) {
-                                if (!replica.is_completed() ||
-                                    (!replica.is_memory_replica() &&
-                                     !replica.is_local_disk_replica())) {
-                                    return false;
-                                }
-                                Replica::Descriptor descriptor;
-                                return !replica.getDescriptorIfAvailable(
-                                    descriptor);
-                            })) {
-                            settled.emplace(tl::make_unexpected(
-                                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS));
-                            return;
-                        }
-
-                        // Cancel a still-queued offload so the upsert can take
-                        // the key over. Once a store worker owns the task it is
-                        // reading the source buffer for its SSD write, so the
-                        // upsert waits for NotifyOffloadSuccess to clear the
-                        // marker instead.
-                        if (!CancelQueuedOffloadTask(metadata, state,
-                                                     object_id)) {
-                            LOG(INFO) << "key=" << key
-                                      << ", error=object_has_offloading_task";
-                            settled.emplace(tl::make_unexpected(
-                                ErrorCode::OBJECT_HAS_REPLICATION_TASK));
-                            return;
-                        }
-
-                        // Preempt an in-progress Put/Upsert on the same key.
-                        // The previous writer's PROCESSING replicas are moved
-                        // to discarded_replicas_ with a TTL so they are not
-                        // freed while the old writer may still be doing RDMA
-                        // writes.  Unlike PutStart (which only preempts after a
-                        // timeout), UpsertStart preempts immediately.
-                        if (state.is_processing) {
-                            auto processing_replicas = metadata.PopReplicas(
-                                &Replica::fn_is_processing);
-                            metadata.ClearPendingSoftPinAction();
-                            if (!processing_replicas.empty()) {
-                                FreeDfsReplicas(key, processing_replicas);
-                                std::lock_guard lock(discarded_replicas_mutex_);
-                                discarded_replicas_.emplace_back(
-                                    std::move(processing_replicas),
-                                    now + put_start_release_timeout_sec_);
-                            }
-                            state.is_processing = false;
-
-                            // If no COMPLETE replicas survive the preemption,
-                            // this key effectively does not exist — fall
-                            // through to Case A.
-                            if (!metadata.HasReplica(
-                                    &Replica::fn_is_completed)) {
-                                case_a_committed_soft_pin_timeout =
-                                    metadata.GetCommittedSoftPinTimeout();
-                                if (case_a_committed_soft_pin_timeout &&
-                                    *case_a_committed_soft_pin_timeout <= now) {
-                                    case_a_committed_soft_pin_timeout.reset();
-                                }
-                                EraseMetadata(*tenant, entry, metadata, state,
-                                              object_id.tenant_id,
-                                              QuotaEraseMode::kFull);
-                                return;
-                            }
-                            auto settle_result = SettlePrimaryWriteQuotaIfReady(
-                                *tenant, metadata);
-                            if (!settle_result) {
-                                settled.emplace(
-                                    tl::make_unexpected(settle_result.error()));
-                                return;
-                            }
-                        }
-
-                        // --- Step 2: key exists with COMPLETE replicas →
-                        // Case B or C ---
-                        // Reject if any reader holds a reference (refcnt > 0).
-                        // Overwriting a buffer that an RDMA read is streaming
-                        // from would cause data corruption. The client should
-                        // retry after readers finish.
-                        if (metadata.HasReplica(&Replica::fn_is_busy)) {
-                            LOG(INFO) << "key=" << key
-                                      << ", error=object_replica_busy";
-                            settled.emplace(tl::make_unexpected(
-                                ErrorCode::OBJECT_REPLICA_BUSY));
-                            return;
-                        }
-
-                        if (metadata.size == slice_length) {
-                            // Validate same-size DFS topology before changing
-                            // storage.
-                            const size_t existing_dfs_replicas =
-                                metadata.CountReplicas(
-                                    &Replica::fn_is_dfs_replica);
-                            if (config.dfs_replica_num > 0 ||
-                                existing_dfs_replicas > 0) {
-                                const size_t existing_memory_replicas =
-                                    metadata.CountReplicas(
-                                        &Replica::fn_is_memory_replica);
-                                const size_t existing_nof_replicas =
-                                    metadata.CountReplicas(
-                                        &Replica::fn_is_nof_replica);
-                                if (existing_memory_replicas !=
-                                        config.replica_num ||
-                                    existing_nof_replicas !=
-                                        config.nof_replica_num ||
-                                    existing_dfs_replicas !=
-                                        config.dfs_replica_num) {
-                                    LOG(ERROR) << "key=" << key << ", error="
-                                               << "dfs_upsert_topology_mismatch"
-                                               << ", existing_memory="
-                                               << existing_memory_replicas
-                                               << ", requested_memory="
-                                               << config.replica_num
-                                               << ", existing_nof="
-                                               << existing_nof_replicas
-                                               << ", requested_nof="
-                                               << config.nof_replica_num
-                                               << ", existing_dfs="
-                                               << existing_dfs_replicas
-                                               << ", requested_dfs="
-                                               << config.dfs_replica_num;
-                                    settled.emplace(tl::make_unexpected(
-                                        ErrorCode::INVALID_PARAMS));
-                                    return;
-                                }
-                            }
-                        }
-
-                        const bool has_read_lease =
-                            !metadata.IsLeaseExpired(now);
-                        if (has_read_lease &&
-                            metadata.HasReplica([](const Replica& replica) {
-                                return !replica.is_memory_replica();
-                            })) {
-                            // File-backed reads can resolve storage by key, so
-                            // they cannot retain an old version across
-                            // replacement.
-                            settled.emplace(tl::make_unexpected(
-                                ErrorCode::OBJECT_HAS_LEASE));
-                            return;
-                        }
-
-                        if (metadata.size == slice_length && !has_read_lease) {
-                            metadata.client_id = client_id;
-                            metadata.put_start_time = now;
-
-                            const auto previous_kv_media =
-                                KvMediaSnapshot(metadata);
-
-                            // Mark COMPLETE → PROCESSING so readers won't see
-                            // stale data mid-transfer.  The key becomes
-                            // unreadable until UpsertEnd.
-                            std::unordered_set<ReplicaID> eligible_replica_ids;
-                            metadata.VisitReplicas(
-                                &Replica::fn_is_completed,
-                                [&eligible_replica_ids](Replica& replica) {
-                                    eligible_replica_ids.insert(replica.id());
-                                    replica.mark_processing();
-                                });
-                            metadata.BeginSoftPinAction(
-                                *soft_pin_request,
-                                std::move(eligible_replica_ids));
-                            SyncCacheTotalAccounting(metadata);
-                            SyncKvObjectState(key, metadata,
-                                              object_id.tenant_id,
-                                              previous_kv_media);
-
-                            state.is_processing = true;
-
-                            // Answer with the existing descriptors — same
-                            // buffer addresses as before.
-                            std::vector<Replica::Descriptor> replica_list;
-                            const auto& all_replicas =
-                                metadata.GetAllReplicas();
-                            replica_list.reserve(all_replicas.size());
-                            for (const auto& replica : all_replicas) {
-                                replica_list.emplace_back(
-                                    replica.get_descriptor());
-                            }
-
-                            VLOG(1) << "key=" << key
-                                    << ", action=upsert_start_case_b_inplace";
-                            settled.emplace(std::move(replica_list));
-                            return;
-                        }
-
-                        // --- Case C: different size or active readers —
-                        // reallocate ---
-                        // Old buffers cannot be reused.  Move them to
-                        // discarded_replicas_ for delayed release (readers may
-                        // still hold descriptors without refcnt), then allocate
-                        // fresh buffers at the new size.
-                        //
-                        // Preserve hard_pin and soft_pin from the old metadata
-                        // so that eviction protection survives a size-changing
-                        // upsert (RFC §2.2.2).
-                        merged_config = config;
-                        merged_config.with_hard_pin =
-                            merged_config.with_hard_pin ||
-                            metadata.IsHardPinned();
-                        committed_soft_pin_timeout =
-                            metadata.GetCommittedSoftPinTimeout();
-                        if (committed_soft_pin_timeout &&
-                            *committed_soft_pin_timeout <= now) {
-                            committed_soft_pin_timeout.reset();
-                        }
-
-                        existing_group_id = metadata.group_id;
-                        const auto previous_kv_media =
-                            KvMediaSnapshot(metadata);
-                        has_replacement_charge =
-                            enable_multi_tenants_ &&
-                            metadata.quota_ledger.TotalChargedBytes() != 0;
-                        auto* quota_account =
-                            GetBoundTenantQuotaHandle(*tenant);
-
-                        // A leased memory snapshot still references the old
-                        // replica descriptors. Allocate the replacement before
-                        // removing the old metadata so an allocation failure
-                        // leaves the old object readable instead of turning it
-                        // into OBJECT_NOT_FOUND.
-                        if (has_read_lease) {
-                            replacement_pending_quota_charge =
-                                RequestedMemoryQuotaCharge(slice_length,
-                                                           merged_config);
-                            auto quota_result = ChargeTenantQuota(
-                                quota_account,
-                                replacement_pending_quota_charge);
-                            if (!quota_result) {
-                                settled.emplace(
-                                    tl::make_unexpected(quota_result.error()));
-                                return;
-                            }
-                            auto allocation_result =
-                                AllocateReplicas(key, slice_length,
-                                                 merged_config, writer_host_id);
-                            if (!allocation_result) {
-                                ReleaseTenantQuota(
-                                    quota_account,
-                                    replacement_pending_quota_charge);
-                                settled.emplace(tl::make_unexpected(
-                                    allocation_result.error()));
-                                return;
-                            }
-                            replacement_replicas.emplace(
-                                std::move(allocation_result.value()));
-                        }
-
-                        if (has_replacement_charge) {
-                            auto transfer_result =
-                                metadata.quota_ledger.TransferReplacementCharge(
-                                    quota_account, replacement_charge);
-                            if (!transfer_result) {
-                                LogTenantQuotaLedgerError(
-                                    transfer_result, "transfer_replacement_out",
-                                    object_id.tenant_id, key);
-                                if (replacement_replicas.has_value()) {
-                                    FreeDfsReplicas(key, *replacement_replicas);
-                                    ReleaseTenantQuota(
-                                        quota_account,
-                                        replacement_pending_quota_charge);
-                                }
-                                settled.emplace(tl::make_unexpected(
-                                    ErrorCode::INTERNAL_ERROR));
-                                return;
-                            }
-                        }
-                        // A query granted before this write lock can retain its
-                        // descriptor for a full read TTL. Keep the old
-                        // allocation for at least that long as well as the
-                        // writer grace period.
-                        const auto release_at =
-                            std::chrono::system_clock::now() +
-                            std::max(std::chrono::milliseconds(
-                                         default_kv_lease_ttl_),
-                                     std::chrono::duration_cast<
-                                         std::chrono::milliseconds>(
-                                         put_start_release_timeout_sec_));
-                        auto old_replicas =
-                            PopReplicasWithCacheTotalAccounting(metadata);
-                        if (!old_replicas.empty()) {
-                            FreeDfsReplicas(key, old_replicas);
-                            std::lock_guard lock(discarded_replicas_mutex_);
-                            discarded_replicas_.emplace_back(
-                                std::move(old_replicas), release_at);
-                        }
-                        // The erase ends this callback: the replacement is
-                        // published after it, once the entry's lock is gone, so
-                        // a reader in between finds the key absent. Only this
-                        // call's own per-key operation lock keeps another
-                        // PutStart or UpsertStart out of that window.
-                        EraseMetadata(*tenant, entry, metadata, state,
-                                      object_id.tenant_id,
-                                      QuotaEraseMode::kPreserveOld,
-                                      previous_kv_media);
-                        reallocating = true;
+                        rewrite(*tenant, entry, metadata, state);
                     });
             }
 
