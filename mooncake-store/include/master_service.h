@@ -1317,6 +1317,14 @@ class MasterService {
     void DiscardExpiredProcessingReplicas(
         metadata::Tenant& tenant,
         const std::chrono::system_clock::time_point& now);
+    // The same over an object list the caller already holds and has already
+    // partitioned, so a walk that took the handles does not take them again.
+    // Each object is handled under its own lock, so two callers may sweep
+    // disjoint parts of one tenant at the same time.
+    void DiscardExpiredProcessingReplicas(
+        metadata::Tenant& tenant,
+        const std::vector<std::shared_ptr<ObjectEntry>>& entries,
+        const std::chrono::system_clock::time_point& now);
     void FreeDfsReplicas(const std::string& key,
                          const std::vector<Replica>& replicas);
     void RunDfsEviction();

@@ -10289,18 +10289,22 @@ void MasterService::EvictionThreadFunc() {
 void MasterService::DiscardExpiredProcessingReplicas(
     metadata::Tenant& tenant,
     const std::chrono::system_clock::time_point& now) {
-    std::list<DiscardedReplicas> discarded_replicas;
+    // A snapshot handle says nothing about being current, so the walk below
+    // re-checks each entry under its own lock before anything is touched and
+    // skips one the route has already replaced.
+    DiscardExpiredProcessingReplicas(tenant, tenant.SnapshotObjects(), now);
+}
 
-    // The per-key task state lives on the entry, so one snapshot walk reaches
-    // every task this tenant owns. A snapshot handle says nothing about being
-    // current, so each entry is re-resolved under its own lock before anything
-    // is touched, and an entry the route has already replaced is skipped.
-    const auto entries = tenant.SnapshotObjects();
+void MasterService::DiscardExpiredProcessingReplicas(
+    metadata::Tenant& tenant,
+    const std::vector<std::shared_ptr<ObjectEntry>>& entries,
+    const std::chrono::system_clock::time_point& now) {
+    std::list<DiscardedReplicas> discarded_replicas;
 
     // The handle does not carry the tenant id, and the bookkeeping a removal
     // feeds is keyed by it (KV events, the soft-pin deadline index). Every
-    // object of a tenant carries the same id, so the first object states it; a
-    // tenant holding no object has nothing to discard.
+    // object of a tenant carries the same id, so the first object of the list
+    // states it; a list holding no object has nothing to discard.
     TenantId tenant_id = TenantId::Default();
     for (const auto& entry : entries) {
         entry->WithSharedAccess(
@@ -11633,9 +11637,6 @@ void MasterService::BatchEvict(double evict_ratio_target,
         TenantId tenant_id;
         std::shared_ptr<metadata::Tenant> tenant;
         std::vector<std::shared_ptr<ObjectEntry>> entries;
-        // A tenant's expired-processing sweep runs once, on the slice holding
-        // its first objects.
-        bool sweep_expired_processing{false};
     };
 
     std::vector<std::pair<TenantId, std::shared_ptr<metadata::Tenant>>> tenants;
@@ -11668,7 +11669,6 @@ void MasterService::BatchEvict(double evict_ratio_target,
             slice.entries.assign(
                 std::make_move_iterator(entries.begin() + offset),
                 std::make_move_iterator(entries.begin() + offset + count));
-            slice.sweep_expired_processing = offset == 0;
             slices.push_back(std::move(slice));
             offset += count;
         }
@@ -11722,12 +11722,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
     run_over_slices([&](size_t index) {
         CensusTally& tally = tallies[index];
         const CensusSlice& slice = slices[index];
-        // The sweep takes entry locks exclusively and the census below takes
-        // them shared, so a sweep running next to its own tenant's census still
-        // serializes per object on that object's lock.
-        if (slice.sweep_expired_processing) {
-            DiscardExpiredProcessingReplicas(*slice.tenant, now);
-        }
+        // The sweep takes each entry's lock exclusively and the census below
+        // takes it shared, so one worker does its own slice end to end and no
+        // two workers touch the same object.
+        DiscardExpiredProcessingReplicas(*slice.tenant, slice.entries, now);
         // The snapshot only names the keys to consider: every eviction
         // below resolves its candidate again under that object's own lock,
         // so a handle that stopped being current is caught there.
