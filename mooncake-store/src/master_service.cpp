@@ -13115,8 +13115,7 @@ tl::expected<void, ErrorCode>
 MasterService::ValidateDynamicReplicaPendingForCopyStart(
     ObjectEntry::State& state, const UUID& dynamic_replication_lease_id,
     const UUID& client_id, const std::string& source_segment,
-    uint64_t current_version_epoch,
-    uint64_t dynamic_replication_version_epoch,
+    uint64_t current_version_epoch, uint64_t dynamic_replication_version_epoch,
     const std::vector<std::string>& target_segments) {
     const bool dynamic_copy = dynamic_replication_lease_id != UUID{};
     // Dropping a pending task clears the cooldown with it, so the next proposal
