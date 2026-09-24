@@ -11621,8 +11621,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
         evict_ratio_target >= kCompactPrebypassTargetRatio;
 
     // What one worker accumulates for its own slices. No accumulator is shared
-    // with another worker, so the partition needs no lock of its own.
-    struct CensusTally {
+    // with another worker, so the partition needs no lock of its own; the
+    // padding gives each of them its own cache line, because the vector headers
+    // of two workers packed into one line are written by both on every push.
+    struct alignas(64) CensusTally {
         long eviction_base{0};
         std::vector<Candidate> candidates;
         std::vector<std::chrono::system_clock::time_point> no_pin_timeouts;
@@ -11800,7 +11802,13 @@ void MasterService::BatchEvict(double evict_ratio_target,
     auto collect_candidates = [&](bool use_cutoff,
                                   std::chrono::system_clock::time_point cutoff,
                                   bool collect_older_or_equal) {
-        std::vector<std::vector<Candidate>> per_slice(slices.size());
+        // Padded for the same reason as CensusTally: these are per-worker
+        // accumulators, and packing their headers into one cache line makes
+        // every append a coherence round trip between two workers.
+        struct alignas(64) CandidateCollection {
+            std::vector<Candidate> entries;
+        };
+        std::vector<CandidateCollection> per_slice(slices.size());
         run_over_slices([&](size_t index) {
             const CensusSlice& slice = slices[index];
             for (const auto& entry : slice.entries) {
@@ -11826,21 +11834,21 @@ void MasterService::BatchEvict(double evict_ratio_target,
                             return;
                         }
                     }
-                    per_slice[index].push_back(
+                    per_slice[index].entries.push_back(
                         {slice.tenant_id, entry->key(), deadline});
                 });
             }
         });
         size_t total = 0;
         for (const auto& collected : per_slice) {
-            total += collected.size();
+            total += collected.entries.size();
         }
         std::vector<Candidate> merged;
         merged.reserve(total);
         for (auto& collected : per_slice) {
             merged.insert(merged.end(),
-                          std::make_move_iterator(collected.begin()),
-                          std::make_move_iterator(collected.end()));
+                          std::make_move_iterator(collected.entries.begin()),
+                          std::make_move_iterator(collected.entries.end()));
         }
         return merged;
     };
