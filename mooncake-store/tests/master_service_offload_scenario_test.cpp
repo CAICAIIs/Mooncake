@@ -68,8 +68,8 @@ std::vector<std::string> HeartbeatKeys(size_t begin, size_t end) {
 }  // namespace
 
 TEST(MasterServiceOffloadScenarioTest, HeartbeatReturnsObjectsPutSinceEnable) {
-    // Spread enough keys across the metadata shards that the heartbeat sweep
-    // covers all of them, as the direct test did with 3000 keys per phase.
+    // Enough keys that the heartbeat sweep covers all of them, as the direct
+    // test did with 3000 keys per phase.
     constexpr size_t kBatch = 3000;
     MasterScenario scenario(
         "the heartbeat hands back objects put while offloading was enabled",
@@ -166,8 +166,8 @@ TEST(MasterServiceOffloadScenarioTest, BatchRemoveDropsQueuedOffloadMirrors) {
         .When(OffloadHeartbeat("node").ExpectNoTasks());
 }
 
-// An offload task passes through two observable states in
-// offloading_tasks[key]: QUEUED (mirror still present, worker has not seen
+// An offload task passes through two observable states in the entry's own
+// offloading task state: QUEUED (mirror still present, worker has not seen
 // the task; UpsertStart cancels it in place) and IN-FLIGHT (mirror drained by
 // the heartbeat; UpsertStart returns OBJECT_HAS_REPLICATION_TASK and the
 // caller retries after the worker's completion).
