@@ -96,7 +96,9 @@ class MasterServiceTestPeer;
  * be taken without holding the ones listed above it, never the other way
  * round:
  * 1. object_operation_locks_[stripe], which PutStart and UpsertStart hold for
- *    the whole request
+ *    the whole request. Holding it per key rather than per operation is what
+ *    keeps another writer out of the window where UpsertStart has erased the
+ *    object it replaces and has not yet published the replacement.
  * 2. client_mutex_
  * 3. a ClientLivenessRecord's serving or retaining guard
  * 4. tenant_quota_policy_mutex_
