@@ -1,44 +1,20 @@
 // Regression test for the invalid-replica cleanup that runs at the head of a
-// read-write operation: it tears one publication down at most once, and it must
-// not crash the process.
+// read-write operation: it must tear one publication down at most once, and it
+// must not crash the process.
 //
-// The trigger chain is the one behind the 2026-08-03 incident, in which
-// mooncake_master segfaulted every ~5 minutes after a snapshot restore, always
-// at the same instruction inside
-// std::unordered_set<std::string>::erase(const_iterator). The retired per-shard
-// model kept the in-processing set in the tenant state, and the accessor's
-// cleanup erased a key from it twice: the first erase freed the node the second
-// one then erased through a cached iterator, so libstdc++ re-read the cached
-// hash from freed memory, walked the bucket chain looking for it by address and
-// dereferenced the chain end.
+// The chain: MountSegment a segment, PutStart a key without PutEnd (routing
+// the entry with is_processing set and one incomplete replica), then
+// PrepareUnmountSegment so that replica's memory handle goes invalid, then
+// PutEnd, which resolves the entry, drops the invalid replica and tears the
+// object down exactly once.
 //
-// The per-key task state now lives on the object's own entry, and one teardown
-// point claims it: EraseMetadata sets ObjectEntry::State::is_torn_down first,
-// and reports false to every later caller, so the same chain cannot dismantle
-// one publication twice:
-//   1. MountSegment             (a "ghost" client mounts a segment)
-//   2. PutStart without PutEnd  (the entry is routed with is_processing set and
-//                                an incomplete replica on that segment)
-//   3. PrepareUnmountSegment    (the ghost client's allocator is destroyed, so
-//                                the replica's memory handle is invalid:
-//                                has_invalid_mem_handle() == true)
-//   4. PutEnd                   (the read-write access resolves the entry,
-//                                drops the invalid replica, finds the object
-//                                invalid and tears it down exactly once — the
-//                                child below checks the flag and the released
-//                                route)
-//
-// Step 3 must NOT use MasterService::UnmountSegment: it runs
+// The unmount must not use MasterService::UnmountSegment: it runs
 // ClearInvalidHandles() internally, which would erase the crafted object
-// through the sweep before step 4 could exercise the accessor's own cleanup.
-// Production had the same window: the expiry path unmounted the ghost segment
-// and only then slowly swept 23M keys, so any RPC landing in that window took
-// the accessor cleanup first.
+// through the sweep before PutEnd could exercise the accessor's own cleanup.
 //
-// The scenario runs in a forked child so a regression surfaces as a clean test
-// failure instead of killing the test binary: the child reports what it saw
-// through its exit code, and the parent turns a signal or a wrong code into a
-// failure.
+// The child asserts EraseMetadata claimed ObjectEntry::State::is_torn_down,
+// the processing marker is cleared and the route slot is gone, and reports
+// that through its exit code: a forked child turns a crash into a test failure.
 
 #include "master_service.h"
 #include "master_service/master_service_test_peer.h"
@@ -71,14 +47,13 @@ class MasterServiceProcessingKeyDoubleEraseTest : public ::testing::Test {
     static constexpr int kExitMountFailed = 2;      // scenario setup broken
     static constexpr int kExitPutStartFailed = 3;   // scenario setup broken
     static constexpr int kExitUnmountFailed = 4;    // scenario setup broken
-    static constexpr int kExitPutEndAnswer = 5;     // trigger did not report
-                                                    // the object as absent
+    static constexpr int kExitPutEndAnswer = 5;     // PutEnd answered wrong
     static constexpr int kExitNotTornDown = 6;      // teardown flag unclaimed
     static constexpr int kExitStillProcessing = 7;  // marker outlived teardown
     static constexpr int kExitStillRouted = 8;      // slot outlived teardown
 
-    // Builds the incident state and fires the trigger. Only returns on code
-    // where the cleanup claims the teardown; a double teardown would die here.
+    // Builds the crafted state and fires the trigger; only returns once the
+    // cleanup has claimed the teardown, so a double teardown dies here.
     void RunIncidentScenario() {
         MasterService service(MasterServiceConfig::builder().build());
 
@@ -153,9 +128,8 @@ class MasterServiceProcessingKeyDoubleEraseTest : public ::testing::Test {
             ::_exit(kExitStillProcessing);
         }
         if (MasterServiceTestPeer::FindObject(
-                service,
-                MasterServiceTestPeer::ObjectIdentity{TenantId::Default(),
-                                                      key}) != nullptr) {
+                service, MasterServiceTestPeer::ObjectIdentity{
+                             TenantId::Default(), key}) != nullptr) {
             ::_exit(kExitStillRouted);
         }
 
@@ -167,9 +141,8 @@ class MasterServiceProcessingKeyDoubleEraseTest : public ::testing::Test {
     }
 };
 
-// The trigger chain must reach the end without crashing, with the object torn
-// down exactly once: the child dies with SIGSEGV on code that dismantles one
-// publication twice.
+// The chain above must reach the end without crashing, with the object torn
+// down exactly once.
 TEST_F(MasterServiceProcessingKeyDoubleEraseTest,
        AccessorCleanupAfterSegmentUnmountDoesNotCrash) {
     ::fflush(nullptr);

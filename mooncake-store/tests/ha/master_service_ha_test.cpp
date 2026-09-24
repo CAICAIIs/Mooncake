@@ -718,8 +718,8 @@ class MasterServiceHATest : public ::testing::Test {
     static std::vector<Replica::Descriptor> ReplicaDescriptorsForTesting(
         MasterService& service, const TenantId& tenant_id,
         const std::string& key) {
-        // The stored object is read as it is held, so a replica a request path
-        // would refuse to serve is still reported here.
+        // Read as stored: a replica a request path would refuse to serve is
+        // still reported here.
         return MasterServiceTestPeer(service)
             .WithStoredObjectForRead(
                 tenant_id, key,
@@ -745,8 +745,8 @@ class MasterServiceHATest : public ::testing::Test {
     static bool HasInvalidMemoryHandleForTesting(MasterService& service,
                                                  const TenantId& tenant_id,
                                                  const std::string& key) {
-        // An object that is absent or no longer readable has nothing a caller
-        // could read, which is the state the callers assert.
+        // A missing or unreadable object counts as having no valid handle,
+        // which is the state the callers assert.
         return MasterServiceTestPeer(service)
             .WithPublishedObjectForRead(
                 tenant_id, key,
@@ -801,8 +801,8 @@ class MasterServiceHATest : public ::testing::Test {
     static bool HasCompletedMemoryReplicaForTesting(MasterService& service,
                                                     const TenantId& tenant_id,
                                                     const std::string& key) {
-        // An object whose only handle went stale is still held, so the stored
-        // object is the one to look at rather than the readable one.
+        // A stale handle leaves the object held but unreadable, so the stored
+        // object is what this has to look at.
         return MasterServiceTestPeer(service)
             .WithStoredObjectForRead(
                 tenant_id, key,
@@ -881,16 +881,10 @@ class MasterServiceHATest : public ::testing::Test {
             MasterServiceTestPeer::SnapshotMutex(service));
     }
 
-    // The create paths take the snapshot barrier and the object's own lock for
-    // their discovery section, release both, and only then wait for the serving
-    // guard of the client they will read from. This runs one create task and
-    // checks that ordering: while the task is parked in that section the
-    // barrier is held, and once the section has ended the object's own lock is
-    // free again even though the serving guard is still held here.
-    //
-    // The section reaches the object through its entry, so holding that entry's
-    // own lock is what parks the task: the lock is held here, the task runs
-    // into the section and cannot get past it.
+    // The create paths hold the snapshot barrier and the object's own lock for
+    // their discovery section and release both before waiting for the source
+    // client's serving guard. Holding that object's lock is what parks one
+    // create task in the section, pinning the order this checks.
     template <typename CreateTask>
     static bool CreateTaskReleasesMetadataBeforeServingGuardForTesting(
         MasterService& service, const UUID& source_client,
@@ -920,10 +914,9 @@ class MasterServiceHATest : public ::testing::Test {
             }
             return false;
         };
-        // The task's section holds the barrier for as long as this test holds
-        // the object's lock, while a background worker only crosses it, so
-        // requiring the barrier to stay held over a window is what tells the
-        // task's own section apart from an unrelated holder.
+        // Requiring the barrier to stay held over a window separates the task's
+        // own section, which cannot leave while this test holds the object's
+        // lock, from an unrelated holder that only crosses it.
         const auto barrier_held_for = [&](auto duration) {
             const auto deadline = std::chrono::steady_clock::now() + duration;
             while (std::chrono::steady_clock::now() < deadline) {
@@ -941,8 +934,8 @@ class MasterServiceHATest : public ::testing::Test {
             MasterServiceTestPeer(service).WithEntryLockedForTesting(
                 tenant_id, key, [&] {
                     object_lock_held.store(true, std::memory_order_release);
-                    while (!release_object_lock.load(
-                        std::memory_order_acquire)) {
+                    while (
+                        !release_object_lock.load(std::memory_order_acquire)) {
                         std::this_thread::yield();
                     }
                 });
@@ -986,10 +979,9 @@ class MasterServiceHATest : public ::testing::Test {
             waiting_for_serving_guard &&
             probe_acquired.load(std::memory_order_acquire);
 
-        // Released last: while this test holds it the task is parked, and a
-        // task that keeps the object's lock across that wait never lets the
-        // probe in. The guard goes first so the probe can never be left waiting
-        // on a lock nothing will release.
+        // Released last: while this test holds it the task stays parked, and a
+        // task that kept the object's lock across that wait never lets the
+        // probe in. The guard goes first so nothing waits on it forever.
         serving_guard.reset();
         if (probe.joinable()) {
             probe.join();
@@ -1764,9 +1756,8 @@ TEST_F(MasterServiceHATest,
     // Route the key with a processing entry: the PutStart under test reaches
     // the object through that entry's own lock, so holding the lock parks it
     // inside its snapshot section.
-    ASSERT_TRUE(
-        service.PutStart(client_id, key, kDefaultTenant, 1024, config)
-            .has_value());
+    ASSERT_TRUE(service.PutStart(client_id, key, kDefaultTenant, 1024, config)
+                    .has_value());
     std::this_thread::sleep_for(std::chrono::milliseconds(2));
 
     std::atomic<bool> object_lock_held{false};
@@ -1816,10 +1807,9 @@ TEST_F(MasterServiceHATest,
     auto client_lock = LockClientForTesting(service);
     release_object_lock.store(true, std::memory_order_release);
     object_lock_holder.join();
-    // A real re-acquire would block PutStart forever on client_mutex_ (held by
-    // the test), so a generous window still catches it; the stale-entry cleanup
-    // and the LOCAL_FIRST allocation a legal PutStart runs here complete far
-    // within it.
+    // A re-acquire would block PutStart on client_mutex_ for good, so a
+    // generous window still catches it; the cleanup and allocation a legal
+    // PutStart runs here finish well inside it.
     const bool completed_while_client_locked =
         put.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
     client_lock.unlock();

@@ -47,9 +47,9 @@ void MasterServiceTestPeer::SetKvTenantEpochTrackingForTesting(bool enabled) {
     service_.kv_track_tenant_epochs_ = enabled;
 }
 
-void MasterServiceTestPeer::SetRemoveAllShardHookForTesting(
+void MasterServiceTestPeer::SetRemoveAllTenantHookForTesting(
     std::function<void(size_t)> hook) {
-    service_.kv_remove_all_shard_hook_ = std::move(hook);
+    service_.kv_remove_all_tenant_hook_ = std::move(hook);
 }
 
 uint64_t MasterServiceTestPeer::GetKvClearedPublishedForTesting() const {
@@ -119,9 +119,8 @@ void MasterServiceTestPeer::SeedPromotionTaskForTesting(
     auto tenant_handle = service_.GetOrCreateTenantHandle(tenant_id);
     auto entry = tenant_handle->Get(key);
     if (entry == nullptr) {
-        // A key no writer published yet still needs an entry to carry the
-        // task, and the route is what keeps it reachable by the completion
-        // path, so seed it through InsertObject rather than beside the route.
+        // The route is what keeps the entry reachable by the completion path,
+        // so an unpublished key is seeded through InsertObject.
         entry = std::make_shared<ObjectEntry>(std::make_unique<ObjectMetadata>(
             holder_id, std::chrono::system_clock::now(), object_size,
             std::vector<Replica>{}, std::nullopt, false,
@@ -145,25 +144,15 @@ void MasterServiceTestPeer::SeedPromotionTaskForTesting(
 size_t MasterServiceTestPeer::CountCandidatesForTesting(
     const TenantId& tenant_id) {
     std::shared_lock<std::shared_mutex> lock(service_.snapshot_mutex_);
-    // The candidate state lives in each entry; the service keeps only the
-    // sparse index of the keys that carry one, per tenant.
+    // The count is the tenant's candidate index; the candidate state itself
+    // lives on each entry.
     return service_.PromotionCandidateKeys(tenant_id).size();
-}
-
-size_t MasterServiceTestPeer::PromotionCandidateIndexBucketCount(
-    MasterService& service, const TenantId& tenant_id) {
-    std::lock_guard<std::mutex> lock(service.replica_action_mutex_);
-    const auto it = service.replica_action_state_.find(tenant_id);
-    return it == service.replica_action_state_.end()
-               ? 0
-               : it->second.promotion_candidate_keys.bucket_count();
 }
 
 void MasterServiceTestPeer::ResetCandidateBackoffsForTesting() {
     const auto epoch = std::chrono::steady_clock::time_point{};
-    // The candidate index only names the keys, so each key is resolved again
-    // under its own entry lock before the backoff is reset; a key whose entry
-    // was replaced in between is skipped.
+    // The index only names keys, so each key is resolved again under its own
+    // entry lock; a key whose entry was replaced in between is skipped.
     service_.tenants_.Visit(
         [&](const TenantId& tenant_id,
             const std::shared_ptr<metadata::Tenant>& handle) {

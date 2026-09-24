@@ -248,9 +248,8 @@ class SnapshotChildProcessTest : public ::testing::Test {
 
     std::optional<std::chrono::system_clock::time_point> GetSoftPinDeadline(
         MasterService* svc, const std::string& key) {
-        // The committed deadline is itself optional, so this reads the entry
-        // rather than reporting through the published-object helper, whose own
-        // empty optional already means "not published".
+        // The deadline is itself an optional, so it is read from the entry
+        // rather than through the published-object helper.
         auto handle =
             MasterServiceTestPeer::Tenants(*svc).Lookup(TenantId::Default());
         if (handle == nullptr) {
@@ -625,8 +624,7 @@ TEST_F(SnapshotChildProcessTest, RestoreRebuildsGroupedObjectRouting) {
     const std::string key = "snapshot_grouped_route_key";
     ReplicateConfig replicate_config;
     replicate_config.replica_num = 1;
-    replicate_config.group_ids =
-        std::vector<std::string>{key + "_group"};
+    replicate_config.group_ids = std::vector<std::string>{key + "_group"};
 
     auto put_start = service_->PutStart(client_id, key, TenantId::Default(),
                                         1024, replicate_config);
@@ -736,7 +734,7 @@ TEST_F(SnapshotChildProcessTest,
     root_packer.pack_map(3);
     root_packer.pack(std::string("shards"));
     root_packer.pack_map(1);
-    // The legacy "shards" entry key: a reader ignores it, so any value does.
+    // The reader ignores the inner "shards" map key, so any value works.
     root_packer.pack(uint32_t{0});
     root_packer.pack_bin(compressed_shard.size());
     root_packer.pack_bin_body(
@@ -787,7 +785,7 @@ TEST_F(SnapshotChildProcessTest, DeserializeMetadataSkipsInvalidClientId) {
     root_packer.pack_map(3);
     root_packer.pack(std::string("shards"));
     root_packer.pack_map(1);
-    // The legacy "shards" entry key: a reader ignores it, so any value does.
+    // The reader ignores the inner "shards" map key, so any value works.
     root_packer.pack(uint32_t{0});
     root_packer.pack_bin(compressed_shard.size());
     root_packer.pack_bin_body(

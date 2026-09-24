@@ -270,9 +270,8 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
             bytes);
     }
 
-    // The tenant the registry yields for one tenant id, created through the
-    // registry's factory on first use. The factory binds the tenant's quota
-    // account, so a caller that gets a tenant always has one to charge.
+    // The tenant for one tenant id, created through the registry's factory on
+    // first use, which binds its quota account.
     std::shared_ptr<metadata::Tenant> GetOrCreateTenantHandleForTest(
         MasterService& service, const TenantId& tenant_id) {
         return MasterServiceTestPeer(service).GetOrCreateTenantHandle(
@@ -302,8 +301,7 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
         MasterServiceTestPeer(service).ReleaseTenantQuota(account, bytes);
     }
 
-    // One tenant's expired processing replicas, which is the whole of it: a
-    // tenant's objects are one route, not a set of containers to pick from.
+    // Sweeps one tenant: its objects are its whole route, so no key is named.
     void DiscardExpiredProcessingForTest(MasterService& service,
                                          const TenantId& tenant_id) {
         auto tenant =
@@ -334,9 +332,9 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
         const auto visited =
             MasterServiceTestPeer(service).WithPublishedObjectForWrite(
                 tenant_id, key,
-                [&removed_ids](
-                    metadata::Tenant&, const std::shared_ptr<ObjectEntry>&,
-                    ObjectMetadata& metadata, ObjectEntry::State&) {
+                [&removed_ids](metadata::Tenant&,
+                               const std::shared_ptr<ObjectEntry>&,
+                               ObjectMetadata& metadata, ObjectEntry::State&) {
                     metadata.VisitReplicas(
                         &Replica::fn_is_memory_replica,
                         [&removed_ids](Replica& replica) {
@@ -502,10 +500,8 @@ TEST_F(MasterServiceTenantQuotaTest,
     // One tenant id names one tenant, so a second lookup yields the same one.
     EXPECT_EQ(first_tenant, second_tenant);
 
-    auto* first_handle =
-        GetBoundTenantQuotaHandleForTest(service, tenant_id);
-    auto* second_handle =
-        GetBoundTenantQuotaHandleForTest(service, tenant_id);
+    auto* first_handle = GetBoundTenantQuotaHandleForTest(service, tenant_id);
+    auto* second_handle = GetBoundTenantQuotaHandleForTest(service, tenant_id);
 
     ASSERT_NE(first_handle, nullptr);
     // ...and that tenant owns exactly one bound account.

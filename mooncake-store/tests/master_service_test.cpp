@@ -733,11 +733,10 @@ TEST_F(MasterServiceTest, RemoveAllKeepsObjectWhenOpLogReservationFails) {
         << "the object survived, so the tenant was never emptied";
 }
 
-// RemoveAll holds one tenant route at a time, so a commit can land in a tenant
-// whose scan already finished. The scan's own bookkeeping cannot see it, and
-// publishing `cleared` would order it after that commit's `stored` — telling
-// subscribers to drop an object that is live. Pause the scan right after the
-// tenant the new key belongs to, commit there, and the clear must be withheld.
+// RemoveAll releases one tenant route at a time, so a commit can land in a
+// tenant the scan already finished. Publishing `cleared` then orders it after
+// that commit's `stored`, telling subscribers to drop a live object. The hook
+// parks the scan there so the commit is pinned into that window.
 TEST_F(MasterServiceTest, ConcurrentCommitDuringScanSuppressesClear) {
     MasterService service;
     MasterServiceTestPeer(service).SetKvTenantEpochTrackingForTesting(true);
@@ -755,7 +754,7 @@ TEST_F(MasterServiceTest, ConcurrentCommitDuringScanSuppressesClear) {
                     .has_value());
 
     bool committed = false;
-    MasterServiceTestPeer(service).SetRemoveAllShardHookForTesting(
+    MasterServiceTestPeer(service).SetRemoveAllTenantHookForTesting(
         [&](size_t) {
             // Commit exactly once, immediately after the scan releases the
             // tenant route the new key belongs to, so the scan can never
@@ -775,7 +774,7 @@ TEST_F(MasterServiceTest, ConcurrentCommitDuringScanSuppressesClear) {
         });
 
     service.RemoveAll(true);
-    MasterServiceTestPeer(service).SetRemoveAllShardHookForTesting(nullptr);
+    MasterServiceTestPeer(service).SetRemoveAllTenantHookForTesting(nullptr);
 
     ASSERT_TRUE(committed) << "the hook never fired, so nothing was raced";
     auto exists = service.ExistKey("racer_key", TenantId::Default());
@@ -835,7 +834,7 @@ TEST_F(MasterServiceTest, TenantScopedRemoveAllSuppressesClearOnRace) {
                     .has_value());
 
     bool committed = false;
-    MasterServiceTestPeer(service).SetRemoveAllShardHookForTesting(
+    MasterServiceTestPeer(service).SetRemoveAllTenantHookForTesting(
         [&](size_t) {
             // The tenant-scoped overload releases the one route it scanned, so
             // this fire is the last point at which a commit into that tenant
@@ -855,7 +854,7 @@ TEST_F(MasterServiceTest, TenantScopedRemoveAllSuppressesClearOnRace) {
         });
 
     service.RemoveAll(TenantId::Default(), true);
-    MasterServiceTestPeer(service).SetRemoveAllShardHookForTesting(nullptr);
+    MasterServiceTestPeer(service).SetRemoveAllTenantHookForTesting(nullptr);
 
     ASSERT_TRUE(committed) << "the hook never fired, so nothing was raced";
     EXPECT_EQ(0u,
@@ -1327,32 +1326,29 @@ TEST_F(MasterServiceTest, UnmountSegmentHidesReplicasBeforeAsyncCleanup) {
     EXPECT_EQ(2u, service_->GetKeyCount());
 }
 
-// A mass client expiry marks handles stale all over the metadata table, so
-// the sweep cleans a tenant route in bounded write-lock batches instead of
-// holding it exclusively for the whole walk. Dropping and retaking the lock
-// mid-route must not cost coverage: every key of the departed segment is
-// erased, and every key of a live segment survives. All the keys below belong
-// to the one tenant of the default id, so they share the single route the
-// batches are taken over.
-TEST_F(MasterServiceTest, ClearInvalidHandlesSweepsRouteAcrossLockBatches) {
+// A mass client expiry marks handles stale all over the metadata table, and the
+// sweep takes one object's lock at a time, so the unlinking of one visit must
+// not hide the objects behind it: every object whose only memory segment was
+// unmounted is erased, and every object on a live segment stays readable.
+TEST_F(MasterServiceTest, ClearInvalidHandlesSweepsUnmountedSegments) {
     auto service = std::make_unique<MasterService>();
     PauseReplicaCleanup(*service);
 
     constexpr size_t kSegmentSize = 1024 * 1024 * 128;
-    const std::string stale_segment_name = "batch_sweep_stale_segment";
-    const std::string live_segment_name = "batch_sweep_live_segment";
+    const std::string stale_segment_name = "sweep_stale_segment";
+    const std::string live_segment_name = "sweep_live_segment";
     const auto stale_segment = PrepareSimpleSegment(
         *service, stale_segment_name, 0x300000000, kSegmentSize);
     const auto live_segment = PrepareSimpleSegment(*service, live_segment_name,
                                                    0x400000000, kSegmentSize);
 
-    // Enough keys per segment that draining the route takes several batches.
+    // Enough keys per segment that the walk covers many objects.
     constexpr size_t kKeysPerSegment = 100;
 
     std::vector<std::string> stale_keys;
     std::vector<std::string> live_keys;
     for (size_t i = 0; i < 2 * kKeysPerSegment; ++i) {
-        const std::string key = "batch_sweep_key_" + std::to_string(i);
+        const std::string key = "sweep_key_" + std::to_string(i);
 
         const bool on_stale_segment = stale_keys.size() < kKeysPerSegment;
         const UUID& client_id =
@@ -1637,216 +1633,6 @@ TEST_F(MasterServiceTest, ShrinkBucketsIfSparseThresholds) {
     ShrinkBucketsIfSparse(map);
     EXPECT_LT(map.bucket_count(), high_water);
     EXPECT_GE(map.bucket_count(), map.size());
-}
-
-TEST_F(MasterServiceTest, BatchEvictShrinksSparseMetadataMaps) {
-    // Zero lease TTL so every committed object is immediately evictable, and a
-    // zero pool watermark so the on-hit admission path rejects a key rather
-    // than queueing a promotion task for it — the rejection is the branch that
-    // records the candidate. Offload is what builds the promotion machinery, so
-    // it has to be on for the admission path to run at all. The candidate index
-    // is the per-tenant container this test measures, because a tenant's object
-    // route now lives inside the frozen metadata::Tenant.
-    auto service_config = MasterServiceConfig::builder()
-                              .set_default_kv_lease_ttl(0)
-                              .set_enable_offload(true)
-                              .set_eviction_high_watermark_ratio(0.0)
-                              .build();
-    service_config.promotion_on_hit = true;
-    service_config.promotion_admission_threshold = 1;
-    std::unique_ptr<MasterService> service_(new MasterService(service_config));
-    // With the watermark at zero the periodic pass would evict on the first
-    // mounted byte, somewhere between the staging below and the assertion.
-    // This test drives exactly one pass, so the worker is parked.
-    MasterServiceTestPeer::EvictionRunning(*service_).store(false);
-
-    const UUID client_id = generate_uuid();
-    constexpr size_t buffer = 0x300000000;
-    constexpr size_t object_size = 1024;
-    constexpr size_t object_count = 2 * kShrinkMinBucketCount;
-    // Size the segment with ample headroom so allocations never run out.
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(
-        *service_, "test_segment", buffer, object_size * object_count * 16);
-
-    // Every key belongs to the one tenant of the default id, so its candidates
-    // all land in that tenant's index and grow it past the shrink floor.
-    std::vector<std::string> keys;
-    keys.reserve(object_count);
-    for (size_t i = 0; i < object_count; ++i) {
-        keys.push_back("shrink_key_" + std::to_string(i));
-    }
-
-    ReplicateConfig config;
-    config.replica_num = 1;
-    for (const auto& key : keys) {
-        // Hard-pin the first object: it is excluded from eviction, so the
-        // tenant (and its candidate index) deterministically survives the
-        // full eviction below and the shrunk bucket count stays observable.
-        config.with_hard_pin = (&key == &keys.front());
-        ASSERT_TRUE(service_
-                        ->PutStart(client_id, key, TenantId::Default(),
-                                   object_size, config)
-                        .has_value());
-        ASSERT_TRUE(service_
-                        ->PutEnd(client_id, key, TenantId::Default(),
-                                 ReplicaType::MEMORY)
-                        .has_value());
-        // The admission a read hit drives, taken directly so no LOCAL_DISK
-        // replica is needed per key: over the watermark the key is recorded as
-        // a candidate instead of being queued as a task.
-        ASSERT_EQ(
-            MasterServiceTestPeer::PromotionQueueResult::kWatermarkRejected,
-            MasterServiceTestPeer(*service_).TryPushPromotionQueue(
-                MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key},
-                /*record_candidate=*/true))
-            << "key=" << key;
-    }
-    ASSERT_EQ(object_count,
-              MasterServiceTestPeer(*service_).CountCandidatesForTesting(
-                  TenantId::Default()));
-
-    const size_t buckets_before = MetadataBucketCount(*service_);
-    ASSERT_GT(buckets_before, kShrinkMinBucketCount);
-
-    MasterServiceTestPeer(*service_).RunBatchEvictForTesting(1.0, 1.0);
-
-    // Only the hard-pinned survivor is left, and it kept its candidate, so the
-    // tenant's index is sparse rather than gone.
-    auto survivor = service_->ExistKey(keys.front(), TenantId::Default());
-    ASSERT_TRUE(survivor.has_value());
-    EXPECT_TRUE(survivor.value());
-    EXPECT_EQ(1u, MasterServiceTestPeer(*service_).CountCandidatesForTesting(
-                      TenantId::Default()));
-
-    const size_t buckets_after = MetadataBucketCount(*service_);
-    ASSERT_GT(buckets_after, 0u);
-    // Without the post-eviction shrink the bucket array would still sit at
-    // its high-water mark and this assertion would fail.
-    EXPECT_LT(buckets_after, buckets_before / 2);
-}
-
-TEST_F(MasterServiceTest, ClearStaleHandlesShrinksSparseMetadataMaps) {
-    // Regression for the lease-expire / client-offboarding delete path.
-    // ClearInvalidHandles -> ClearStaleHandles can erase tens of millions of
-    // keys from a shared tenant; erase() never returns bucket memory, so a
-    // tenant that loses most (but not all) of its keys would keep its
-    // high-water bucket array forever and RSS would never drop. The container
-    // measured here is the per-tenant promotion-candidate key index, the one
-    // per-tenant key-keyed container the service still owns; the shrink pass at
-    // the end of ClearStaleHandles mirrors the one in BatchEvict.
-    auto service_config =
-        MasterServiceConfig::builder()
-            .set_enable_offload(true)
-            .set_eviction_high_watermark_ratio(0.0)
-            .build();
-    service_config.promotion_on_hit = true;
-    service_config.promotion_admission_threshold = 1;
-    auto service = std::make_unique<MasterService>(service_config);
-    PauseReplicaCleanup(*service);
-    // With the watermark at zero the periodic pass would evict the objects this
-    // test expects the sweep to erase, so the worker is parked.
-    MasterServiceTestPeer::EvictionRunning(*service).store(false);
-
-    constexpr size_t kSegmentSize = 1024 * 1024 * 128;
-    const std::string stale_segment_name = "clear_shrink_stale_segment";
-    const std::string live_segment_name = "clear_shrink_live_segment";
-    const auto stale_segment = PrepareSimpleSegment(
-        *service, stale_segment_name, 0x300000000, kSegmentSize);
-    const auto live_segment = PrepareSimpleSegment(*service, live_segment_name,
-                                                   0x400000000, kSegmentSize);
-
-    // A few live keys keep the tenant's index non-empty after the sweep
-    // (partial drain, not full erase); the rest are swept and must trigger a
-    // shrink. Every key belongs to the one tenant of the default id, so its
-    // candidates all land in that tenant's index.
-    constexpr size_t kLiveKeys = 128;
-    constexpr size_t kTotalKeys = 2 * kShrinkMinBucketCount;
-
-    std::vector<std::string> stale_keys;
-    std::vector<std::string> live_keys;
-    for (size_t i = 0; stale_keys.size() + live_keys.size() < kTotalKeys; ++i) {
-        const std::string key = "clear_shrink_key_" + std::to_string(i);
-
-        const bool on_live = live_keys.size() < kLiveKeys;
-        const UUID& client_id =
-            on_live ? live_segment.client_id : stale_segment.client_id;
-        const std::string& segment_name =
-            on_live ? live_segment_name : stale_segment_name;
-        ReplicateConfig config;
-        config.replica_num = 1;
-        config.preferred_segments = {segment_name};
-
-        ASSERT_TRUE(
-            service->PutStart(client_id, key, TenantId::Default(), 1024, config)
-                .has_value())
-            << "key=" << key;
-        ASSERT_TRUE(service
-                        ->PutEnd(client_id, key, TenantId::Default(),
-                                 ReplicaType::MEMORY)
-                        .has_value())
-            << "key=" << key;
-        (on_live ? live_keys : stale_keys).push_back(key);
-    }
-    ASSERT_GT(stale_keys.size(), live_keys.size());
-
-    // Stage one candidate per key before anything is swept: the admission a
-    // read hit drives, taken directly, where the pool-watermark rejection is
-    // the branch that records the candidate instead of queueing a task.
-    for (const auto& key : stale_keys) {
-        ASSERT_EQ(
-            MasterServiceTestPeer::PromotionQueueResult::kWatermarkRejected,
-            MasterServiceTestPeer(*service).TryPushPromotionQueue(
-                MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key},
-                /*record_candidate=*/true))
-            << "key=" << key;
-    }
-    for (const auto& key : live_keys) {
-        ASSERT_EQ(
-            MasterServiceTestPeer::PromotionQueueResult::kWatermarkRejected,
-            MasterServiceTestPeer(*service).TryPushPromotionQueue(
-                MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key},
-                /*record_candidate=*/true))
-            << "key=" << key;
-    }
-    ASSERT_EQ(kTotalKeys, MasterServiceTestPeer(*service)
-                              .CountCandidatesForTesting(TenantId::Default()));
-
-    const size_t buckets_before = MetadataBucketCount(*service);
-    ASSERT_GT(buckets_before, kShrinkMinBucketCount);
-
-    // Unmount the stale segment, then sweep inline. The tenant survives
-    // because the live segment still holds keys, so the container is only
-    // partially drained — exactly the case that leaks bucket memory without
-    // the shrink.
-    ASSERT_TRUE(
-        service
-            ->UnmountSegment(stale_segment.segment_id, stale_segment.client_id)
-            .has_value());
-    ClearInvalidHandlesForTest(*service);
-
-    // GetKeyCount counts physical metadata, so it distinguishes "swept" from
-    // "merely hidden by the unmount".
-    EXPECT_EQ(live_keys.size(), service->GetKeyCount());
-
-    const size_t buckets_after = MetadataBucketCount(*service);
-    ASSERT_GT(buckets_after, 0u);
-    // Without the post-sweep shrink the bucket array would stay at its
-    // high-water mark and this assertion would fail.
-    EXPECT_LT(buckets_after, buckets_before / 2);
-    // The shrunk index must still be large enough to hold every live key.
-    EXPECT_GE(buckets_after, live_keys.size());
-
-    for (const auto& key : live_keys) {
-        auto get_result = service->GetReplicaList(key, TenantId::Default());
-        ASSERT_TRUE(get_result.has_value()) << "key=" << key << " was swept";
-        ASSERT_EQ(1u, get_result->replicas.size()) << "key=" << key;
-    }
-    for (const auto& key : stale_keys) {
-        auto get_result = service->GetReplicaList(key, TenantId::Default());
-        ASSERT_FALSE(get_result.has_value()) << "key=" << key;
-        EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result.error())
-            << "key=" << key;
-    }
 }
 
 TEST_F(MasterServiceTest, RemoveSoftPinObject) {

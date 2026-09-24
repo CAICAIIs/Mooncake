@@ -119,9 +119,8 @@ class PromotionOnHitTest : public ::testing::Test {
             .value_or(false);
     }
 
-    // std::nullopt when the key has no in-flight promotion task. A plain
-    // result, because the read helper's own optional already carries "the
-    // object was not read".
+    // What a key's in-flight promotion task reports. A plain result, because
+    // the read helper's own optional already means "not read".
     struct PromotionTaskFailures {
         bool has_task;
         uint32_t execution_failures;
@@ -1018,12 +1017,10 @@ TEST_F(PromotionOnHitTest, MultiSegmentAllocRespectsPreferred) {
     service->RemoveAll();
 }
 
-// promotion_queue_limit caps total in-flight tasks cluster-wide
-// (gate: promotion_in_flight_ >= limit). With limit=1 the very first
-// queued task saturates the cap, so a second LOCAL_DISK-only read of
-// another key of the same tenant must be silently dropped by the cap
-// gate (reads still succeed; just no new task is enqueued).
-// QueueLimitRejectsCrossTenant covers the same cap across two tenants.
+// promotion_queue_limit caps in-flight tasks cluster-wide (gate:
+// promotion_in_flight_ >= limit). With limit=1 the first queued task
+// saturates the cap, so a later LOCAL_DISK-only read of another key is
+// dropped by the gate while the read itself still succeeds.
 TEST_F(PromotionOnHitTest, QueueLimitRejectsBeyondCap) {
     MasterServiceConfig config;
     config.enable_offload = true;
@@ -1050,9 +1047,8 @@ TEST_F(PromotionOnHitTest, QueueLimitRejectsBeyondCap) {
     auto r1 = service->GetReplicaList(k1, TenantId::Default());
     ASSERT_TRUE(r1.has_value());
 
-    // Second read on k2 (a different key, so no dedup) must be dropped by
-    // the cap gate: the cluster-wide in-flight counter is already 1, which
-    // meets promotion_queue_limit_ = 1.
+    // Second read on k2: a different key, so no dedup, and the cluster-wide
+    // in-flight counter is already at promotion_queue_limit_.
     auto r2 = service->GetReplicaList(k2, TenantId::Default());
     ASSERT_TRUE(r2.has_value()) << "read itself must still succeed; "
                                 << "queue gate is silent";
@@ -1133,9 +1129,8 @@ TEST_F(PromotionOnHitTest, HeartbeatBoundedBatchPreservesLeftovers) {
     EXPECT_TRUE(tick4->empty())
         << "after draining all queued keys, heartbeat must return empty";
 
-    // Sanity: the promotion task each key's entry carries is intact
-    // (NotifyPromotionSuccess clears it, Heartbeat does not), so the
-    // source refcnts remain pinned until processed.
+    // NotifyPromotionSuccess clears a task and the heartbeat does not, so each
+    // key's entry still carries its promotion task and pins the source refcnt.
     for (const auto& k : keys) {
         auto rl = service->GetReplicaList(k, TenantId::Default());
         ASSERT_TRUE(rl.has_value()) << "key " << k << " should still exist";
@@ -1241,20 +1236,18 @@ TEST_F(PromotionOnHitTest, ReaperPopsStagedMemoryReplicaOnExpiry) {
     service->RemoveAll();
 }
 
-// The cap gate must be cluster-wide, not per container. Promotion targets
-// skewed hot keys, which by definition cluster into one tenant's route, so a
-// per-tenant count would let every tenant admit its own task. With a global
-// atomic counter, a task admitted for one tenant counts toward the cap that
-// gates a task of another tenant.
+// The cap gate is one cluster-wide counter, not a per-tenant one: promotion
+// targets skewed hot keys, which cluster into one tenant's route, so a
+// per-tenant count would let every tenant admit a task of its own.
 TEST_F(PromotionOnHitTest, QueueLimitRejectsCrossTenant) {
     const TenantId tenant_other("tenant-b");
     MasterServiceConfig config;
     config.enable_offload = true;
     config.enable_multi_tenants = true;
     config.tenant_quota_connector_type = "file";
-    config.tenant_quota_connector_uri = WriteTenantQuotaPolicyFile(
-        {{TenantId::Default().value(), 1 << 20},
-         {tenant_other.value(), 1 << 20}});
+    config.tenant_quota_connector_uri =
+        WriteTenantQuotaPolicyFile({{TenantId::Default().value(), 1 << 20},
+                                    {tenant_other.value(), 1 << 20}});
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 1;
     config.promotion_queue_limit = 1;  // 1 in-flight task cluster-wide
@@ -1264,22 +1257,20 @@ TEST_F(PromotionOnHitTest, QueueLimitRejectsCrossTenant) {
     constexpr size_t seg_size = 1024 * 1024 * 16;
     auto seg = PrepareSegment(*service, "seg_a", kDefaultSegmentBase, seg_size);
 
-    // The two keys live in different tenants, so each is on its own route
-    // with its own empty task count. The cap itself is one counter for the
-    // whole service, so the first admission blocks the second.
+    // Each key is in its own tenant with its own empty task count, while the
+    // cap is one counter for the whole service.
     const std::string k1 = "xtenant_first";
     const std::string k2 = "xtenant_other";
     ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, k1, 1024,
                                        seg.segment_name));
     ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, k2, 1024,
-                                       seg.segment_name,
-                                       tenant_other.value()));
+                                       seg.segment_name, tenant_other.value()));
 
     auto r1 = service->GetReplicaList(k1, TenantId::Default());
     ASSERT_TRUE(r1.has_value());
 
-    // k2 belongs to another tenant, but the cluster-wide cap is already met
-    // by k1's task — k2 must be rejected.
+    // k2's own tenant holds no task, but the cluster-wide cap is already met
+    // by k1's.
     auto r2 = service->GetReplicaList(k2, tenant_other);
     ASSERT_TRUE(r2.has_value()) << "read itself still succeeds";
 
@@ -2215,10 +2206,9 @@ TEST_F(PromotionOnHitTest, ClientExpiryClearsPromotionTask) {
     }
 
     // ClearInvalidHandles should have erased the holder's LOCAL_DISK
-    // source replica AND (with the fix) the promotion task recorded on
-    // the entry, decrementing the global in-flight counter. Re-admit a
-    // promotion on the second holder; with queue_limit=1 this can only
-    // succeed if the slot was freed.
+    // source replica and the entry's promotion task, decrementing the global
+    // in-flight counter. Re-admit a promotion on the second holder: with
+    // queue_limit=1 this can only succeed if the slot was freed.
     {
         auto r = service->GetReplicaList("k_other", TenantId::Default());
         ASSERT_TRUE(r.has_value())
@@ -2338,8 +2328,7 @@ TEST_F(PromotionOnHitTest, RemoveErasesPromotionTask) {
 
 // RemoveByRegex on a key with an in-flight PromotionTask must drop the
 // task entry, same as Remove. Mirror of RemoveErasesPromotionTask, but
-// exercises the regex path which iterates every tenant's route directly
-// without an accessor object.
+// exercises the regex path, which walks every tenant's route directly.
 TEST_F(PromotionOnHitTest, RemoveByRegexErasesPromotionTask) {
     MasterServiceConfig config;
     config.enable_offload = true;
@@ -3018,9 +3007,8 @@ TEST_F(PromotionOnHitTest, RetryCandidate_CapRejectedThenQueuedOnRetry) {
     service->RemoveAll();
 }
 
-// The retry driver queues nothing while it has no candidates, and nothing
-// for a candidate whose admission stays rejected: the rejected candidate is
-// backed off and kept, not dropped.
+// The retry driver queues nothing without candidates, and nothing for a
+// candidate whose admission stays rejected: it is backed off, not dropped.
 TEST_F(PromotionOnHitTest,
        RetryCandidate_NoCandidatesOrTransientRejectionQueuesNothing) {
     MasterServiceConfig config;

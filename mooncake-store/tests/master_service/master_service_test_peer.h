@@ -7,10 +7,9 @@
 namespace mooncake::test {
 namespace detail {
 
-// A result the entry helpers below refuse, because their own empty optional is
-// what reports "the callback did not run": a callback that also carries an
-// optional would be wrapped a second time and every caller would have to unwrap
-// twice.
+// A result type the entry helpers below reject: their own empty optional
+// already reports "the callback did not run", so a callback that returns an
+// optional would be wrapped a second time.
 template <typename T>
 struct IsOptionalResult : std::false_type {};
 template <typename T>
@@ -68,10 +67,8 @@ class MasterServiceTestPeer {
 
     // Called after each tenant's route is released during RemoveAll, which is
     // the only point where a test can commit into an already-scanned tenant.
-    // There are no shards any more: the hook fires once per tenant whose route
-    // the scan finished, and its argument reports the scan's own progress
-    // rather than a container index.
-    void SetRemoveAllShardHookForTesting(std::function<void(size_t)> hook);
+    // The argument reports the scan's own progress, not a container index.
+    void SetRemoveAllTenantHookForTesting(std::function<void(size_t)> hook);
 
     // Counts of published clears and clears suppressed by a concurrent commit.
     uint64_t GetKvClearedPublishedForTesting() const;
@@ -168,11 +165,9 @@ class MasterServiceTestPeer {
     }
 
     // --- The tenant metadata model ------------------------------------------
-    // One tenant per registered tenant id, each owning that tenant's object
-    // route, group table and bound quota account. There is no per-shard table:
-    // a tenant's objects are one container, reached through its tenant, so a
-    // walk is `Visit` over the registry followed by `SnapshotObjects` on each
-    // tenant.
+    // One tenant per registered tenant id, owning that tenant's object route,
+    // its group table and its bound quota account. A walk over all objects is
+    // `Visit` over the registry followed by `SnapshotObjects` per tenant.
 
     static auto& Tenants(MasterService& service) { return service.tenants_; }
     static const auto& Tenants(const MasterService& service) {
@@ -180,12 +175,9 @@ class MasterServiceTestPeer {
     }
 
     // The entry the tenant of `object_id` routes for its key, or nullptr when
-    // that tenant is absent or the key is not routed. The handle is strong, so
-    // it keeps the entry alive after the route lookup returns; the envelope
-    // behind it is read only through WithExclusiveAccess/WithSharedAccess,
-    // never through a reference kept outside the entry's own lock.
-    //
-    // The tenant is resolved the way the service resolves a request tenant.
+    // that tenant is absent or the key is not routed. The tenant id is resolved
+    // as for a request. The handle is strong, so the entry outlives the
+    // lookup; its metadata is read under the entry's own lock.
     static std::shared_ptr<ObjectEntry> FindObject(
         MasterService& service, const ObjectIdentity& object_id) {
         auto tenant = TenantForRequest(service, object_id.tenant_id);
@@ -207,13 +199,6 @@ class MasterServiceTestPeer {
         MasterService& service, const TenantId& tenant_id) {
         return service.PromotionCandidateKeys(tenant_id);
     }
-
-    // The bucket count of one tenant's promotion-candidate key index — the
-    // per-tenant container the service still owns and can shrink, since the
-    // object route now lives inside metadata::Tenant. 0 when the tenant has no
-    // replica-action record. Takes replica_action_mutex_.
-    static size_t PromotionCandidateIndexBucketCount(
-        MasterService& service, const TenantId& tenant_id);
 
     static auto& NeedMemEviction(MasterService& service) {
         return service.need_mem_eviction_;
@@ -480,8 +465,8 @@ class MasterServiceTestPeer {
     }
 
     // Resolves the tenant, creating it through the registry's factory on first
-    // use. The factory binds the tenant's quota account, so a handle a caller
-    // holds always has one to charge against. The tenant id is taken as given.
+    // use; the factory binds the tenant's quota account, so a caller that holds
+    // a tenant always has one to charge against. The id is taken as given.
     std::shared_ptr<metadata::Tenant> GetOrCreateTenantHandle(
         const TenantId& tenant_id) {
         return service_.GetOrCreateTenantHandle(tenant_id);
@@ -560,10 +545,9 @@ class MasterServiceTestPeer {
     }
 
     // Tears one object down the way a remove path does, with the same
-    // accounting: the entry's own lock is held while the teardown runs and the
-    // route slot is dropped. Lets a test release an object's allocation
-    // without going through the public remove entry points. False when the
-    // tenant is absent or the key is not routed.
+    // accounting, without going through the public remove entry points: the
+    // entry's own lock is held while the teardown runs and the route slot is
+    // dropped. False when the tenant is absent or the key is not routed.
     bool EraseObjectForTesting(const TenantId& tenant_id,
                                const std::string& key) {
         const TenantId normalized = service_.ResolveRequestTenantId(tenant_id);
@@ -595,16 +579,10 @@ class MasterServiceTestPeer {
             [&](ObjectMetadata&, ObjectEntry::State&) { fn(); });
     }
 
-    // Runs `fn(tenant, entry, metadata, state)` on the object the route of
-    // `tenant_id` publishes for `key`, under the entry's own shared lock, with
-    // the callback contract of MasterService::WithObjectMetadataForRead: the
-    // tenant first, then the entry, then the object's two guarded halves, and
-    // the callback returns its own result rather than an optional, because this
-    // helper's own empty optional already carries "the callback did not run".
-    //
-    // Nothing when the tenant is absent, the key is not routed, the entry has
-    // been torn down, or the object is no longer valid — exactly the states the
-    // retired MetadataAccessorRO reported as Exists() == false.
+    // Runs `fn(tenant, entry, metadata, state)` on the object `tenant_id`'s
+    // route publishes for `key`, under the entry's own shared lock, with the
+    // callback contract of MasterService::WithObjectMetadataForRead. Empty
+    // when the tenant is absent, the key is unrouted or the object unreadable.
     template <typename Fn>
     [[nodiscard]] auto WithPublishedObjectForRead(const TenantId& tenant_id,
                                                   const std::string& key,
@@ -615,9 +593,10 @@ class MasterServiceTestPeer {
         using Result = std::invoke_result_t<
             Fn, const metadata::Tenant&, const std::shared_ptr<ObjectEntry>&,
             const ObjectMetadata&, const ObjectEntry::State&>;
-        static_assert(!std::is_void_v<Result>,
-                      "this helper reports absence through its own optional, so "
-                      "the callback must return a result");
+        static_assert(
+            !std::is_void_v<Result>,
+            "this helper reports absence through its own optional, so "
+            "the callback must return a result");
         static_assert(!std::is_reference_v<Result>,
                       "the result is carried by value: nothing a callback "
                       "returns may outlive the lock it ran under");
@@ -644,10 +623,9 @@ class MasterServiceTestPeer {
             });
     }
 
-    // The same under the entry's own write lock, for a test that has to stage
-    // state a production path would have produced. `fn` may mutate the object
-    // and the state, and the same readability predicate gates it. Not const: it
-    // hands the callback a mutable object.
+    // The same under the entry's own write lock, for a test that stages state a
+    // production path would have produced. `fn` may mutate the object and the
+    // state, and the same readability predicate gates it.
     template <typename Fn>
     [[nodiscard]] auto WithPublishedObjectForWrite(const TenantId& tenant_id,
                                                    const std::string& key,
@@ -659,9 +637,10 @@ class MasterServiceTestPeer {
             std::invoke_result_t<Fn, metadata::Tenant&,
                                  const std::shared_ptr<ObjectEntry>&,
                                  ObjectMetadata&, ObjectEntry::State&>;
-        static_assert(!std::is_void_v<Result>,
-                      "this helper reports absence through its own optional, so "
-                      "the callback must return a result");
+        static_assert(
+            !std::is_void_v<Result>,
+            "this helper reports absence through its own optional, so "
+            "the callback must return a result");
         static_assert(!std::is_reference_v<Result>,
                       "the result is carried by value: nothing a callback "
                       "returns may outlive the lock it ran under");
@@ -688,13 +667,10 @@ class MasterServiceTestPeer {
             });
     }
 
-    // Runs `fn(entry, metadata, state)` on the object the route of `tenant_id`
-    // publishes for `key`, under the entry's own shared lock, and hands the
-    // envelope over exactly as stored. Unlike the published-object accessors
-    // this resolves the tenant as given and applies no readability predicate,
-    // so a test can inspect state a request path would refuse to serve —
-    // including an envelope whose replicas are all invalid. Nothing when the
-    // tenant has no route or the key is not routed.
+    // Runs `fn(entry, metadata, state)` on the object `tenant_id`'s route
+    // publishes for `key`, under the entry's own shared lock, with the tenant
+    // taken as given and the envelope handed over exactly as stored: no
+    // readability predicate, so a test sees state a request path would refuse.
     template <typename Fn>
     [[nodiscard]] auto WithStoredObjectForRead(const TenantId& tenant_id,
                                                const std::string& key,
@@ -706,9 +682,10 @@ class MasterServiceTestPeer {
             std::invoke_result_t<Fn, const std::shared_ptr<ObjectEntry>&,
                                  const ObjectMetadata&,
                                  const ObjectEntry::State&>;
-        static_assert(!std::is_void_v<Result>,
-                      "this helper reports absence through its own optional, so "
-                      "the callback must return a result");
+        static_assert(
+            !std::is_void_v<Result>,
+            "this helper reports absence through its own optional, so "
+            "the callback must return a result");
         static_assert(!std::is_reference_v<Result>,
                       "the result is carried by value: nothing a callback "
                       "returns may outlive the lock it ran under");
@@ -734,10 +711,8 @@ class MasterServiceTestPeer {
 
     // Walks every object every tenant routes, running
     // `fn(tenant_id, entry, metadata, state)` under that entry's own shared
-    // lock. Each tenant's handles are collected before any of them is locked
-    // and the entries are locked one at a time, so the walk never holds one
-    // entry's lock while taking another's. An object replaced or removed
-    // during the walk is visited as it was snapshotted.
+    // lock. Entries are locked one at a time over a snapshot taken up front, so
+    // the walk never holds two locks and visits what it snapshotted.
     template <typename Fn>
     static void ForEachObjectForTesting(MasterService& service, Fn&& fn) {
         service.tenants_.Visit(
@@ -762,11 +737,10 @@ class MasterServiceTestPeer {
             [&](const TenantId& tenant_id,
                 const std::shared_ptr<metadata::Tenant>& tenant) {
                 for (const auto& entry : tenant->SnapshotObjects()) {
-                    entry->WithExclusiveAccess(
-                        [&](ObjectMetadata& metadata,
-                            ObjectEntry::State& state) {
-                            fn(tenant_id, entry, metadata, state);
-                        });
+                    entry->WithExclusiveAccess([&](ObjectMetadata& metadata,
+                                                   ObjectEntry::State& state) {
+                        fn(tenant_id, entry, metadata, state);
+                    });
                 }
             });
     }

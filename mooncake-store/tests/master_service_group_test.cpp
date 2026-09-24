@@ -112,9 +112,8 @@ TEST_F(MasterServiceTest, WrappedBatchPutStartMixedGroupIdsPreservesOrder) {
 
     ReplicateConfig config;
     config.replica_num = 1;
-    config.group_ids =
-        std::vector<std::string>{UnrelatedGroupId(keys[0]), "",
-                                 UnrelatedGroupId(keys[2])};
+    config.group_ids = std::vector<std::string>{UnrelatedGroupId(keys[0]), "",
+                                                UnrelatedGroupId(keys[2])};
 
     auto results = service_.BatchPutStart(client_id, keys, sizes, config);
     ASSERT_EQ(results.size(), keys.size());
@@ -247,13 +246,10 @@ TEST_F(MasterServiceTest, BatchReplicaClearWithLeaseActive) {
 }
 
 TEST_F(MasterServiceTest, GroupedRoutingIsDecoupledFromGroupMembership) {
-    // Route-decoupling invariant: an object is reached through the route of its
-    // own tenant by (tenant, key) alone, so a group id never decides which
-    // container an object lives in. The group is a key-list-only domain beside
-    // the route, and it is the unit of eviction: members of one group whose ids
-    // are unrelated to their keys are retired together.
-    // Zero lease TTL so the reads below leave every object immediately
-    // evictable, and the one eviction pass at the end is what retires objects.
+    // A group id never decides where an object lives: the object is reached by
+    // (tenant, key) alone, and the group is a key-list-only domain beside that
+    // route, evicted as a unit. Zero lease TTL so the reads below leave every
+    // object immediately evictable and the last pass is what retires them.
     auto service_config =
         MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
     std::unique_ptr<MasterService> service_(new MasterService(service_config));
@@ -280,17 +276,17 @@ TEST_F(MasterServiceTest, GroupedRoutingIsDecoupledFromGroupMembership) {
     PutCompletedObject(*service_, client_id, survivor_key, tenant,
                        survivor_config);
 
-    // All three live on that one route, and the group id is only what the entry
-    // itself reports: an ungrouped object of the same tenant shares the route.
+    // The group id is only what each entry reports; all three objects share the
+    // tenant's one route regardless of it.
     auto tenant_handle = MasterServiceTestPeer::Tenants(*service_).Lookup(
         MasterServiceTestPeer(*service_).ResolveRequestTenantId(tenant));
     ASSERT_NE(nullptr, tenant_handle);
     EXPECT_EQ(3u, tenant_handle->ObjectCount());
     for (const auto& key : {key_a, key_b, survivor_key}) {
-        EXPECT_NE(nullptr,
-                  MasterServiceTestPeer::FindObject(
-                      *service_,
-                      MasterServiceTestPeer::ObjectIdentity{tenant, key}))
+        EXPECT_NE(
+            nullptr,
+            MasterServiceTestPeer::FindObject(
+                *service_, MasterServiceTestPeer::ObjectIdentity{tenant, key}))
             << "key=" << key;
     }
     auto grouped_entry = MasterServiceTestPeer::FindObject(
@@ -306,23 +302,20 @@ TEST_F(MasterServiceTest, GroupedRoutingIsDecoupledFromGroupMembership) {
     ASSERT_NE(nullptr, ungrouped_entry);
     EXPECT_TRUE(ungrouped_entry->group_id().empty());
 
-    // Both members are reachable through the read paths by (tenant, key), which
-    // is decoupled from the group domain.
+    // Read paths reach both members by (tenant, key), not through the group.
     EXPECT_TRUE(service_->ExistKey(key_a, tenant).value_or(false));
     EXPECT_TRUE(service_->ExistKey(key_b, tenant).value_or(false));
     EXPECT_TRUE(service_->GetReplicaList(key_a, tenant).has_value());
     EXPECT_TRUE(service_->GetReplicaList(key_b, tenant).has_value());
 
-    // The group table still sees both members and nothing else: group state is
-    // a separate, key-list-only domain.
+    // The group index holds exactly the two members.
     auto members = GetGroupMemberKeysForTest(*service_, group_id);
     ASSERT_EQ(2u, members.size());
     EXPECT_NE(members.end(), std::find(members.begin(), members.end(), key_a));
     EXPECT_NE(members.end(), std::find(members.begin(), members.end(), key_b));
 
-    // The target covers one of the tenant's two evictable objects, but the
-    // group is evicted as a unit: both members go, and the hard-pinned object
-    // outside the group stays.
+    // The target covers one member, but a group is evicted as a unit: both
+    // members go and the hard-pinned object outside the group stays.
     MasterServiceTestPeer(*service_).RunBatchEvictForTesting(0.5, 0.5);
 
     EXPECT_FALSE(service_->ExistKey(key_a, tenant).value_or(true));

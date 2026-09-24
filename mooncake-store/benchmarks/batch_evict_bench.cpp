@@ -174,8 +174,8 @@ class BatchEvictBench {
 
         // Every object of the default tenant lives on that tenant's own route,
         // so each entry is re-dated and read under its own lock.
-        const auto tenant = MasterServiceTestPeer::Tenants(service).Lookup(
-            TenantId::Default());
+        const auto tenant =
+            MasterServiceTestPeer::Tenants(service).Lookup(TenantId::Default());
         if (tenant == nullptr) {
             return stats;
         }

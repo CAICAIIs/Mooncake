@@ -988,8 +988,7 @@ TEST_F(ClientIntegrationTest, BatchPutMixedGroupIdsThroughClient) {
     ReplicateConfig config;
     config.replica_num = 1;
     config.group_ids =
-        std::vector<std::string>{keys[0] + "_group", "",
-                                 keys[2] + "_group"};
+        std::vector<std::string>{keys[0] + "_group", "", keys[2] + "_group"};
 
     auto put_results = test_client_->BatchPut(keys, batched_slices, config);
     ASSERT_EQ(put_results.size(), keys.size());

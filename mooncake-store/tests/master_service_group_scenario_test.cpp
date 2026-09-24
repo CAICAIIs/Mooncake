@@ -38,8 +38,7 @@ TEST(MasterServiceGroupScenarioTest,
 TEST(MasterServiceGroupScenarioTest, GroupRoutingIsTenantScopedForSameUserKey) {
     const std::string key = "tenant_grouped_shared_user_key";
     // The same user key grouped differently in two tenants: membership is
-    // scoped to the tenant that owns the object, so neither entry can be
-    // confused with the other.
+    // scoped to the tenant that owns the object.
     const std::string group_a = UnrelatedGroupId(key);
     const std::string group_b = UnrelatedGroupId(key + "_tenant_b");
 

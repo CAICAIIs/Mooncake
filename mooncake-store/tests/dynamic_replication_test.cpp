@@ -205,8 +205,7 @@ class DynamicReplicationTest : public ::testing::Test {
 
     // True when the object still carries dynamic-replication state: the entry's
     // own pending/cooldown state, or the in-flight replica-action lease the
-    // caller names. A lease is recorded per tenant and keyed by proposal id, so
-    // the caller passes the id it submitted.
+    // caller names by the proposal id it submitted.
     bool HasDynamicState(MasterService& service, const std::string& key,
                          const UUID& proposal_id) const {
         const bool has_lease =
@@ -223,7 +222,7 @@ class DynamicReplicationTest : public ::testing::Test {
                                std::chrono::steady_clock::time_point{};
                 });
         // A torn-down object keeps neither flag, so only a lease can outlive
-        // it; an absent one reports the same as an object without flags.
+        // it; an absent object reports the same as one without flags.
         return has_flags.value_or(false) || has_lease;
     }
 

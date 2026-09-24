@@ -146,20 +146,6 @@ class MasterServiceTest : public ::testing::Test {
         MasterServiceTestPeer(service).CleanupExpiredSoftPins(now);
     }
 
-    // The bucket count of the per-tenant container that grows and shrinks with
-    // that tenant's keys. A tenant's object route now lives inside the frozen
-    // metadata::Tenant, so the container measured here is the one the service
-    // still owns for the tenant: its promotion-candidate key index. 0 when the
-    // tenant has no replica-action record.
-    size_t MetadataBucketCount(
-        MasterService& service,
-        const TenantId& tenant_id = TenantId::Default()) {
-        const TenantId normalized =
-            MasterServiceTestPeer(service).ResolveRequestTenantId(tenant_id);
-        return MasterServiceTestPeer::PromotionCandidateIndexBucketCount(
-            service, normalized);
-    }
-
     void SetSoftPinDeadlineForTest(
         MasterService& service, const std::string& key,
         const std::chrono::system_clock::time_point& deadline,
@@ -190,17 +176,15 @@ class MasterServiceTest : public ::testing::Test {
 
     // What a segment-name lookup reports about one object: whether it carries a
     // replica on that segment, and that replica's refcount. A plain result,
-    // because the read helper's own optional already carries "the object was
-    // not read".
+    // because the read helper's own optional already means "not read".
     struct ReplicaRefcntLookup {
         bool found;
         uint32_t refcnt;
     };
 
     // Reads one object's envelope and state the way the read paths do, with the
-    // callback contract of MasterService::WithObjectMetadataForRead: the tenant
-    // first, then the entry, then the object's two guarded halves; nothing when
-    // the object is absent or no longer readable.
+    // callback contract of MasterService::WithObjectMetadataForRead. Nothing
+    // when the object is absent or no longer readable.
     template <typename Fn>
     [[nodiscard]] auto WithObjectForRead(MasterService& service,
                                          const std::string& key,
@@ -393,8 +377,7 @@ class MasterServiceTest : public ::testing::Test {
     }
 
     // A group name unrelated to the object key. Group membership lives in the
-    // object's own tenant, so only the name has to be distinct from the key;
-    // there is no shard for it to disagree with any more.
+    // object's own tenant, so the name only has to differ from the key.
     std::string UnrelatedGroupId(const std::string& key) const {
         return key + "_group";
     }
@@ -527,7 +510,7 @@ class MasterServiceTest : public ::testing::Test {
         const TenantId normalized_tenant =
             MasterServiceTestPeer(service).ResolveRequestTenantId(
                 TenantId(tenant_id));
-        // Group membership is single-sourced in the tenant's group index.
+        // Membership is per tenant, so the group id alone is not enough.
         auto tenant_handle =
             MasterServiceTestPeer::Tenants(service).Lookup(normalized_tenant);
         if (tenant_handle == nullptr) {
@@ -537,9 +520,8 @@ class MasterServiceTest : public ::testing::Test {
     }
 
     void ClearGroupStateForTest(MasterService& service) {
-        // Drop every grouped entry's membership from its tenant's group index,
-        // which is what leaves the group table empty for a rebuild. Each entry
-        // names the membership it registered, so nothing is resolved twice.
+        // Drops every grouped entry's membership from its tenant's group
+        // index, leaving the group table empty for a rebuild.
         MasterServiceTestPeer::Tenants(service).Visit(
             [&](const TenantId&,
                 const std::shared_ptr<metadata::Tenant>& handle) {

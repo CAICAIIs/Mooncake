@@ -238,9 +238,9 @@ MemoryNodeStatusSpec MemoryNodeStatus(std::string node) {
     return {.node = std::move(node)};
 }
 
-// A group id that names something other than the key it groups. Membership is
-// an annotation on the object's own entry and the object is routed by
-// (tenant, key) alone, so the name only has to differ from the key.
+// A group id that names something other than the key it groups: membership is
+// an annotation on the object's own entry and routing uses (tenant, key)
+// alone, so the name only has to differ from the key.
 std::string UnrelatedGroupId(std::string_view key) {
     return std::string(key) + "_group";
 }
@@ -1066,22 +1066,17 @@ MasterScenario& MasterScenario::When(ExpireAtAction action) {
     }
 
     // An object's per-key state lives on the entry its tenant's route
-    // publishes, so the object is reached by (tenant, key) and no longer by a
-    // container index.
-    const auto expired = MasterServiceTestPeer(*service_)
-                             .WithPublishedObjectForWrite(
-                                 TenantId(action.tenant), action.key,
-                                 [&](metadata::Tenant&,
-                                     const std::shared_ptr<ObjectEntry>&,
-                                     ObjectMetadata& metadata,
-                                     ObjectEntry::State&) {
-                                     SpinLocker locker(&metadata.lock);
-                                     metadata.lease_->SetDeadline(
-                                         action.lease_timeout);
-                                     metadata.soft_pin_timeout =
-                                         action.soft_pin_timeout;
-                                     return true;
-                                 });
+    // publishes, so the object is reached by (tenant, key) alone.
+    const auto expired =
+        MasterServiceTestPeer(*service_).WithPublishedObjectForWrite(
+            TenantId(action.tenant), action.key,
+            [&](metadata::Tenant&, const std::shared_ptr<ObjectEntry>&,
+                ObjectMetadata& metadata, ObjectEntry::State&) {
+                SpinLocker locker(&metadata.lock);
+                metadata.lease_->SetDeadline(action.lease_timeout);
+                metadata.soft_pin_timeout = action.soft_pin_timeout;
+                return true;
+            });
     if (!expired.has_value()) {
         Fail("ExpireAt(" + action.key + ") could not find object");
     }
