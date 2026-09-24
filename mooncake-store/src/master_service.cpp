@@ -5918,7 +5918,10 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                                 std::move(old_replicas), release_at);
                         }
                         // The erase ends this callback: the replacement is
-                        // published after it, once the entry's lock is gone.
+                        // published after it, once the entry's lock is gone, so
+                        // a reader in between finds the key absent. Only this
+                        // call's own per-key operation lock keeps another
+                        // PutStart or UpsertStart out of that window.
                         EraseMetadata(*tenant, entry, metadata, state,
                                       object_id.tenant_id,
                                       QuotaEraseMode::kPreserveOld,
