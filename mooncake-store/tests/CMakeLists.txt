@@ -202,6 +202,7 @@ add_store_test(dynamic_replication_lease_table_test dynamic_replication_lease_ta
 add_store_test(group_index_test group_index_test.cpp)
 add_store_test(metadata_tenant_test metadata_tenant_test.cpp)
 add_store_test(metadata_tenant_registry_test metadata_tenant_registry_test.cpp)
+add_store_test(shrink_buckets_test shrink_buckets_test.cpp)
 add_store_test(segment_test segment_test.cpp)
 add_executable(local_ssd_test local_ssd/local_ssd_test.cpp)
 target_include_directories(local_ssd_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

@@ -21,8 +21,10 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -35,6 +37,13 @@
 
 namespace mooncake {
 namespace metadata {
+
+// What the published-entry accessors return: the callback's own result, or
+// nothing when the callback did not run. A callback that returns void has no
+// result to carry, so its report collapses to a bool.
+template <typename Result>
+using PublishedResult =
+    std::conditional_t<std::is_void_v<Result>, bool, std::optional<Result>>;
 
 class Tenant {
    public:
@@ -113,30 +122,91 @@ class Tenant {
         });
     }
 
-    // Runs `fn(metadata, state)` on the entry the route currently publishes for
-    // `key`, under that entry's own lock, and only once it has re-checked under
-    // that lock that the slot still publishes this entry and that the entry is
-    // not torn down. False without running `fn` otherwise, so a caller that
-    // kept a handle from before resolves the key again instead of acting on it.
+    // Runs `fn(entry, metadata, state)` on the entry the route currently
+    // publishes for `key`, under that entry's own lock, and only once it has
+    // re-checked under that lock that the slot still publishes this entry and
+    // that the entry is not torn down. Returns `fn`'s result; nothing when `fn`
+    // did not run, so a caller that kept a handle from before resolves the key
+    // again instead of acting on it. The result is carried by value: nothing
+    // the callback returns may outlive the lock it ran under.
+    //
+    // The callback receives the entry itself as well as its two guarded halves,
+    // because the entry is what names the publication the callback is acting
+    // on.
     //
     // The callback runs inside the entry's lock, which is not recursive: it
-    // must not call back into `WithPublishedObject` for the same key, nor
-    // `InsertObject` for the same entry.
+    // must not call back into this accessor for the same key, nor
+    // `InsertObject` for the same entry. The route lock nests inside the entry
+    // lock, which is the allowed order, so a callback may call `RemoveObject`.
     template <typename Fn>
-    [[nodiscard]] bool WithPublishedObject(std::string_view key, Fn&& fn) {
+    [[nodiscard]] auto WithPublishedEntry(std::string_view key, Fn&& fn) {
+        using Result =
+            std::invoke_result_t<Fn, const std::shared_ptr<ObjectEntry>&,
+                                 ObjectMetadata&, ObjectEntry::State&>;
         const auto entry = object_index_.Get(key);
         if (entry == nullptr) {
-            return false;
+            return PublishedResult<Result>{};
         }
         return entry->WithExclusiveAccess(
-            [&](ObjectMetadata& metadata, ObjectEntry::State& state) -> bool {
-                if (state.is_torn_down ||
-                    !object_index_.IsCurrent(key, entry)) {
-                    return false;
+            [&](ObjectMetadata& metadata,
+                ObjectEntry::State& state) -> PublishedResult<Result> {
+                if (!IsPublishedAndLive(key, entry, state)) {
+                    return PublishedResult<Result>{};
                 }
-                std::forward<Fn>(fn)(metadata, state);
-                return true;
+                if constexpr (std::is_void_v<Result>) {
+                    std::forward<Fn>(fn)(entry, metadata, state);
+                    return true;
+                } else {
+                    return PublishedResult<Result>{
+                        std::forward<Fn>(fn)(entry, metadata, state)};
+                }
             });
+    }
+
+    // The same for a reader: `fn` sees all three but may not mutate them, and
+    // concurrent readers of one object do not exclude each other. The identity
+    // re-check is the same, so a reader cannot observe a torn-down entry or one
+    // the route has already replaced.
+    template <typename Fn>
+    [[nodiscard]] auto WithPublishedEntryShared(std::string_view key, Fn&& fn) {
+        using Result =
+            std::invoke_result_t<Fn, const std::shared_ptr<ObjectEntry>&,
+                                 const ObjectMetadata&,
+                                 const ObjectEntry::State&>;
+        const auto entry = object_index_.Get(key);
+        if (entry == nullptr) {
+            return PublishedResult<Result>{};
+        }
+        return entry->WithSharedAccess(
+            [&](const ObjectMetadata& metadata,
+                const ObjectEntry::State& state) -> PublishedResult<Result> {
+                if (!IsPublishedAndLive(key, entry, state)) {
+                    return PublishedResult<Result>{};
+                }
+                if constexpr (std::is_void_v<Result>) {
+                    std::forward<Fn>(fn)(entry, metadata, state);
+                    return true;
+                } else {
+                    return PublishedResult<Result>{
+                        std::forward<Fn>(fn)(entry, metadata, state)};
+                }
+            });
+    }
+
+    // The same invariant for a caller that only needs to run something on the
+    // published entry: the callback's own result has no reader here, so this
+    // reports whether it ran.
+    template <typename Fn>
+    [[nodiscard]] bool WithPublishedObject(std::string_view key, Fn&& fn) {
+        return WithPublishedEntry(key,
+                                  [&](const std::shared_ptr<ObjectEntry>&,
+                                      ObjectMetadata& metadata,
+                                      ObjectEntry::State& state) -> bool {
+                                      (void)std::forward<Fn>(fn)(metadata,
+                                                                 state);
+                                      return true;
+                                  })
+            .value_or(false);
     }
 
     [[nodiscard]] bool ContainsObject(std::string_view key) const {
@@ -160,6 +230,25 @@ class Tenant {
     [[nodiscard]] bool Empty() const {
         return object_index_.Empty() && group_index_.Empty() &&
                lease_table_.Empty();
+    }
+
+    // Rehash the object route down to roughly twice its live size, for a
+    // caller that erased most of this tenant's objects in one sweep or
+    // eviction cycle.
+    void ShrinkRouteTableIfSparse() {
+        object_index_.ShrinkRouteTableIfSparse();
+    }
+
+    // The route's bucket count, read under the route lock.
+    [[nodiscard]] size_t RouteBucketCountForTesting() const {
+        return object_index_.RouteBucketCountForTesting();
+    }
+
+    // Holds the route lock exclusively, so a concurrent access to this tenant's
+    // route blocks at the boundary where an operation first pins an entry.
+    [[nodiscard]] std::unique_lock<std::shared_mutex> LockRouteForTesting()
+        const {
+        return object_index_.LockRouteForTesting();
     }
 
     // Drops a grouped entry's membership, without touching the route slot or
@@ -314,6 +403,12 @@ class Tenant {
     }
 
    private:
+    [[nodiscard]] bool IsPublishedAndLive(
+        std::string_view key, const std::shared_ptr<ObjectEntry>& entry,
+        const ObjectEntry::State& state) const {
+        return !state.is_torn_down && object_index_.IsCurrent(key, entry);
+    }
+
     // Primary object route: object key -> strong ObjectEntry handle, with the
     // per-object mutation boundary inside the entry.
     ObjectIndex object_index_;

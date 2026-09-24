@@ -1,4 +1,5 @@
 #include "object_index.h"
+#include "common/shrink_buckets.h"
 #include "object_test_helpers.h"
 
 #include <algorithm>
@@ -112,6 +113,37 @@ TEST(ObjectIndexTest, SnapshotObjectsEnumeratesEveryEntry) {
     // Enumeration order is the map's, so compare as a set.
     std::sort(keys.begin(), keys.end());
     EXPECT_EQ(keys, (std::vector<std::string>{"k1", "k2", "k3"}));
+}
+
+TEST(ObjectIndexTest, ShrinkRouteTableIfSparseRehashesAnEmptiedRoute) {
+    ObjectIndex store;
+    for (size_t i = 0; i < 4096; ++i) {
+        ASSERT_TRUE(store.Insert(test::MakeObjectEntry(std::to_string(i))));
+    }
+    const size_t grown = store.RouteBucketCountForTesting();
+    ASSERT_GT(grown, kShrinkMinBucketCount);
+
+    for (size_t i = 0; i < 4096; ++i) {
+        const std::string key = std::to_string(i);
+        ASSERT_TRUE(store.EraseIf(key, store.Get(key)));
+    }
+    store.ShrinkRouteTableIfSparse();
+
+    EXPECT_LT(store.RouteBucketCountForTesting(), grown);
+    EXPECT_EQ(store.ObjectCount(), 0u);
+}
+
+TEST(ObjectIndexTest, ShrinkRouteTableIfSparseLeavesADenseRouteAlone) {
+    ObjectIndex store;
+    for (size_t i = 0; i < 4096; ++i) {
+        ASSERT_TRUE(store.Insert(test::MakeObjectEntry(std::to_string(i))));
+    }
+    const size_t grown = store.RouteBucketCountForTesting();
+    ASSERT_GT(grown, kShrinkMinBucketCount);
+
+    store.ShrinkRouteTableIfSparse();
+
+    EXPECT_EQ(store.RouteBucketCountForTesting(), grown);
 }
 
 }  // namespace
