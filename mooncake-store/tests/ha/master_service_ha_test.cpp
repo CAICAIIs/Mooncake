@@ -225,6 +225,44 @@ class GatedOrderedOpLogWriter : public OrderedOpLogWriter {
     bool stopping_{false};
 };
 
+// Self-contained arrive-gate injected into MasterService through
+// MasterService::snapshot_arrive_hook_. Owns the barrier state the test needs
+// (armed flag, mutex, CV); Arm/Disarm/WaitForArrive drive it.
+struct SnapshotBarrierGate {
+    void Arm() {
+        std::lock_guard<std::mutex> lock(mutex);
+        reached = false;
+        armed.store(true, std::memory_order_release);
+    }
+
+    void Disarm() {
+        armed.store(false, std::memory_order_release);
+        std::lock_guard<std::mutex> lock(mutex);
+        reached = false;
+    }
+
+    // Invoked by PutStart through the injected hook when it enters the
+    // snapshot section (client_mutex_ released, snapshot_mutex_ held shared).
+    void Arrive() {
+        if (!armed.load(std::memory_order_acquire)) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mutex);
+        reached = true;
+        cv.notify_all();
+    }
+
+    bool WaitForArrive(std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> lock(mutex);
+        return cv.wait_for(lock, timeout, [this] { return reached; });
+    }
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::atomic<bool> armed{false};
+    bool reached{false};
+};
+
 class RejectingOrderedOpLogWriter : public OrderedOpLogWriter {
    public:
     RejectingOrderedOpLogWriter(OrderedOpLogWriterConfig config,
@@ -286,6 +324,12 @@ class MasterServiceHATest : public ::testing::Test {
    protected:
     static void EnableDfsForTesting(MasterService& service) {
         MasterServiceTestPeer::EnableDfs(service) = true;
+    }
+
+    static void SetSnapshotArriveHookForTesting(MasterService& service,
+                                                std::function<void()> hook) {
+        MasterServiceTestPeer(service).SetSnapshotArriveHookForTesting(
+            std::move(hook));
     }
 
     static void SetUpTestSuite() {
@@ -611,37 +655,6 @@ class MasterServiceHATest : public ::testing::Test {
         return segment;
     }
 
-    static std::string FindGroupIdOnDifferentShard(MasterService& service,
-                                                   size_t source_shard,
-                                                   const std::string& prefix) {
-        for (size_t index = 0; index < MasterServiceTestPeer::kNumShards * 2;
-             ++index) {
-            std::string group_id = prefix + std::to_string(index);
-            if (MasterServiceTestPeer(service).getShardIndex(group_id) !=
-                source_shard) {
-                return group_id;
-            }
-        }
-        return {};
-    }
-
-    static std::string FindGroupIdOnDifferentShardFromObject(
-        MasterService& service, const TenantId& tenant_id,
-        const std::string& key, const std::string& prefix) {
-        return FindGroupIdOnDifferentShard(
-            service,
-            MasterServiceTestPeer(service).getShardIndex(tenant_id, key),
-            prefix);
-    }
-
-    static std::string FindGroupIdOnDifferentShardFromGroup(
-        MasterService& service, const std::string& group_id,
-        const std::string& prefix) {
-        return FindGroupIdOnDifferentShard(
-            service, MasterServiceTestPeer(service).getShardIndex(group_id),
-            prefix);
-    }
-
     // Use the test peer to seed an in-flight PromotionTask for a
     // given (tenant, key) so NotifyPromotionSuccess can proceed without
     // going through the on-hit admission gate (which is currently
@@ -650,20 +663,8 @@ class MasterServiceHATest : public ::testing::Test {
     static void SeedPromotionTaskForTesting(
         MasterService* service, const TenantId& tenant, const std::string& key,
         const UUID& holder_id, ReplicaID alloc_id, uint64_t object_size) {
-        const size_t shard_idx =
-            MasterServiceTestPeer(*service).getShardIndex(tenant, key);
-        auto shard_access =
-            MasterServiceTestPeer::MetadataShardAccessorRW(service, shard_idx);
-        auto& tenant_state =
-            MasterServiceTestPeer(*service).GetOrCreateTenantState(
-                shard_access.get(), tenant);
-        tenant_state.promotion_tasks.emplace(
-            key, MasterServiceTestPeer::PromotionTask{
-                     .source_id = 0,
-                     .alloc_id = alloc_id,
-                     .object_size = object_size,
-                     .start_time = std::chrono::system_clock::now(),
-                     .holder_id = holder_id});
+        MasterServiceTestPeer(*service).SeedPromotionTaskForTesting(
+            tenant, key, holder_id, alloc_id, object_size);
     }
 
     static bool SnapshotManagerCreatedForTesting(const MasterService& service) {
@@ -735,72 +736,93 @@ class MasterServiceHATest : public ::testing::Test {
     static size_t ReplicaCountForTesting(MasterService& service,
                                          const TenantId& tenant_id,
                                          const std::string& key) {
-        MasterServiceTestPeer::MetadataAccessorRO accessor(
-            &service, MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
-        return accessor.Exists() ? accessor.Get().CountReplicas() : 0;
+        return MasterServiceTestPeer(service)
+            .WithPublishedObjectForRead(
+                tenant_id, key,
+                [](const metadata::Tenant&, const std::shared_ptr<ObjectEntry>&,
+                   const ObjectMetadata& metadata, const ObjectEntry::State&) {
+                    return metadata.CountReplicas();
+                })
+            .value_or(0);
     }
 
     static bool IsHardPinnedForTesting(MasterService& service,
                                        const TenantId& tenant_id,
                                        const std::string& key) {
-        MasterServiceTestPeer::MetadataAccessorRO accessor(
-            &service, MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
-        return accessor.Exists() && accessor.Get().IsHardPinned();
+        return MasterServiceTestPeer(service)
+            .WithPublishedObjectForRead(
+                tenant_id, key,
+                [](const metadata::Tenant&, const std::shared_ptr<ObjectEntry>&,
+                   const ObjectMetadata& metadata, const ObjectEntry::State&) {
+                    return metadata.IsHardPinned();
+                })
+            .value_or(false);
     }
 
     static std::vector<Replica::Descriptor> ReplicaDescriptorsForTesting(
         MasterService& service, const TenantId& tenant_id,
         const std::string& key) {
-        MasterServiceTestPeer::MetadataAccessorRO accessor(
-            &service, MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
-        if (!accessor.Exists()) {
-            return {};
-        }
-        std::vector<Replica::Descriptor> descriptors;
-        for (const auto& replica : accessor.Get().GetAllReplicas()) {
-            descriptors.push_back(replica.get_descriptor());
-        }
-        return descriptors;
+        // The stored object is read as it is held, so a replica a request path
+        // would refuse to serve is still reported here.
+        return MasterServiceTestPeer(service)
+            .WithStoredObjectForRead(
+                tenant_id, key,
+                [](const std::shared_ptr<ObjectEntry>&,
+                   const ObjectMetadata& metadata, const ObjectEntry::State&) {
+                    std::vector<Replica::Descriptor> descriptors;
+                    for (const auto& replica : metadata.GetAllReplicas()) {
+                        descriptors.push_back(replica.get_descriptor());
+                    }
+                    return descriptors;
+                })
+            .value_or(std::vector<Replica::Descriptor>{});
     }
 
     static bool HasMetadataEntryForTesting(MasterService& service,
                                            const TenantId& tenant_id,
                                            const std::string& key) {
-        const auto shard_idx =
-            MasterServiceTestPeer(service).getShardIndex(tenant_id, key);
-        MasterServiceTestPeer::MetadataShardAccessorRO shard(&service,
-                                                             shard_idx);
-        auto tenant = shard->tenants.find(tenant_id);
-        return tenant != shard->tenants.end() &&
-               tenant->second.metadata.contains(key);
+        auto tenant = MasterServiceTestPeer::Tenants(service).Lookup(
+            MasterServiceTestPeer(service).ResolveRequestTenantId(tenant_id));
+        return tenant != nullptr && tenant->ContainsObject(key);
     }
 
     static bool HasInvalidMemoryHandleForTesting(MasterService& service,
                                                  const TenantId& tenant_id,
                                                  const std::string& key) {
-        MasterServiceTestPeer::MetadataAccessorRO accessor(
-            &service, MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
-        if (!accessor.Exists()) {
-            return true;
-        }
-        for (const auto& replica : accessor.Get().GetAllReplicas()) {
-            if (replica.has_invalid_mem_handle()) {
-                return true;
-            }
-        }
-        return false;
+        // An object that is absent or no longer readable has nothing a caller
+        // could read, which is the state the callers assert.
+        return MasterServiceTestPeer(service)
+            .WithPublishedObjectForRead(
+                tenant_id, key,
+                [](const metadata::Tenant&, const std::shared_ptr<ObjectEntry>&,
+                   const ObjectMetadata& metadata, const ObjectEntry::State&) {
+                    for (const auto& replica : metadata.GetAllReplicas()) {
+                        if (replica.has_invalid_mem_handle()) {
+                            return true;
+                        }
+                    }
+                    return false;
+                })
+            .value_or(true);
     }
 
     static bool HasReadableReplicaForTesting(MasterService& service,
                                              const TenantId& tenant_id,
                                              const std::string& key) {
-        MasterServiceTestPeer::MetadataAccessorRO accessor(
-            &service, MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
-        return accessor.Exists() &&
-               accessor.Get().HasReplica([&service](const Replica& replica) {
-                   return MasterServiceTestPeer(service).IsReplicaReadable(
-                       replica);
-               });
+        return MasterServiceTestPeer(service)
+            .WithPublishedObjectForRead(
+                tenant_id, key,
+                [&service](const metadata::Tenant&,
+                           const std::shared_ptr<ObjectEntry>&,
+                           const ObjectMetadata& metadata,
+                           const ObjectEntry::State&) {
+                    return metadata.HasReplica([&service](
+                                                   const Replica& replica) {
+                        return MasterServiceTestPeer(service).IsReplicaReadable(
+                            replica);
+                    });
+                })
+            .value_or(false);
     }
 
     static std::shared_ptr<ClientLivenessRecord> ClientRecordForTesting(
@@ -823,58 +845,70 @@ class MasterServiceHATest : public ::testing::Test {
     static bool HasCompletedMemoryReplicaForTesting(MasterService& service,
                                                     const TenantId& tenant_id,
                                                     const std::string& key) {
-        const size_t shard_idx =
-            MasterServiceTestPeer(service).getShardIndex(tenant_id, key);
-        MasterServiceTestPeer::MetadataShardAccessorRO shard(&service,
-                                                             shard_idx);
-        const auto tenant = shard->tenants.find(tenant_id);
-        if (tenant == shard->tenants.end()) {
-            return false;
-        }
-        const auto metadata = tenant->second.metadata.find(key);
-        return metadata != tenant->second.metadata.end() &&
-               metadata->second.HasReplica([](const Replica& replica) {
-                   return replica.is_memory_replica() && replica.is_completed();
-               });
+        // An object whose only handle went stale is still held, so the stored
+        // object is the one to look at rather than the readable one.
+        return MasterServiceTestPeer(service)
+            .WithStoredObjectForRead(
+                tenant_id, key,
+                [](const std::shared_ptr<ObjectEntry>&,
+                   const ObjectMetadata& metadata, const ObjectEntry::State&) {
+                    return metadata.HasReplica([](const Replica& replica) {
+                        return replica.is_memory_replica() &&
+                               replica.is_completed();
+                    });
+                })
+            .value_or(false);
     }
 
     static bool MemoryReplicaAffiliatedWithForTesting(
         MasterService& service, const TenantId& tenant_id,
         const std::string& key,
         const std::shared_ptr<ClientLivenessRecord>& record) {
-        MasterServiceTestPeer::MetadataAccessorRO accessor(
-            &service, MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
-        if (!accessor.Exists()) {
-            return false;
-        }
-        return accessor.Get().HasReplica([&](const Replica& replica) {
-            return replica.is_memory_replica() &&
-                   replica.isAffiliatedWith(record);
-        });
+        return MasterServiceTestPeer(service)
+            .WithPublishedObjectForRead(
+                tenant_id, key,
+                [&record](const metadata::Tenant&,
+                          const std::shared_ptr<ObjectEntry>&,
+                          const ObjectMetadata& metadata,
+                          const ObjectEntry::State&) {
+                    return metadata.HasReplica(
+                        [&record](const Replica& replica) {
+                            return replica.is_memory_replica() &&
+                                   replica.isAffiliatedWith(record);
+                        });
+                })
+            .value_or(false);
     }
 
     static void SetLeaseDeadlineForTesting(
         MasterService& service, const TenantId& tenant_id,
         const std::string& key,
         std::chrono::system_clock::time_point deadline) {
-        MasterServiceTestPeer::MetadataAccessorRW accessor(
-            &service, MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
-        ASSERT_TRUE(accessor.Exists());
-        SpinLocker locker(&accessor.Get().lock);
-        accessor.Get().lease_->SetDeadline(deadline);
+        auto written =
+            MasterServiceTestPeer(service).WithPublishedObjectForWrite(
+                tenant_id, key,
+                [&](metadata::Tenant&, const std::shared_ptr<ObjectEntry>&,
+                    ObjectMetadata& metadata, ObjectEntry::State&) {
+                    SpinLocker locker(&metadata.lock);
+                    metadata.lease_->SetDeadline(deadline);
+                    return true;
+                });
+        ASSERT_TRUE(written.has_value());
     }
 
     static std::chrono::system_clock::time_point LeaseDeadlineForTesting(
         MasterService& service, const TenantId& tenant_id,
         const std::string& key) {
-        MasterServiceTestPeer::MetadataAccessorRO accessor(
-            &service, MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
-        EXPECT_TRUE(accessor.Exists());
-        if (!accessor.Exists()) {
-            return {};
-        }
-        SpinLocker locker(&accessor.Get().lock);
-        return accessor.Get().lease_->ExpiresAt();
+        auto deadline =
+            MasterServiceTestPeer(service).WithPublishedObjectForRead(
+                tenant_id, key,
+                [](const metadata::Tenant&, const std::shared_ptr<ObjectEntry>&,
+                   const ObjectMetadata& metadata, const ObjectEntry::State&) {
+                    SpinLocker locker(&metadata.lock);
+                    return metadata.lease_->ExpiresAt();
+                });
+        EXPECT_TRUE(deadline.has_value());
+        return deadline.value_or(std::chrono::system_clock::time_point{});
     }
 
     static uint64_t EvictTenantMemoryForQuotaForTesting(
@@ -891,15 +925,28 @@ class MasterServiceHATest : public ::testing::Test {
             MasterServiceTestPeer::SnapshotMutex(service));
     }
 
-    static std::unique_lock<SharedMutex> LockMetadataShardForTesting(
-        MasterService& service, const TenantId& tenant_id,
-        const std::string& key) {
-        const size_t shard_idx =
-            MasterServiceTestPeer(service).getShardIndex(tenant_id, key);
-        return std::unique_lock<SharedMutex>(
-            MasterServiceTestPeer::MetadataShards(service)[shard_idx].mutex);
+    SnapshotBarrierGate snapshot_gate_;
+
+    static std::unique_lock<std::shared_mutex> LockRouteForTesting(
+        MasterService& service, const TenantId& tenant_id) {
+        // The tenant's object route. Holding it EXCLUSIVE gates PutStart at its
+        // first Pin inside the snapshot barrier, letting the test observe the
+        // barrier (snapshot held, client_mutex_ released) without racing the
+        // async PutStart.
+        return MasterServiceTestPeer(service).LockRouteForTesting(tenant_id);
     }
 
+    // The create paths take the snapshot barrier and the object's own lock for
+    // their discovery section, release both, and only then wait for the
+    // serving guard of the client they will read from. This runs one create
+    // task and checks that ordering: while the task is parked in that section
+    // the barrier is held, and once the section has ended the object's own lock
+    // is free again even though the serving guard is still held here.
+    //
+    // The object's lock never leaves its entry, so "is it free?" is asked by
+    // having a probe take it. The probe is started only once the task is past
+    // its section and parked on the guard, so the answer says something about
+    // that wait rather than about the section itself.
     template <typename CreateTask>
     static bool CreateTaskReleasesMetadataBeforeServingGuardForTesting(
         MasterService& service, const UUID& source_client,
@@ -913,58 +960,85 @@ class MasterServiceHATest : public ::testing::Test {
             return false;
         }
 
-        auto segment_lock = std::make_unique<ScopedSegmentAccess>(
-            MasterServiceTestPeer::SegmentManager(service).getSegmentAccess());
-        auto task = std::async(std::launch::async, std::move(create_task));
-        auto& metadata_mutex =
-            MasterServiceTestPeer::MetadataShards(
-                service)[MasterServiceTestPeer(service).getShardIndex(tenant_id,
-                                                                      key)]
-                .mutex;
-        const auto wait_for_metadata = [&](bool available, auto timeout) {
+        const auto barrier_free = [&]() {
+            std::unique_lock<std::shared_mutex> barrier(
+                MasterServiceTestPeer::SnapshotMutex(service),
+                std::try_to_lock);
+            return barrier.owns_lock();
+        };
+        const auto wait_for_barrier = [&](bool free, auto timeout) {
             const auto deadline = std::chrono::steady_clock::now() + timeout;
             while (std::chrono::steady_clock::now() < deadline) {
-                std::unique_lock<SharedMutex> metadata_lock(metadata_mutex,
-                                                            std::try_to_lock);
-                if (metadata_lock.owns_lock() == available) {
+                if (barrier_free() == free) {
                     return true;
                 }
                 std::this_thread::yield();
             }
             return false;
         };
+        // The task's section holds the barrier for as long as this test holds
+        // the segment registry, while a background worker only crosses it, so
+        // requiring the barrier to stay held over a window is what tells the
+        // task's own section apart from an unrelated holder.
+        const auto barrier_held_for = [&](auto duration) {
+            const auto deadline = std::chrono::steady_clock::now() + duration;
+            while (std::chrono::steady_clock::now() < deadline) {
+                if (barrier_free()) {
+                    return false;
+                }
+                std::this_thread::yield();
+            }
+            return true;
+        };
 
-        const bool reached_discovery =
-            wait_for_metadata(false, std::chrono::seconds(5));
+        // Hold the segment registry so the task parks inside its discovery
+        // section instead of running to its serving-guard wait.
+        auto segment_lock = std::make_unique<ScopedSegmentAccess>(
+            MasterServiceTestPeer::SegmentManager(service).getSegmentAccess());
+        auto task = std::async(std::launch::async, std::move(create_task));
+        const bool reached_section =
+            wait_for_barrier(/*free=*/false, std::chrono::seconds(5)) &&
+            barrier_held_for(std::chrono::milliseconds(200));
         segment_lock.reset();
-        const bool metadata_released =
-            reached_discovery &&
-            wait_for_metadata(true, std::chrono::seconds(1));
-        serving_guard.reset();
-        return task.get().has_value() && reached_discovery && metadata_released;
-    }
+        const bool barrier_released =
+            reached_section &&
+            wait_for_barrier(/*free=*/true, std::chrono::seconds(1));
+        // The task cannot finish here: its next step is the serving guard this
+        // test holds, so an unfinished task is one waiting for that guard.
+        const bool waiting_for_serving_guard =
+            barrier_released && task.wait_for(std::chrono::milliseconds(0)) ==
+                                    std::future_status::timeout;
 
-    static bool PutStartHoldsSnapshotAfterClientReleaseForTesting(
-        MasterService& service, const TenantId& tenant_id,
-        const std::string& key) {
-        const auto scoped_key = tenant_id.MakeScopedKey(key);
-        const size_t stripe_idx =
-            std::hash<std::string>{}(scoped_key) %
-            MasterServiceTestPeer::kObjectOperationLockStripes;
-        std::unique_lock<std::mutex> object_lock(
-            MasterServiceTestPeer::ObjectOperationLocks(service)[stripe_idx],
-            std::try_to_lock);
-        if (object_lock.owns_lock()) {
-            return false;
+        std::atomic<bool> probe_acquired{false};
+        std::thread probe;
+        if (waiting_for_serving_guard) {
+            probe = std::thread([&] {
+                MasterServiceTestPeer(service).WithEntryLockedForTesting(
+                    tenant_id, key, [&] {
+                        probe_acquired.store(true, std::memory_order_release);
+                    });
+            });
         }
-        std::unique_lock<std::shared_mutex> client_lock(
-            MasterServiceTestPeer::ClientMutex(service), std::try_to_lock);
-        if (!client_lock.owns_lock()) {
-            return false;
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        while (std::chrono::steady_clock::now() < deadline &&
+               !probe_acquired.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
         }
-        std::unique_lock<std::shared_mutex> snapshot_lock(
-            MasterServiceTestPeer::SnapshotMutex(service), std::try_to_lock);
-        return !snapshot_lock.owns_lock();
+        const bool object_lock_free =
+            waiting_for_serving_guard &&
+            probe_acquired.load(std::memory_order_acquire);
+
+        // Released last: while this test holds it the task is parked, and a
+        // task that keeps the object's lock across that wait never lets the
+        // probe in. The guard goes first so the probe can never be left waiting
+        // on a lock nothing will release.
+        serving_guard.reset();
+        if (probe.joinable()) {
+            probe.join();
+        }
+        return task.get().has_value() && reached_section && barrier_released &&
+               waiting_for_serving_guard && object_lock_free;
     }
 
     static std::unique_lock<std::shared_mutex> LockClientForTesting(
@@ -990,10 +1064,8 @@ class MasterServiceHATest : public ::testing::Test {
     static void EraseObjectForTesting(MasterService& service,
                                       const TenantId& tenant_id,
                                       const std::string& key) {
-        MasterServiceTestPeer::MetadataAccessorRW accessor(
-            &service, MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
-        ASSERT_TRUE(accessor.Exists());
-        accessor.Erase();
+        ASSERT_TRUE(MasterServiceTestPeer(service).EraseObjectForTesting(
+            tenant_id, key));
     }
 
     static void PrepareUnmountSegmentForTesting(MasterService& service,
@@ -1008,18 +1080,20 @@ class MasterServiceHATest : public ::testing::Test {
     static std::vector<ReplicaID> MarkCompletedReplicasRemovedForTesting(
         MasterService& service, const TenantId& tenant_id,
         const std::string& key) {
-        MasterServiceTestPeer::MetadataAccessorRW accessor(
-            &service, MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
-        if (!accessor.Exists()) {
-            return {};
-        }
-        std::vector<ReplicaID> ids;
-        accessor.Get().VisitReplicas(&Replica::fn_is_completed,
-                                     [&ids](Replica& replica) {
-                                         ids.push_back(replica.id());
-                                         replica.mark_removed();
-                                     });
-        return ids;
+        return MasterServiceTestPeer(service)
+            .WithPublishedObjectForWrite(
+                tenant_id, key,
+                [](metadata::Tenant&, const std::shared_ptr<ObjectEntry>&,
+                   ObjectMetadata& metadata, ObjectEntry::State&) {
+                    std::vector<ReplicaID> ids;
+                    metadata.VisitReplicas(&Replica::fn_is_completed,
+                                           [&ids](Replica& replica) {
+                                               ids.push_back(replica.id());
+                                               replica.mark_removed();
+                                           });
+                    return ids;
+                })
+            .value_or(std::vector<ReplicaID>{});
     }
 
     static void FinalizeRemovedReplicasForTesting(
@@ -1455,12 +1529,12 @@ TEST_F(MasterServiceHATest, RestoreFailureKeepsExistingState) {
 }
 
 TEST_F(MasterServiceHATest,
-       RestoreRejectsUngroupedObjectDuplicatedIntoAnotherShard) {
+       RestoreRejectsUngroupedObjectDuplicatedIntoAnotherGroup) {
     MasterService service(
         MasterServiceConfig::builder().set_enable_ha(false).build());
 
-    const std::string key = "standby_cross_shard_duplicate";
-    const std::string endpoint = "standby_cross_shard_segment";
+    const std::string key = "standby_cross_group_duplicate";
+    const std::string endpoint = "standby_cross_group_segment";
     auto existing = MakeStandbyObject(key, endpoint);
     ASSERT_TRUE(service
                     .RestoreFromStandbySnapshot(
@@ -1468,9 +1542,7 @@ TEST_F(MasterServiceHATest,
                     .has_value());
 
     auto duplicate = MakeStandbyObject(key, endpoint);
-    duplicate.metadata.group_id = FindGroupIdOnDifferentShardFromObject(
-        service, kDefaultTenant, key, "group-");
-    ASSERT_FALSE(duplicate.metadata.group_id.empty());
+    duplicate.metadata.group_id = "group-" + key;
 
     auto result = service.RestoreFromStandbySnapshot(
         {duplicate}, 8, {MakeStandbyMemorySegment(endpoint)});
@@ -1494,9 +1566,7 @@ TEST_F(MasterServiceHATest,
                     .has_value());
 
     auto duplicate = MakeStandbyObject(key, endpoint);
-    duplicate.metadata.group_id = FindGroupIdOnDifferentShardFromGroup(
-        service, existing.metadata.group_id, "replacement-group-");
-    ASSERT_FALSE(duplicate.metadata.group_id.empty());
+    duplicate.metadata.group_id = "replacement-group";
 
     auto result = service.RestoreFromStandbySnapshot(
         {duplicate}, 8, {MakeStandbyMemorySegment(endpoint)});
@@ -1706,41 +1776,43 @@ TEST_F(MasterServiceHATest,
 
     ReplicateConfig config;
     config.replica_num = 1;
-    auto shard_lock = LockMetadataShardForTesting(service, kDefaultTenant, key);
+    // Deterministically gate PutStart inside the snapshot barrier: holding the
+    // owning route lock EXCLUSIVE parks it at its first Pin, after it released
+    // client_mutex_ and while it holds snapshot_mutex_ (shared).
+    SetSnapshotArriveHookForTesting(service,
+                                    [this] { snapshot_gate_.Arrive(); });
+    snapshot_gate_.Arm();
+    auto route_lock = LockRouteForTesting(service, kDefaultTenant);
     auto put = std::async(std::launch::async, [&] {
         return service.PutStart(client_id, key, kDefaultTenant, 1024, config);
     });
 
-    const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    bool reached_snapshot = false;
-    while (std::chrono::steady_clock::now() < deadline) {
-        if (PutStartHoldsSnapshotAfterClientReleaseForTesting(
-                service, kDefaultTenant, key)) {
-            reached_snapshot = true;
-            break;
-        }
-        std::this_thread::yield();
-    }
-    if (!reached_snapshot) {
-        shard_lock.unlock();
+    if (!snapshot_gate_.WaitForArrive(std::chrono::seconds(5))) {
+        // PutStart never entered the barrier within the deadline. Unblock it
+        // and drain the future so the service destructs cleanly, then fail.
+        route_lock.unlock();
         EXPECT_EQ(put.wait_for(std::chrono::seconds(5)),
                   std::future_status::ready);
         if (put.wait_for(std::chrono::seconds(0)) ==
             std::future_status::ready) {
             (void)put.get();
         }
+        snapshot_gate_.Disarm();
         FAIL() << "PutStart did not reach the snapshot barrier";
     }
 
     // ReMountSegment holds client_mutex_ exclusively while waiting for the
     // snapshot barrier. PutStart must not reacquire it inside that barrier.
     auto client_lock = LockClientForTesting(service);
-    shard_lock.unlock();
+    route_lock.unlock();
+    // A real re-acquire would block PutStart forever on client_mutex_ (held by
+    // the test), so a generous window still catches it; a slow-but-legal
+    // LOCAL_FIRST allocation completes far within it.
     const bool completed_while_client_locked =
-        put.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
+        put.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
     client_lock.unlock();
 
+    snapshot_gate_.Disarm();
     ASSERT_EQ(put.wait_for(std::chrono::seconds(5)), std::future_status::ready);
     auto result = put.get();
     ASSERT_TRUE(result.has_value()) << toString(result.error());

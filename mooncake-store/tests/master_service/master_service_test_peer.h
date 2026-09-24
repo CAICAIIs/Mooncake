@@ -5,6 +5,18 @@
 #include "master_service.h"
 
 namespace mooncake::test {
+namespace detail {
+
+// A result the entry helpers below refuse, because their own empty optional is
+// what reports "the callback did not run": a callback that also carries an
+// optional would be wrapped a second time and every caller would have to unwrap
+// twice.
+template <typename T>
+struct IsOptionalResult : std::false_type {};
+template <typename T>
+struct IsOptionalResult<std::optional<T>> : std::true_type {};
+
+}  // namespace detail
 
 // The single test access boundary for MasterService. Keep test-only inspection,
 // mutation and synchronous drivers here, not in the production service API.
@@ -15,27 +27,19 @@ class MasterServiceTestPeer {
     explicit MasterServiceTestPeer(MasterService& service)
         : service_(service) {}
 
-    using GroupDomainAccessorRO = MasterService::GroupDomainAccessorRO;
-    using GroupDomainAccessorRW = MasterService::GroupDomainAccessorRW;
-    using MetadataAccessorRO = MasterService::MetadataAccessorRO;
-    using MetadataAccessorRW = MasterService::MetadataAccessorRW;
     using MetadataSerializer = MasterService::MetadataSerializer;
-    using MetadataShard = MasterService::MetadataShard;
-    using MetadataShardAccessorRO = MasterService::MetadataShardAccessorRO;
-    using MetadataShardAccessorRW = MasterService::MetadataShardAccessorRW;
     using ObjectIdentity = MasterService::ObjectIdentity;
     using ObjectMetadata = mooncake::ObjectMetadata;
     using PromotionQueueResult = mooncake::PromotionQueueResult;
     using PromotionTask = mooncake::PromotionTask;
     using QuotaEraseMode = MasterService::QuotaEraseMode;
+    using TenantRegistry = metadata::TenantRegistry;
     using TenantQuotaEvictionResult = MasterService::TenantQuotaEvictionResult;
-    using TenantState = MasterService::TenantState;
 
     static constexpr auto kDynamicReplicationWindowEntryLimit =
         MasterService::kDynamicReplicationWindowEntryLimit;
     static constexpr auto kMaxPromotionExecutionFailures =
         MasterService::kMaxPromotionExecutionFailures;
-    static constexpr auto kNumShards = MasterService::kNumShards;
     static constexpr auto kObjectOperationLockStripes =
         MasterService::kObjectOperationLockStripes;
     static constexpr auto kPromotionCandidateMaxRetries =
@@ -62,9 +66,16 @@ class MasterServiceTestPeer {
     // Enable epoch bookkeeping without starting a live KV event publisher.
     void SetKvTenantEpochTrackingForTesting(bool enabled);
 
-    // Called after each shard lock is released during RemoveAll. Tests can
-    // commit into an already-scanned shard to pin the interleaving.
-    void SetRemoveAllShardHookForTesting(std::function<void(size_t)> hook);
+    // Publish-side entry point of PutStart's snapshot section: fires after
+    // client_mutex_ is released and while snapshot_mutex_ is held shared. Lets
+    // a lock-order test park PutStart there deterministically.
+    void SetSnapshotArriveHookForTesting(std::function<void()> hook);
+
+    // The owning ObjectIndex's route lock, held EXCLUSIVE. PutStart takes it at
+    // its first Pin inside the snapshot barrier, so holding it parks a PutStart
+    // that has already entered that barrier.
+    std::unique_lock<std::shared_mutex> LockRouteForTesting(
+        const TenantId& tenant_id);
 
     // Counts of published clears and clears suppressed by a concurrent commit.
     uint64_t GetKvClearedPublishedForTesting() const;
@@ -83,6 +94,14 @@ class MasterServiceTestPeer {
     size_t RunPromotionCandidateRetryForTesting();
 
     size_t CountCandidatesForTesting(const TenantId& tenant_id);
+
+    // Seeds an in-flight PromotionTask on (tenant, key), publishing the entry
+    // when the key is not routed yet, so a test can drive
+    // NotifyPromotionSuccess without the on-hit admission gate.
+    void SeedPromotionTaskForTesting(const TenantId& tenant_id,
+                                     const std::string& key,
+                                     const UUID& holder_id, ReplicaID alloc_id,
+                                     uint64_t object_size);
 
     void ResetCandidateBackoffsForTesting();
 
@@ -160,11 +179,9 @@ class MasterServiceTestPeer {
         return service.local_ssd_manager_;
     }
 
-    static auto& MetadataShards(MasterService& service) {
-        return service.metadata_shards_;
-    }
-    static const auto& MetadataShards(const MasterService& service) {
-        return service.metadata_shards_;
+    static auto& Tenants(MasterService& service) { return service.tenants_; }
+    static const auto& Tenants(const MasterService& service) {
+        return service.tenants_;
     }
 
     static auto& NeedMemEviction(MasterService& service) {
@@ -344,9 +361,18 @@ class MasterServiceTestPeer {
 
     void ClearCandidatesForReload() { service_.ClearCandidatesForReload(); }
 
-    void ClearDynamicReplicationStateForKey(TenantState& tenant_state,
+    // Drops the pending dynamic-replication task state for `key` under the
+    // entry's own lock, the way the sweep paths do.
+    void ClearDynamicReplicationStateForKey(metadata::Tenant& tenant,
                                             const std::string& key) {
-        service_.ClearDynamicReplicationStateForKey(tenant_state, key);
+        auto entry = tenant.Get(key);
+        if (entry == nullptr) {
+            return;
+        }
+        entry->WithExclusiveAccess([&](ObjectMetadata&,
+                                       ObjectEntry::State& state) {
+            service_.ClearDynamicReplicationStateLocked(tenant, entry, state);
+        });
     }
 
     void ClearLocalDiskHandlesOwnedBy(const UUID& owner) {
@@ -364,9 +390,9 @@ class MasterServiceTestPeer {
         const MasterServiceConfig& config);
 
     void DiscardExpiredProcessingReplicas(
-        MetadataShardAccessorRW& shard,
+        metadata::Tenant& tenant,
         const std::chrono::system_clock::time_point& now) {
-        service_.DiscardExpiredProcessingReplicas(shard, now);
+        service_.DiscardExpiredProcessingReplicas(tenant, now);
     }
 
     uint32_t DynamicReplicationAdmissionMinHits() const {
@@ -396,10 +422,10 @@ class MasterServiceTestPeer {
     }
 
     void FinalizeExpiredProcessingReplicasAfterDurable(
-        const OpLogEntry& durable_entry,
+        std::shared_ptr<ObjectEntry> entry, const OpLogEntry& durable_entry,
         const std::chrono::system_clock::time_point& ttl) {
-        service_.FinalizeExpiredProcessingReplicasAfterDurable(durable_entry,
-                                                               ttl);
+        service_.FinalizeExpiredProcessingReplicasAfterDurable(
+            std::move(entry), durable_entry, ttl);
     }
 
     void FinalizeRemovedReplicasAfterDurable(
@@ -416,13 +442,210 @@ class MasterServiceTestPeer {
     }
 
     TenantQuotaHandle GetBoundTenantQuotaHandle(
-        const TenantState& tenant_state) const {
-        return service_.GetBoundTenantQuotaHandle(tenant_state);
+        const metadata::Tenant& tenant) const {
+        return service_.GetBoundTenantQuotaHandle(tenant);
     }
 
-    TenantState& GetOrCreateTenantState(MetadataShard& shard,
-                                        const TenantId& tenant_id) {
-        return service_.GetOrCreateTenantState(shard, tenant_id);
+    std::shared_ptr<metadata::Tenant> GetOrCreateTenantHandle(
+        const TenantId& tenant_id) {
+        return service_.GetOrCreateTenantHandle(tenant_id);
+    }
+
+    // The entry currently routed for (tenant, key), or nullptr when the tenant
+    // or the key is absent. Lets a test hold one entry across a concurrent
+    // operation.
+    std::shared_ptr<ObjectEntry> GetEntryForTesting(const TenantId& tenant_id,
+                                                    const std::string& key) {
+        auto tenant_handle =
+            service_.tenants_.Lookup(ResolveRequestTenantId(tenant_id));
+        return tenant_handle == nullptr ? nullptr : tenant_handle->Get(key);
+    }
+
+    // Tears one object down the way a remove path does, with the same
+    // accounting: the entry's own lock is held while the teardown runs and the
+    // route slot is dropped. Lets a test release an object's allocation
+    // without going through the public remove entry points.
+    bool EraseObjectForTesting(const TenantId& tenant_id,
+                               const std::string& key) {
+        const TenantId normalized = ResolveRequestTenantId(tenant_id);
+        auto tenant_handle = service_.tenants_.Lookup(normalized);
+        if (tenant_handle == nullptr) {
+            return false;
+        }
+        auto entry = tenant_handle->Get(key);
+        if (entry == nullptr) {
+            return false;
+        }
+        return entry->WithExclusiveAccess(
+            [&](ObjectMetadata& metadata, ObjectEntry::State& state) {
+                return service_.EraseMetadata(*tenant_handle, entry, metadata,
+                                              state, normalized);
+            });
+    }
+
+    // Runs `fn` while the entry's own lock is held, the way a mutating path
+    // holds it. A test parks a background sweep by blocking inside `fn`: the
+    // sweep blocks on the same entry at its next step, which is where an
+    // operation that first pins the entry and only then decides about it can be
+    // interrupted deterministically.
+    template <typename Fn>
+    void WithEntryLockedForTesting(const TenantId& tenant_id,
+                                   const std::string& key, Fn&& fn) {
+        auto entry = GetEntryForTesting(tenant_id, key);
+        assert(entry != nullptr);
+        entry->WithExclusiveAccess(
+            [&](ObjectMetadata&, ObjectEntry::State&) { fn(); });
+    }
+
+    // Runs `fn(tenant, entry, metadata, state)` on the object under its entry's
+    // own shared lock, the way a read path sees it, with the callback contract
+    // of MasterService::WithObjectMetadataForRead: the tenant first, then the
+    // entry, then the object's two guarded halves, and the callback returns its
+    // own result rather than an optional, because this helper's own empty
+    // optional already carries "the callback did not run".
+    //
+    // Nothing when the tenant or the key is absent, and nothing for an entry
+    // whose accounting is already released: a torn-down entry keeps its
+    // envelope wired until the route slot goes, and an object left with no
+    // valid replica is no longer readable, which is how the retired accessors'
+    // Exists() read it.
+    template <typename Fn>
+    [[nodiscard]] auto WithPublishedObjectForRead(const TenantId& tenant_id,
+                                                  const std::string& key,
+                                                  Fn&& fn) const
+        -> std::optional<std::invoke_result_t<
+            Fn, const metadata::Tenant&, const std::shared_ptr<ObjectEntry>&,
+            const ObjectMetadata&, const ObjectEntry::State&>> {
+        using Result = std::invoke_result_t<
+            Fn, const metadata::Tenant&, const std::shared_ptr<ObjectEntry>&,
+            const ObjectMetadata&, const ObjectEntry::State&>;
+        static_assert(!std::is_void_v<Result>,
+                      "the helper reports absence through its own optional, so "
+                      "the callback must return a result");
+        static_assert(!std::is_reference_v<Result>,
+                      "the result is carried by value: nothing a callback "
+                      "returns may outlive the lock it ran under");
+        static_assert(
+            !detail::IsOptionalResult<std::remove_cv_t<Result>>::value,
+            "the callback must return its result itself; an optional "
+            "here would be wrapped a second time");
+        auto tenant_handle =
+            service_.tenants_.Lookup(ResolveRequestTenantId(tenant_id));
+        if (tenant_handle == nullptr) {
+            return std::nullopt;
+        }
+        auto entry = tenant_handle->Get(key);
+        if (entry == nullptr) {
+            return std::nullopt;
+        }
+        return entry->WithSharedAccess(
+            [&](const ObjectMetadata& metadata,
+                const ObjectEntry::State& state) -> std::optional<Result> {
+                if (state.is_torn_down || !metadata.IsValid()) {
+                    return std::nullopt;
+                }
+                return std::optional<Result>{std::forward<Fn>(fn)(
+                    *tenant_handle, entry, metadata, state)};
+            });
+    }
+
+    // The same under the entry's own write lock, for a test that has to stage
+    // state a production path would have produced. `fn(tenant, entry, metadata,
+    // state)` may mutate the object, the callback contract is the write gate's,
+    // and the same readability predicate gates it. Not const: it hands the
+    // callback a mutable object.
+    template <typename Fn>
+    [[nodiscard]] auto WithPublishedObjectForWrite(const TenantId& tenant_id,
+                                                   const std::string& key,
+                                                   Fn&& fn)
+        -> std::optional<std::invoke_result_t<
+            Fn, metadata::Tenant&, const std::shared_ptr<ObjectEntry>&,
+            ObjectMetadata&, ObjectEntry::State&>> {
+        using Result =
+            std::invoke_result_t<Fn, metadata::Tenant&,
+                                 const std::shared_ptr<ObjectEntry>&,
+                                 ObjectMetadata&, ObjectEntry::State&>;
+        static_assert(!std::is_void_v<Result>,
+                      "the helper reports absence through its own optional, so "
+                      "the callback must return a result");
+        static_assert(!std::is_reference_v<Result>,
+                      "the result is carried by value: nothing a callback "
+                      "returns may outlive the lock it ran under");
+        static_assert(
+            !detail::IsOptionalResult<std::remove_cv_t<Result>>::value,
+            "the callback must return its result itself; an optional "
+            "here would be wrapped a second time");
+        auto tenant_handle =
+            service_.tenants_.Lookup(ResolveRequestTenantId(tenant_id));
+        if (tenant_handle == nullptr) {
+            return std::nullopt;
+        }
+        auto entry = tenant_handle->Get(key);
+        if (entry == nullptr) {
+            return std::nullopt;
+        }
+        return entry->WithExclusiveAccess(
+            [&](ObjectMetadata& metadata,
+                ObjectEntry::State& state) -> std::optional<Result> {
+                if (state.is_torn_down || !metadata.IsValid()) {
+                    return std::nullopt;
+                }
+                return std::optional<Result>{std::forward<Fn>(fn)(
+                    *tenant_handle, entry, metadata, state)};
+            });
+    }
+
+    // Runs `fn(entry, metadata, state)` on the object the route of `tenant_id`
+    // publishes for `key`, under the entry's own shared lock, and hands the
+    // envelope over exactly as stored. Unlike the published-object accessors
+    // this resolves the tenant as given and applies no readability predicate,
+    // so a test can inspect state a request path would refuse to serve.
+    // Nothing when the tenant has no route or the key is not routed.
+    template <typename Fn>
+    [[nodiscard]] auto WithStoredObjectForRead(const TenantId& tenant_id,
+                                               const std::string& key,
+                                               Fn&& fn) const
+        -> std::optional<std::invoke_result_t<
+            Fn, const std::shared_ptr<ObjectEntry>&, const ObjectMetadata&,
+            const ObjectEntry::State&>> {
+        using Result =
+            std::invoke_result_t<Fn, const std::shared_ptr<ObjectEntry>&,
+                                 const ObjectMetadata&,
+                                 const ObjectEntry::State&>;
+        static_assert(!std::is_void_v<Result>,
+                      "the helper reports absence through its own optional, so "
+                      "the callback must return a result");
+        static_assert(!std::is_reference_v<Result>,
+                      "the result is carried by value: nothing a callback "
+                      "returns may outlive the lock it ran under");
+        auto tenant_handle = service_.tenants_.Lookup(tenant_id);
+        if (tenant_handle == nullptr) {
+            return std::nullopt;
+        }
+        auto entry = tenant_handle->Get(key);
+        if (entry == nullptr) {
+            return std::nullopt;
+        }
+        return entry->WithSharedAccess(
+            [&](const ObjectMetadata& metadata,
+                const ObjectEntry::State& state) -> std::optional<Result> {
+                return std::optional<Result>{
+                    std::forward<Fn>(fn)(entry, metadata, state)};
+            });
+    }
+
+    // The tenant's `cleared`-ordering epoch, as RemoveAll reads it before its
+    // walk. Exposed so a test can pin the epoch-changed decision without
+    // racing threads.
+    uint64_t KvTenantEpochForTesting(const TenantId& tenant_id) {
+        return service_.ReadKvTenantEpoch(
+            ResolveRequestTenantId(tenant_id).value());
+    }
+
+    void PublishKvClearedIfEpochUnchangedForTesting(const TenantId& tenant_id,
+                                                    uint64_t expected_epoch) {
+        service_.PublishKvClearedIfEpochUnchanged(
+            ResolveRequestTenantId(tenant_id), expected_epoch);
     }
 
     bool IsReplicaReadable(const Replica& replica) const {
@@ -462,10 +685,6 @@ class MasterServiceTestPeer {
         return service_.PushOffloadingQueue(object_id, replica, mirror_clients);
     }
 
-    void ReRouteRestoredObjectsByKey() {
-        service_.ReRouteRestoredObjectsByKey();
-    }
-
     void RebuildGroupState() { service_.RebuildGroupState(); }
 
     void RebuildTenantQuotaUsageFromMetadata() {
@@ -484,10 +703,6 @@ class MasterServiceTestPeer {
         return service_.ResolveRequestTenantId(tenant_id);
     }
 
-    size_t RunPromotionCandidateRetry(size_t max_shards_to_scan) {
-        return service_.RunPromotionCandidateRetry(max_shards_to_scan);
-    }
-
     size_t RunPromotionCandidateRetry() {
         return service_.RunPromotionCandidateRetry();
     }
@@ -495,15 +710,6 @@ class MasterServiceTestPeer {
     PromotionQueueResult TryPushPromotionQueue(const ObjectIdentity& object_id,
                                                bool record_candidate = true) {
         return service_.TryPushPromotionQueue(object_id, record_candidate);
-    }
-
-    size_t getShardIndex(const TenantId& tenant_id,
-                         const std::string& user_key) const {
-        return service_.getShardIndex(tenant_id, user_key);
-    }
-
-    size_t getShardIndex(const std::string& key) const {
-        return service_.getShardIndex(key);
     }
 
    private:
