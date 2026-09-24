@@ -11894,6 +11894,15 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                             /*collect_older_or_equal=*/true);
         }
     }
+    // The snapshot named the objects to consider and nothing below reads it,
+    // so the handles go back before the eviction pass. Holding them longer
+    // keeps every object the pass evicts alive until this call returns, which
+    // both raises the memory peak and moves the teardown of each one to the end
+    // of the pass.
+    for (auto& slice : slices) {
+        slice.entries.clear();
+    }
+
     // ===== Phase 2: Serial eviction via key lookup =====
     long evicted_count = 0;
     uint64_t total_freed_size = 0;
