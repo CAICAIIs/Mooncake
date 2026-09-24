@@ -237,13 +237,9 @@ class SnapshotChildProcessTest : public ::testing::Test {
 
     // Check if a key exists in raw metadata (regardless of replica status)
     bool KeyExistsInMetadata(MasterService* svc, const std::string& key) {
-        size_t shard_idx = MasterServiceTestPeer(*svc).getShardIndex(key);
-        auto& shard = MasterServiceTestPeer::MetadataShards(*svc)[shard_idx];
-        SharedMutexLocker lock(&shard.mutex, shared_lock_t{});
-        auto tenant_it = shard.tenants.find(TenantId::Default());
-        return tenant_it != shard.tenants.end() &&
-               tenant_it->second.metadata.find(key) !=
-                   tenant_it->second.metadata.end();
+        auto handle =
+            MasterServiceTestPeer::Tenants(*svc).Lookup(TenantId::Default());
+        return handle != nullptr && handle->ContainsObject(key);
     }
 
     size_t SoftPinRegistrationCount(MasterService* svc) {
@@ -252,23 +248,28 @@ class SnapshotChildProcessTest : public ::testing::Test {
 
     std::optional<std::chrono::system_clock::time_point> GetSoftPinDeadline(
         MasterService* svc, const std::string& key) {
-        const size_t shard_idx =
-            MasterServiceTestPeer(*svc).getShardIndex(TenantId::Default(), key);
-        MasterServiceTestPeer::MetadataShardAccessorRO shard(svc, shard_idx);
-        const auto tenant_it = shard->tenants.find(TenantId::Default());
-        if (tenant_it == shard->tenants.end()) {
+        // The committed deadline is itself optional, so this reads the entry
+        // rather than reporting through the published-object helper, whose own
+        // empty optional already means "not published".
+        auto handle =
+            MasterServiceTestPeer::Tenants(*svc).Lookup(TenantId::Default());
+        if (handle == nullptr) {
             return std::nullopt;
         }
-        const auto metadata_it = tenant_it->second.metadata.find(key);
-        if (metadata_it == tenant_it->second.metadata.end()) {
+        auto entry = handle->Get(key);
+        if (entry == nullptr) {
             return std::nullopt;
         }
-        return metadata_it->second.GetCommittedSoftPinTimeout();
+        return entry->WithSharedAccess(
+            [](const ObjectMetadata& metadata, const ObjectEntry::State&) {
+                return metadata.GetCommittedSoftPinTimeout();
+            });
     }
 
-    uint32_t GetShardIndexForTest(const std::string& key) {
-        return static_cast<uint32_t>(
-            MasterServiceTestPeer(*service_).getShardIndex(key));
+    // Shard index a legacy snapshot writer would have used for this key
+    // (std::hash % 1024); the legacy wire format stores per-shard maps.
+    uint32_t LegacyShardIndex(const std::string& key) {
+        return static_cast<uint32_t>(std::hash<std::string>{}(key) % 1024);
     }
 
     tl::expected<void, SerializationError> DeserializeMetadataForTest(
@@ -277,30 +278,20 @@ class SnapshotChildProcessTest : public ::testing::Test {
         return serializer.Deserialize(data);
     }
 
-    bool ObjectIsGroupedInMetadata(const std::string& key, size_t shard_idx) {
-        auto& shard =
-            MasterServiceTestPeer::MetadataShards(*service_)[shard_idx];
-        SharedMutexLocker lock(&shard.mutex, shared_lock_t{});
-        for (const auto& [tenant_id, tenant_state] : shard.tenants) {
-            auto it = tenant_state.metadata.find(key);
-            if (it != tenant_state.metadata.end()) {
-                return it->second.IsGrouped();
-            }
+    bool ObjectIsGroupedInMetadata(const std::string& key) {
+        auto handle = MasterServiceTestPeer::Tenants(*service_).Lookup(
+            TenantId::Default());
+        if (handle == nullptr) {
+            return false;
         }
-        return false;
-    }
-
-    std::string FindGroupIdOnDifferentShard(MasterService* svc,
-                                            const std::string& key) {
-        const size_t key_shard = MasterServiceTestPeer(*svc).getShardIndex(key);
-        for (int i = 0; i < 1024; ++i) {
-            std::string group_id = key + "_group_" + std::to_string(i);
-            if (MasterServiceTestPeer(*svc).getShardIndex(group_id) !=
-                key_shard) {
-                return group_id;
-            }
+        auto entry = handle->Get(key);
+        if (entry == nullptr) {
+            return false;
         }
-        return key + "_group";
+        return entry->WithSharedAccess(
+            [](const ObjectMetadata& metadata, const ObjectEntry::State&) {
+                return metadata.IsGrouped();
+            });
     }
 
    private:
@@ -640,8 +631,7 @@ TEST_F(SnapshotChildProcessTest, RestoreRebuildsGroupedObjectRouting) {
     const std::string key = "snapshot_grouped_route_key";
     ReplicateConfig replicate_config;
     replicate_config.replica_num = 1;
-    replicate_config.group_ids = std::vector<std::string>{
-        FindGroupIdOnDifferentShard(service_.get(), key)};
+    replicate_config.group_ids = std::vector<std::string>{key + "_group"};
 
     auto put_start = service_->PutStart(client_id, key, TenantId::Default(),
                                         1024, replicate_config);
@@ -721,7 +711,7 @@ TEST_F(SnapshotChildProcessTest,
        DeserializeLegacyMetadataWithoutGroupIdRestoresUngroupedObject) {
     CreateDefaultService();
     const std::string key = "legacy_snapshot_no_group_id_key";
-    const uint32_t shard_idx = GetShardIndexForTest(key);
+    const uint32_t shard_idx = LegacyShardIndex(key);
     const UUID client_id = generate_uuid();
 
     msgpack::sbuffer shard_buffer;
@@ -767,13 +757,13 @@ TEST_F(SnapshotChildProcessTest,
     ASSERT_TRUE(deserialize_result.has_value())
         << deserialize_result.error().message;
 
-    EXPECT_FALSE(ObjectIsGroupedInMetadata(key, shard_idx));
+    EXPECT_FALSE(ObjectIsGroupedInMetadata(key));
 }
 
 TEST_F(SnapshotChildProcessTest, DeserializeMetadataSkipsInvalidClientId) {
     CreateDefaultService();
     const std::string key = "invalid_client_id_snapshot_key";
-    const uint32_t shard_idx = GetShardIndexForTest(key);
+    const uint32_t shard_idx = LegacyShardIndex(key);
 
     msgpack::sbuffer shard_buffer;
     MsgpackPacker shard_packer(&shard_buffer);

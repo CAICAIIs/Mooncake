@@ -1,10 +1,13 @@
 #include "metadata/tenant.h"
+#include "common/shrink_buckets.h"
 #include "object_test_helpers.h"
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -193,6 +196,107 @@ TEST(TenantTest, WithPublishedObjectRunsOnlyOnThePublishedEntry) {
     });
     EXPECT_FALSE(tenant.WithPublishedObject(
         "k1", [](ObjectMetadata&, ObjectEntry::State&) {}));
+}
+
+TEST(TenantTest, WithPublishedEntryHandsTheEntryAndCarriesTheResult) {
+    Tenant tenant;
+    auto entry = test::MakeObjectEntry("k1", "g1");
+    ASSERT_TRUE(tenant.InsertObject(entry));
+
+    auto ran = tenant.WithPublishedEntry(
+        "k1", [&](const std::shared_ptr<ObjectEntry>& published,
+                  ObjectMetadata& metadata, ObjectEntry::State& state) {
+            // The entry is what names the publication the callback is acting
+            // on, so the handle it receives is the routed one itself.
+            EXPECT_EQ(published.get(), entry.get());
+            state.is_processing = true;
+            return std::string(metadata.user_key);
+        });
+    // The result is engaged exactly when the callback ran, so a caller cannot
+    // mistake "did not run" for the callback's own answer.
+    ASSERT_TRUE(ran.has_value());
+    EXPECT_EQ(*ran, "k1");
+    EXPECT_TRUE(IsProcessing(entry));
+
+    // A callback that returns void has no result to carry, so its report is
+    // the plain bool.
+    EXPECT_TRUE(tenant.WithPublishedEntry(
+        "k1", [](const std::shared_ptr<ObjectEntry>&, ObjectMetadata&,
+                 ObjectEntry::State&) {}));
+
+    ASSERT_TRUE(tenant.RemoveObject(entry));
+    auto missing = tenant.WithPublishedEntry(
+        "k1", [](const std::shared_ptr<ObjectEntry>&, ObjectMetadata&,
+                 ObjectEntry::State&) { return std::string("never"); });
+    EXPECT_FALSE(missing.has_value());
+}
+
+TEST(TenantTest, WithPublishedEntrySharedReadsWhatIsPublished) {
+    Tenant tenant;
+    auto entry = test::MakeObjectEntry("k1", "g1");
+    ASSERT_TRUE(tenant.InsertObject(entry));
+    entry->WithExclusiveAccess([](ObjectMetadata&, ObjectEntry::State& state) {
+        state.is_processing = true;
+    });
+
+    auto observed = tenant.WithPublishedEntryShared(
+        "k1",
+        [&](const std::shared_ptr<ObjectEntry>& published,
+            const ObjectMetadata& metadata, const ObjectEntry::State& state) {
+            EXPECT_EQ(published.get(), entry.get());
+            EXPECT_TRUE(state.is_processing);
+            return std::string(metadata.user_key);
+        });
+    ASSERT_TRUE(observed.has_value());
+    EXPECT_EQ(*observed, "k1");
+
+    // A reader is refused a torn-down entry just as a writer is.
+    entry->WithExclusiveAccess([](ObjectMetadata&, ObjectEntry::State& state) {
+        state.is_torn_down = true;
+    });
+    EXPECT_FALSE(
+        tenant
+            .WithPublishedEntryShared(
+                "k1",
+                [](const std::shared_ptr<ObjectEntry>&, const ObjectMetadata&,
+                   const ObjectEntry::State&) { return std::string("never"); })
+            .has_value());
+}
+
+TEST(TenantTest, LockRouteForTestingHoldsOffARouteReader) {
+    Tenant tenant;
+    ASSERT_TRUE(tenant.InsertObject(test::MakeObjectEntry("k1")));
+
+    auto route_lock = tenant.LockRouteForTesting();
+    std::mutex mutex;
+    std::condition_variable resolved_cv;
+    bool reader_entered = false;
+    bool reader_resolved = false;
+    std::thread reader([&] {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            reader_entered = true;
+            resolved_cv.notify_all();
+        }
+        EXPECT_TRUE(tenant.ContainsObject("k1"));
+        std::lock_guard<std::mutex> lock(mutex);
+        reader_resolved = true;
+        resolved_cv.notify_all();
+    });
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        ASSERT_TRUE(resolved_cv.wait_for(lock, std::chrono::seconds(5),
+                                         [&] { return reader_entered; }));
+        // The reader is parked on the route lock this test holds, so a bounded
+        // wait is enough to tell a held lock from a free one.
+        EXPECT_FALSE(resolved_cv.wait_for(lock, std::chrono::milliseconds(50),
+                                          [&] { return reader_resolved; }));
+    }
+    route_lock.unlock();
+    reader.join();
+
+    std::lock_guard<std::mutex> lock(mutex);
+    EXPECT_TRUE(reader_resolved);
 }
 
 TEST(TenantTest, UnregisterGroupMemberDropsOnlyTheEntryItIsGiven) {
@@ -452,6 +556,39 @@ TEST(TenantTest, RebuildGroupStateRegroupsTheSameMembers) {
     auto rebuilt_second = LeaseOf(second);
     ASSERT_NE(rebuilt_first, nullptr);
     EXPECT_EQ(rebuilt_first.get(), rebuilt_second.get());
+}
+
+TEST(TenantTest, ShrinkRouteTableIfSparseRehashesAnEmptiedRoute) {
+    Tenant tenant;
+    for (size_t i = 0; i < 4096; ++i) {
+        ASSERT_TRUE(
+            tenant.InsertObject(test::MakeObjectEntry(std::to_string(i))));
+    }
+    const size_t grown = tenant.RouteBucketCountForTesting();
+    ASSERT_GT(grown, kShrinkMinBucketCount);
+
+    for (size_t i = 0; i < 4096; ++i) {
+        const std::string key = std::to_string(i);
+        ASSERT_TRUE(tenant.RemoveObject(tenant.Get(key)));
+    }
+    tenant.ShrinkRouteTableIfSparse();
+
+    EXPECT_LT(tenant.RouteBucketCountForTesting(), grown);
+    EXPECT_EQ(tenant.ObjectCount(), 0u);
+}
+
+TEST(TenantTest, ShrinkRouteTableIfSparseLeavesADenseRouteAlone) {
+    Tenant tenant;
+    for (size_t i = 0; i < 4096; ++i) {
+        ASSERT_TRUE(
+            tenant.InsertObject(test::MakeObjectEntry(std::to_string(i))));
+    }
+    const size_t grown = tenant.RouteBucketCountForTesting();
+    ASSERT_GT(grown, kShrinkMinBucketCount);
+
+    tenant.ShrinkRouteTableIfSparse();
+
+    EXPECT_EQ(tenant.RouteBucketCountForTesting(), grown);
 }
 
 }  // namespace
