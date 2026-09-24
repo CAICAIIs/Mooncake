@@ -11596,14 +11596,17 @@ void MasterService::BatchEvict(double evict_ratio_target,
         std::chrono::system_clock::time_point lease_timeout;
     };
 
-    // All of a tenant's objects live in one container, so the census is one
-    // snapshot-consistent walk of the registry.
+    // All of a tenant's objects live in one container, so the census walks the
+    // registry once and then partitions the per-object pass across worker
+    // threads: one large tenant has to spread across them as well as many small
+    // ones do.
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
 
     constexpr size_t kMinReserveSlack = 1024;
     constexpr size_t kMinFrontierLimit = 64 * 1024;
     constexpr size_t kReserveSlackDivisor = 10;
     constexpr size_t kFrontierDivisor = 4;
+    constexpr size_t kMaxCensusThreads = 16;
     // Above this target ratio the reserve frontier would already cover a large
     // share of the population, so selective materialization stops paying for
     // the extra scan it costs.
@@ -11613,11 +11616,102 @@ void MasterService::BatchEvict(double evict_ratio_target,
     const bool compact_frontier_prebypass =
         evict_ratio_target >= kCompactPrebypassTargetRatio;
 
-    long total_eviction_base = 0;
+    // What one worker accumulates for its own slices. No accumulator is shared
+    // with another worker, so the partition needs no lock of its own.
+    struct CensusTally {
+        long eviction_base{0};
+        std::vector<Candidate> candidates;
+        std::vector<std::chrono::system_clock::time_point> no_pin_timeouts;
+        std::vector<std::chrono::system_clock::time_point> soft_pin_objects;
+    };
+
+    // One work item per bounded run of one tenant's objects. Taking the handles
+    // before the partition is what lets a worker walk its own objects without
+    // the route lock: the handles keep the entries alive, and the only lock the
+    // walk takes is each entry's own, which never nests with another entry's.
+    struct CensusSlice {
+        TenantId tenant_id;
+        std::shared_ptr<metadata::Tenant> tenant;
+        std::vector<std::shared_ptr<ObjectEntry>> entries;
+        // A tenant's expired-processing sweep runs once, on the slice holding
+        // its first objects.
+        bool sweep_expired_processing{false};
+    };
+
+    std::vector<std::pair<TenantId, std::shared_ptr<metadata::Tenant>>> tenants;
+    tenants_.Visit(
+        [&](const TenantId& tenant_id,
+            const std::shared_ptr<metadata::Tenant>& tenant) {
+            tenants.emplace_back(tenant_id, tenant);
+        });
+
     long object_count = 0;
-    std::vector<Candidate> candidates;
-    std::vector<std::chrono::system_clock::time_point> no_pin_timeouts;
-    std::vector<std::chrono::system_clock::time_point> soft_pin_objects;
+    for (const auto& [tenant_id, tenant] : tenants) {
+        (void)tenant_id;
+        object_count += static_cast<long>(tenant->ObjectCount());
+    }
+
+    const size_t objects_per_slice = std::max<size_t>(
+        1,
+        (static_cast<size_t>(object_count) + kMaxCensusThreads - 1) /
+            kMaxCensusThreads);
+    std::vector<CensusSlice> slices;
+    for (const auto& [tenant_id, tenant] : tenants) {
+        auto entries = tenant->SnapshotObjects();
+        size_t offset = 0;
+        while (offset < entries.size()) {
+            const size_t count =
+                std::min(objects_per_slice, entries.size() - offset);
+            CensusSlice slice;
+            slice.tenant_id = tenant_id;
+            slice.tenant = tenant;
+            slice.entries.assign(
+                std::make_move_iterator(entries.begin() + offset),
+                std::make_move_iterator(entries.begin() + offset + count));
+            slice.sweep_expired_processing = offset == 0;
+            slices.push_back(std::move(slice));
+            offset += count;
+        }
+    }
+
+    std::vector<CensusTally> tallies(slices.size());
+
+    // Runs `fn(slice_index)` over the slices on worker threads. Every walk
+    // below takes one entry lock at a time and entry locks never nest with each
+    // other, so the partition needs no lock beyond the shared snapshot lock the
+    // caller holds.
+    const auto run_over_slices = [&](const auto& fn) {
+        if (slices.size() <= 1) {
+            for (size_t i = 0; i < slices.size(); ++i) {
+                fn(i);
+            }
+            return;
+        }
+        const size_t worker_count = std::min(slices.size(), kMaxCensusThreads);
+        const size_t slices_per_worker =
+            (slices.size() + worker_count - 1) / worker_count;
+        std::vector<std::thread> workers;
+        workers.reserve(worker_count - 1);
+        for (size_t worker = 1; worker < worker_count; ++worker) {
+            const size_t begin = worker * slices_per_worker;
+            if (begin >= slices.size()) {
+                break;
+            }
+            const size_t end = std::min(begin + slices_per_worker, slices.size());
+            workers.emplace_back([&fn, begin, end] {
+                for (size_t i = begin; i < end; ++i) {
+                    fn(i);
+                }
+            });
+        }
+        const size_t main_end = std::min(slices_per_worker, slices.size());
+        for (size_t i = 0; i < main_end; ++i) {
+            fn(i);
+        }
+        for (auto& worker : workers) {
+            worker.join();
+        }
+    };
 
     // ===== Phase 1: Candidate census =====
     // For selective ratios only the lease timestamps are collected here; full
@@ -11625,15 +11719,19 @@ void MasterService::BatchEvict(double evict_ratio_target,
     // around the eviction cutoff. High ratios collect full Candidates
     // directly, because a census followed by a second scan would cost more
     // than the identities it saves.
-    tenants_.Visit([&](const TenantId& tenant_id,
-                       const std::shared_ptr<metadata::Tenant>& tenant) {
-        DiscardExpiredProcessingReplicas(*tenant, now);
-
-        object_count += static_cast<long>(tenant->ObjectCount());
+    run_over_slices([&](size_t index) {
+        CensusTally& tally = tallies[index];
+        const CensusSlice& slice = slices[index];
+        // The sweep takes entry locks exclusively and the census below takes
+        // them shared, so a sweep running next to its own tenant's census still
+        // serializes per object on that object's lock.
+        if (slice.sweep_expired_processing) {
+            DiscardExpiredProcessingReplicas(*slice.tenant, now);
+        }
         // The snapshot only names the keys to consider: every eviction
         // below resolves its candidate again under that object's own lock,
         // so a handle that stopped being current is caught there.
-        for (const auto& entry : tenant->SnapshotObjects()) {
+        for (const auto& entry : slice.entries) {
             entry->WithSharedAccess(
                 [&](const ObjectMetadata& metadata, const ObjectEntry::State&) {
                     if (metadata.IsHardPinned()) {
@@ -11641,7 +11739,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     }
                     const bool has_evictable = can_evict_replicas(metadata);
                     if (has_evictable) {
-                        total_eviction_base++;
+                        tally.eviction_base++;
                     }
                     // Grouped objects are evicted all-or-none, so rank them by
                     // the shared group TTL (consistent across members) instead
@@ -11654,17 +11752,36 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     }
                     if (!IsSoftPinActive(metadata, now)) {
                         if (compact_frontier_prebypass) {
-                            candidates.push_back(
-                                {tenant_id, entry->key(), deadline});
+                            tally.candidates.push_back(
+                                {slice.tenant_id, entry->key(), deadline});
                         } else {
-                            no_pin_timeouts.push_back(deadline);
+                            tally.no_pin_timeouts.push_back(deadline);
                         }
                     } else if (allow_evict_soft_pinned_objects_) {
-                        soft_pin_objects.push_back(deadline);
+                        tally.soft_pin_objects.push_back(deadline);
                     }
                 });
         }
     });
+
+    long total_eviction_base = 0;
+    std::vector<Candidate> candidates;
+    std::vector<std::chrono::system_clock::time_point> no_pin_timeouts;
+    std::vector<std::chrono::system_clock::time_point> soft_pin_objects;
+    for (auto& tally : tallies) {
+        total_eviction_base += tally.eviction_base;
+        candidates.insert(candidates.end(),
+                          std::make_move_iterator(tally.candidates.begin()),
+                          std::make_move_iterator(tally.candidates.end()));
+        no_pin_timeouts.insert(
+            no_pin_timeouts.end(),
+            std::make_move_iterator(tally.no_pin_timeouts.begin()),
+            std::make_move_iterator(tally.no_pin_timeouts.end()));
+        soft_pin_objects.insert(
+            soft_pin_objects.end(),
+            std::make_move_iterator(tally.soft_pin_objects.begin()),
+            std::make_move_iterator(tally.soft_pin_objects.end()));
+    }
 
     if (total_eviction_base == 0) {
         VLOG(1) << "[EVICT-DIAG] object_count=" << object_count
@@ -11685,10 +11802,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
     auto collect_candidates = [&](bool use_cutoff,
                                   std::chrono::system_clock::time_point cutoff,
                                   bool collect_older_or_equal) {
-        std::vector<Candidate> merged;
-        tenants_.Visit([&](const TenantId& tenant_id,
-                           const std::shared_ptr<metadata::Tenant>& tenant) {
-            for (const auto& entry : tenant->SnapshotObjects()) {
+        std::vector<std::vector<Candidate>> per_slice(slices.size());
+        run_over_slices([&](size_t index) {
+            const CensusSlice& slice = slices[index];
+            for (const auto& entry : slice.entries) {
                 entry->WithSharedAccess([&](const ObjectMetadata& metadata,
                                             const ObjectEntry::State&) {
                     if (metadata.IsHardPinned() ||
@@ -11711,10 +11828,22 @@ void MasterService::BatchEvict(double evict_ratio_target,
                             return;
                         }
                     }
-                    merged.push_back({tenant_id, entry->key(), deadline});
+                    per_slice[index].push_back(
+                        {slice.tenant_id, entry->key(), deadline});
                 });
             }
         });
+        size_t total = 0;
+        for (const auto& collected : per_slice) {
+            total += collected.size();
+        }
+        std::vector<Candidate> merged;
+        merged.reserve(total);
+        for (auto& collected : per_slice) {
+            merged.insert(merged.end(),
+                          std::make_move_iterator(collected.begin()),
+                          std::make_move_iterator(collected.end()));
+        }
         return merged;
     };
 
