@@ -4986,6 +4986,12 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         [&](metadata::Tenant& tenant, const std::shared_ptr<ObjectEntry>&,
             ObjectMetadata& metadata,
             ObjectEntry::State& state) -> tl::expected<void, ErrorCode> {
+            // A publication with no usable replica reads as absent, so this
+            // reports the same answer as the read APIs for that key.
+            if (!metadata.IsValid()) {
+                VLOG(1) << "key=" << key << ", info=object_not_found";
+                return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+            }
             if (client_id != metadata.client_id) {
                 LOG(ERROR) << "Illegal client " << client_id
                            << " to PutEnd key " << key
@@ -6359,6 +6365,12 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
         [&](metadata::Tenant& tenant, const std::shared_ptr<ObjectEntry>& entry,
             ObjectMetadata& metadata, ObjectEntry::State& state)
             -> tl::expected<CopyStartResponse, ErrorCode> {
+            // A publication with no usable replica reads as absent, so no
+            // replica of it can be the source of a copy.
+            if (!metadata.IsValid()) {
+                VLOG(1) << "key=" << key << ", info=object_not_found";
+                return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+            }
             if (state.replication_task.has_value()) {
                 LOG(ERROR) << "key=" << key
                            << " already has an ongoing replication task";
@@ -6878,6 +6890,12 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
         [&](metadata::Tenant& tenant, const std::shared_ptr<ObjectEntry>& entry,
             ObjectMetadata& metadata, ObjectEntry::State& state)
             -> tl::expected<MoveStartResponse, ErrorCode> {
+            // A publication with no usable replica reads as absent, so no
+            // replica of it can be the source of a move.
+            if (!metadata.IsValid()) {
+                VLOG(1) << "key=" << key << ", info=object_not_found";
+                return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+            }
             if (state.replication_task.has_value()) {
                 LOG(ERROR) << "key=" << key
                            << " already has an ongoing replication task";
@@ -7294,6 +7312,12 @@ auto MasterService::Remove(const std::string& key, const TenantId& tenant_id,
         [&](metadata::Tenant& tenant, const std::shared_ptr<ObjectEntry>& entry,
             ObjectMetadata& metadata,
             ObjectEntry::State& state) -> tl::expected<void, ErrorCode> {
+            // A publication with no usable replica reads as absent, so there is
+            // nothing to remove for this key.
+            if (!metadata.IsValid()) {
+                VLOG(1) << "key=" << key << ", info=object_not_found";
+                return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+            }
             if (!force && !metadata.IsLeaseExpired()) {
                 VLOG(1) << "key=" << key << ", error=object_has_lease";
                 return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
@@ -9396,6 +9420,12 @@ MasterService::SubmitReplicaActionProposalLocked(
         [&](metadata::Tenant& tenant, const std::shared_ptr<ObjectEntry>& entry,
             ObjectMetadata& metadata, ObjectEntry::State& state)
             -> tl::expected<ReplicaActionLease, ErrorCode> {
+            // A publication with no usable replica reads as absent: no proposal
+            // is admitted against it, and no in-flight lease of it is served.
+            if (!metadata.IsValid()) {
+                VLOG(1) << "key=" << proposal.key << ", info=object_not_found";
+                return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+            }
             auto existing_lease =
                 FindDynamicReplicationLease(object_id.tenant_id, proposal_id);
             if (existing_lease.has_value()) {
@@ -9597,12 +9627,18 @@ PromotionQueueResult MasterService::TryPushPromotionQueue(
         MasterMetricManager::instance().inc_promotion_rejected_watermark();
         if (record_candidate) {
             // A key that is not published has nothing to retry, and the
-            // callback does not run for it.
+            // callback does not run for it. One that is published with no
+            // usable replica has nothing to promote either, and reads as
+            // absent everywhere else.
             (void)WithObjectMetadataForWrite(
                 object_id,
                 [&](metadata::Tenant& tenant,
-                    const std::shared_ptr<ObjectEntry>& entry, ObjectMetadata&,
+                    const std::shared_ptr<ObjectEntry>& entry,
+                    ObjectMetadata& metadata,
                     ObjectEntry::State& state) -> void {
+                    if (!metadata.IsValid()) {
+                        return;
+                    }
                     RecordOrUpdateCandidateLocked(
                         object_id.tenant_id, entry, state, freq,
                         PromotionCandidateReason::kWatermark, ErrorCode::OK);
@@ -9619,6 +9655,11 @@ PromotionQueueResult MasterService::TryPushPromotionQueue(
         [&](metadata::Tenant& tenant, const std::shared_ptr<ObjectEntry>& entry,
             ObjectMetadata& metadata,
             ObjectEntry::State& state) -> PromotionQueueResult {
+            // A publication with no usable replica reads as absent; the retry
+            // path that reads this answer drops the candidate with it.
+            if (!metadata.IsValid()) {
+                return PromotionQueueResult::kNotFound;
+            }
             // A primary Put/Upsert owns all PROCESSING replicas while the entry
             // is processing. Promotion must not establish a second owner.
             if (state.is_processing) {
@@ -9784,6 +9825,12 @@ auto MasterService::PromotionAllocStart(
         [&](metadata::Tenant& tenant, const std::shared_ptr<ObjectEntry>&,
             ObjectMetadata& metadata, ObjectEntry::State& state)
             -> tl::expected<PromotionAllocStartResponse, ErrorCode> {
+            // A publication with no usable replica reads as absent, so nothing
+            // is staged for it and no DRAM is charged to it.
+            if (!metadata.IsValid()) {
+                VLOG(1) << "key=" << key << ", info=object_not_found";
+                return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+            }
             if (state.is_processing) {
                 return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
             }
@@ -9930,6 +9977,12 @@ auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
         [&](metadata::Tenant& tenant, const std::shared_ptr<ObjectEntry>&,
             ObjectMetadata& metadata,
             ObjectEntry::State& state) -> tl::expected<void, ErrorCode> {
+            // A publication with no usable replica reads as absent, so no
+            // promotion of it can complete.
+            if (!metadata.IsValid()) {
+                VLOG(1) << "key=" << key << ", info=object_not_found";
+                return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+            }
             const auto previous_kv_media = KvMediaSnapshot(metadata);
 
             // Look up the in-flight task to find the exact replica we staged. A
@@ -10074,6 +10127,12 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
         [&](metadata::Tenant& tenant, const std::shared_ptr<ObjectEntry>& entry,
             ObjectMetadata& metadata,
             ObjectEntry::State& state) -> tl::expected<void, ErrorCode> {
+            // A publication with no usable replica reads as absent, and reports
+            // the same not-found answer a key that was never published does.
+            if (!metadata.IsValid()) {
+                VLOG(1) << "key=" << key << ", info=object_not_found";
+                return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+            }
             if (!state.promotion_task.has_value()) {
                 // No task to release. Either the reaper already swept it, or
                 // the client never had a task here. Return OK to keep this RPC

@@ -1539,6 +1539,12 @@ class MasterService {
     // separate pass: the handle a reader resolves through this object can go
     // stale between two RPCs, and an object left with no valid replica is torn
     // down here, so the callback of such an access does not run.
+    //
+    // The liveness this reports is "the route still publishes this entry, and
+    // it is not torn down". It says nothing about the object being usable, so a
+    // point operation whose answer has to agree with the read APIs checks
+    // `metadata.IsValid()` in its callback, the way the accessor those paths
+    // replaced did through `Exists()`.
     template <typename Fn>
     [[nodiscard]] auto WithObjectMetadataForWrite(
         const ObjectIdentity& object_id, Fn&& fn) {
