@@ -92,18 +92,35 @@ class MasterServiceTestPeer;
 
 /*
  * @brief MasterService is the main class for the master server.
- * Lock order: To avoid deadlocks, the following lock order should be followed:
- * 1. client_mutex_
- * 2. tenant_quota_policy_mutex_
- * 3. snapshot_mutex_
- * 4. one object's own lock, taken through the entry the tenant publishes
- * 5. tenant_quota_recompute_mutex_
- * 6. ShardedTenantQuotaTable internal mutex or segment_mutex_
- * 7. soft_pin_deadline_index_ mutex
+ * Lock order: To avoid deadlocks, the following order is observed. A lock may
+ * be taken without holding the ones listed above it, never the other way
+ * round:
+ * 1. object_operation_locks_[stripe], which PutStart and UpsertStart hold for
+ *    the whole request
+ * 2. client_mutex_
+ * 3. a ClientLivenessRecord's serving or retaining guard
+ * 4. tenant_quota_policy_mutex_
+ * 5. snapshot_mutex_
+ * 6. one object's own lock, taken through the entry its tenant publishes
+ * 7. tenant_quota_recompute_mutex_
+ * 8. segment_mutex_ and the segment allocator mutex, or the
+ *    ShardedTenantQuotaTable internal mutex
+ * 9. the task manager's write lock
+ * 10. everything an object operation reaches from the entry lock: the tenant's
+ *    object route, group index, replica-action lease table and
+ *    promotion-candidate index, the OpLog writer's mutex, local_ssd_manager_,
+ *    dfs_allocator_, discarded_replicas_mutex_, soft_pin_deadline_index_ and
+ *    ObjectMetadata's own spin lock. These are leaves: none of them is held
+ *    while a lock above is taken.
  *
  * The tenant's object route lock nests inside an entry lock, because publishing
  * an entry holds that entry across the route insert; the reverse nesting is
  * forbidden.
+ *
+ * The OpLog writer hands durability back on its own callback thread without
+ * holding its mutex, so a durable finalizer there re-resolves its object
+ * through the route and takes snapshot_mutex_ and the entry lock in the order
+ * above.
  *
  * Strict tenant admission and policy mutation paths that need both
  * tenant_quota_policy_mutex_ and snapshot_mutex_ must acquire the tenant
@@ -740,8 +757,8 @@ class MasterService {
     /**
      * @brief Heartbeat-driven pull of pending promotion work for a client.
      * Returns tenant-scoped promotion tasks for the holder client and clears
-     * its per-client promotion_objects queue. The per-shard promotion_tasks
-     * map remains populated as the source of truth until NotifyPromotionSuccess
+     * its per-client promotion_objects queue. The entry's own promotion task
+     * remains populated as the source of truth until NotifyPromotionSuccess
      * commits the new MEMORY replica.
      */
     auto PromotionObjectHeartbeat(const UUID& client_id)
@@ -766,7 +783,7 @@ class MasterService {
 
     /**
      * @brief Commit a staged MEMORY replica to COMPLETE; decrement source
-     * refcnt; erase per-shard and per-client task entries. Mirror of
+     * refcnt; erase the entry's task and the per-client task entry. Mirror of
      * NotifyOffloadSuccess.
      */
     auto NotifyPromotionSuccess(const UUID& client_id, const std::string& key,
@@ -1752,7 +1769,7 @@ class MasterService {
     uint64_t DynamicReplicationVersionEpoch(
         const ObjectMetadata& metadata) const;
     // Drops the pending dynamic-replication task state of the guarded entry and
-    // the leases of its generation. The caller passes the envelope and state it
+    // the leases of its key. The caller passes the envelope and state it
     // holds under the entry's own lock.
     void ClearDynamicReplicationStateLocked(
         metadata::Tenant& tenant, const std::shared_ptr<ObjectEntry>& entry,
@@ -1774,18 +1791,18 @@ class MasterService {
         const UUID& lease_id, uint64_t version_epoch);
     // Both run under the entry lock CopyStart holds across the whole operation,
     // so the route slot still publishes that entry and the pending state they
-    // read is the one this copy was admitted for. The caller passes the
-    // envelope and state it already holds.
+    // read is the one this copy was admitted for. The caller passes the state
+    // it already holds.
     tl::expected<void, ErrorCode> ValidateDynamicReplicaPendingForCopyStart(
-        ObjectMetadata& metadata, ObjectEntry::State& state,
-        const UUID& dynamic_replication_lease_id, const UUID& client_id,
-        const std::string& source_segment, uint64_t current_version_epoch,
+        ObjectEntry::State& state, const UUID& dynamic_replication_lease_id,
+        const UUID& client_id, const std::string& source_segment,
+        uint64_t current_version_epoch,
         uint64_t dynamic_replication_version_epoch,
         const std::vector<std::string>& target_segments);
     void RegisterDynamicReplicaStart(
-        metadata::Tenant& tenant, ObjectMetadata& metadata,
-        ObjectEntry::State& state, const std::string& source_segment,
-        uint64_t version_epoch, const std::vector<std::string>& target_segments,
+        ObjectMetadata& metadata, ObjectEntry::State& state,
+        const std::string& source_segment, uint64_t version_epoch,
+        const std::vector<std::string>& target_segments,
         const std::vector<ReplicaID>& replica_ids);
     static int64_t DynamicReplicationNowMs();
 

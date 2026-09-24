@@ -814,7 +814,7 @@ TEST_F(PromotionOnHitTest, StalePromotionReaper) {
     const int64_t expired_pre = mm.get_promotion_expired();
 
     // Trigger #1: enqueue, then drain the per-segment queue. Drain leaves
-    // the per-shard PromotionTask intact (the heartbeat is best-effort GC,
+    // the entry's PromotionTask intact (the heartbeat is best-effort GC,
     // not the authoritative state).
     {
         auto r = service->GetReplicaList("k_cold", TenantId::Default());
@@ -914,7 +914,7 @@ TEST_F(PromotionOnHitTest, RemoveDuringPromotion) {
     std::this_thread::sleep_for(std::chrono::seconds(3));
 
     // Re-injecting the key and re-triggering must work end-to-end, proving
-    // the per-shard PromotionTask was reaped (not stuck).
+    // the entry's PromotionTask was reaped (not stuck).
     ASSERT_TRUE(InjectLocalDiskReplica(*service, ctx.client_id, "k_cold", 1024,
                                        ctx.segment_name));
     {
