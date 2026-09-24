@@ -115,7 +115,7 @@ TEST(TenantTest, RemoveObjectDropsEveryRecordOfTheEntryTheSlotHolds) {
     tenant.PutDynamicReplicationLease(entry, UUID{7, 8},
                                       LeaseFor(entry, UUID{7, 8}));
     tenant.IndexPromotionCandidate("k1");
-    ASSERT_FALSE(tenant.Empty());
+    ASSERT_TRUE(tenant.FindDynamicReplicationLease(UUID{7, 8}).has_value());
     ASSERT_EQ(tenant.PromotionCandidateKeys().size(), 1u);
 
     // The slot names this entry, so every record the key carries is its own and
@@ -127,7 +127,6 @@ TEST(TenantTest, RemoveObjectDropsEveryRecordOfTheEntryTheSlotHolds) {
     EXPECT_TRUE(tenant.GroupMembers("g1").empty());
     EXPECT_FALSE(tenant.FindDynamicReplicationLease(UUID{7, 8}).has_value());
     EXPECT_TRUE(tenant.PromotionCandidateKeys().empty());
-    EXPECT_TRUE(tenant.Empty());
 }
 
 TEST(TenantTest, RemoveObjectRequiresTheEntryStillOnTheRoute) {
@@ -334,7 +333,6 @@ TEST(TenantTest, UnregisterGroupMemberDropsOnlyTheEntryItIsGiven) {
     tenant.UnregisterGroupMember(first);
     ASSERT_EQ(tenant.GroupMembers("g1").size(), 1u);
     EXPECT_EQ(tenant.GroupMembers("g1")[0], "k2");
-    EXPECT_FALSE(tenant.Empty());
     EXPECT_EQ(LeaseOf(second).get(), group_lease.get());
 
     // The member is already gone, so a repeat leaves the group as it is.
@@ -389,7 +387,7 @@ TEST(TenantTest, RemoveObjectClearsRecordsUnderAKeyWhoseSlotIsGone) {
     tenant.PutDynamicReplicationLease(entry, UUID{7, 8},
                                       LeaseFor(entry, UUID{7, 8}));
     tenant.IndexPromotionCandidate("k1");
-    ASSERT_FALSE(tenant.Empty());
+    ASSERT_EQ(tenant.PromotionCandidateKeys().size(), 1u);
 
     // What a publish that failed after taking the slot leaves behind: the slot
     // is rolled back, the membership, the lease and the candidate index entry
@@ -401,7 +399,6 @@ TEST(TenantTest, RemoveObjectClearsRecordsUnderAKeyWhoseSlotIsGone) {
     EXPECT_TRUE(tenant.GroupMembers("g1").empty());
     EXPECT_FALSE(tenant.FindDynamicReplicationLease(UUID{7, 8}).has_value());
     EXPECT_TRUE(tenant.PromotionCandidateKeys().empty());
-    EXPECT_TRUE(tenant.Empty());
 }
 
 TEST(TenantTest, AGroupSurvivesConcurrentReplacementOfItsKeys) {
@@ -455,31 +452,32 @@ TEST(TenantTest, AGroupSurvivesConcurrentReplacementOfItsKeys) {
             EXPECT_EQ(group_lease.get(), lease.get());
         }
     }
-    EXPECT_TRUE(tenant.Empty());
+    // At rest the writers have torn every publication down, so nothing may be
+    // left behind: no slot, no member record and no lease in flight.
+    EXPECT_TRUE(tenant.SnapshotObjects().empty());
+    EXPECT_TRUE(tenant.GroupMembers("g1").empty());
+    EXPECT_FALSE(tenant.FindDynamicReplicationLease(UUID{7, 8}).has_value());
 }
 
-TEST(TenantTest, EmptyTracksObjectsGroupsAndLeases) {
+TEST(TenantTest, RouteSlotMembershipAndLeaseAreIndependentRecords) {
     Tenant tenant;
-    EXPECT_TRUE(tenant.Empty());
-
     auto grouped = test::MakeObjectEntry("k1", "g1");
     ASSERT_TRUE(tenant.InsertObject(grouped));
-    EXPECT_FALSE(tenant.Empty());
 
-    // Erasing the route slot leaves the membership behind, so the tenant is
-    // still non-empty until that is dropped too.
+    // Erasing the route slot leaves the membership behind, so the two are
+    // dropped one at a time rather than together.
     ASSERT_TRUE(tenant.EraseObjectIf(grouped));
-    EXPECT_FALSE(tenant.Empty());
+    EXPECT_FALSE(tenant.ContainsObject("k1"));
+    EXPECT_EQ(tenant.GroupMembers("g1").size(), 1u);
     tenant.UnregisterGroupMember(grouped);
-    EXPECT_TRUE(tenant.Empty());
     EXPECT_TRUE(tenant.GroupMembers("g1").empty());
 
     // A lease in flight is state of its own.
     tenant.PutDynamicReplicationLease(grouped, UUID{7, 8},
                                       LeaseFor(grouped, UUID{7, 8}));
-    EXPECT_FALSE(tenant.Empty());
+    EXPECT_TRUE(tenant.FindDynamicReplicationLease(UUID{7, 8}).has_value());
     EXPECT_TRUE(tenant.RemoveDynamicReplicationLease(UUID{7, 8}));
-    EXPECT_TRUE(tenant.Empty());
+    EXPECT_FALSE(tenant.FindDynamicReplicationLease(UUID{7, 8}).has_value());
 }
 
 TEST(TenantTest, RebuildGroupStateRegroupsTheSameMembers) {
@@ -518,7 +516,7 @@ TEST(TenantTest, ResetDynamicReplicationStateClearsTheLeasesItHolds) {
         state.dynamic_replication_cooldown =
             std::chrono::steady_clock::now() + std::chrono::seconds(1);
     });
-    ASSERT_FALSE(tenant.Empty());
+    ASSERT_TRUE(tenant.FindDynamicReplicationLease(UUID{7, 8}).has_value());
 
     entry->WithExclusiveAccess([&](ObjectMetadata&, ObjectEntry::State& state) {
         tenant.ResetDynamicReplicationState(state, entry);
@@ -534,7 +532,6 @@ TEST(TenantTest, ResetDynamicReplicationStateClearsTheLeasesItHolds) {
                    state.dynamic_replication_cooldown ==
                        std::chrono::steady_clock::time_point{};
         }));
-    EXPECT_FALSE(tenant.Empty());
 }
 
 TEST(TenantTest, PromotionCandidateKeysTrackWhatWasIndexed) {

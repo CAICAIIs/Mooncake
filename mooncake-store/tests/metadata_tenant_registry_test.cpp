@@ -95,12 +95,12 @@ TEST(TenantRegistryTest, RemoveDropsTheTenantButNotTheHandle) {
     registry.Remove(TenantId("tenant-a"));
     EXPECT_EQ(registry.Lookup(TenantId("tenant-a")), nullptr);
     ASSERT_TRUE(removed->InsertObject(test::MakeObjectEntry("k1")));
-    EXPECT_FALSE(removed->Empty());
+    EXPECT_TRUE(removed->ContainsObject("k1"));
 
     auto recreated = registry.GetOrCreateTenant(TenantId("tenant-a"));
     ASSERT_NE(recreated, nullptr);
     EXPECT_NE(recreated.get(), removed.get());
-    EXPECT_TRUE(recreated->Empty());
+    EXPECT_FALSE(recreated->ContainsObject("k1"));
     ASSERT_NE(registry.Lookup(TenantId("tenant-b")), nullptr);
 }
 

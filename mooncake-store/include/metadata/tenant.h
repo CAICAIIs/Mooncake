@@ -75,9 +75,11 @@ class Tenant {
     }
 
     // Erases the route slot only when it still resolves to `expected`, without
-    // touching the records that hang off the key. A publish that failed before
-    // registering anything rolls back with this; a teardown that already
-    // registered a membership uses `RemoveObject`, which drops those too.
+    // touching the records that hang off the key. This is the failed-publish
+    // rollback: the slot goes back, and the group membership, the leases and
+    // the promotion-candidate index entry that the publish had already
+    // registered are left for `RemoveObject`. A teardown that owns those
+    // records uses `RemoveObject` directly, which drops them too.
     [[nodiscard]] bool EraseObjectIf(
         const std::shared_ptr<ObjectEntry>& expected) {
         if (expected == nullptr) {
@@ -223,13 +225,6 @@ class Tenant {
     [[nodiscard]] std::vector<std::shared_ptr<ObjectEntry>> SnapshotObjects()
         const {
         return object_index_.SnapshotObjects();
-    }
-
-    // True when the tenant holds no object, no group membership and no lease
-    // in flight.
-    [[nodiscard]] bool Empty() const {
-        return object_index_.Empty() && group_index_.Empty() &&
-               lease_table_.Empty();
     }
 
     // Rehash the object route down to roughly twice its live size, for a

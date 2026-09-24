@@ -109,12 +109,6 @@ class ObjectIndex {
         return route_.size();
     }
 
-    // True when no object is currently routed.
-    [[nodiscard]] bool Empty() const {
-        std::shared_lock<std::shared_mutex> lock(route_lock_);
-        return route_.empty();
-    }
-
     // Rehash the route down to roughly twice its live size, for a caller that
     // erased most of the tenant's objects in one sweep or eviction cycle.
     void ShrinkRouteTableIfSparse() {
