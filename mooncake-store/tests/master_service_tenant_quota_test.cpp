@@ -1022,8 +1022,8 @@ TEST_F(MasterServiceTenantQuotaTest,
 
     auto superseded = MasterServiceTestPeer::FindObject(service, identity);
     ASSERT_NE(superseded, nullptr);
-    set_soft_pin(superseded, std::chrono::system_clock::now() +
-                                std::chrono::seconds(600));
+    set_soft_pin(superseded,
+                 std::chrono::system_clock::now() + std::chrono::seconds(600));
     ASSERT_EQ(committed_quota_of(superseded), object_size);
     ASSERT_EQ(peer.TryPushPromotionQueue(identity, /*record_candidate=*/true),
               MasterServiceTestPeer::PromotionQueueResult::kWatermarkRejected);
@@ -1031,9 +1031,9 @@ TEST_F(MasterServiceTenantQuotaTest,
               (std::vector<std::string>{key}));
     ASSERT_EQ(peer.CountCandidatesForTesting(tenant), 1u);
     const UUID superseded_proposal = generate_uuid();
-    peer.PutDynamicReplicationLeaseForTesting(
-        tenant, superseded, superseded_proposal,
-        make_lease(superseded_proposal));
+    peer.PutDynamicReplicationLeaseForTesting(tenant, superseded,
+                                              superseded_proposal,
+                                              make_lease(superseded_proposal));
     ASSERT_TRUE(MasterServiceTestPeer::FindDynamicReplicationLease(
                     service, tenant, superseded_proposal)
                     .has_value());
@@ -1042,14 +1042,13 @@ TEST_F(MasterServiceTenantQuotaTest,
     std::vector<ReplicaID> removed_ids;
     const auto marked = peer.WithPublishedObjectForWrite(
         tenant, key,
-        [&removed_ids](metadata::Tenant&,
-                       const std::shared_ptr<ObjectEntry>&,
+        [&removed_ids](metadata::Tenant&, const std::shared_ptr<ObjectEntry>&,
                        ObjectMetadata& metadata, ObjectEntry::State&) {
-            metadata.VisitReplicas(
-                &Replica::fn_is_memory_replica, [&removed_ids](Replica& r) {
-                    removed_ids.push_back(r.id());
-                    r.mark_removed();
-                });
+            metadata.VisitReplicas(&Replica::fn_is_memory_replica,
+                                   [&removed_ids](Replica& r) {
+                                       removed_ids.push_back(r.id());
+                                       r.mark_removed();
+                                   });
             return true;
         });
     ASSERT_TRUE(marked.has_value());
@@ -1068,15 +1067,15 @@ TEST_F(MasterServiceTenantQuotaTest,
     ASSERT_NE(replacement, superseded);
 
     // The replacement owns all four again, with its own lease proposal.
-    set_soft_pin(replacement, std::chrono::system_clock::now() +
-                                  std::chrono::seconds(1200));
+    set_soft_pin(replacement,
+                 std::chrono::system_clock::now() + std::chrono::seconds(1200));
     ASSERT_EQ(peer.TryPushPromotionQueue(identity, /*record_candidate=*/true),
               MasterServiceTestPeer::PromotionQueueResult::kWatermarkRejected);
     const UUID replacement_proposal = generate_uuid();
     ASSERT_NE(replacement_proposal, superseded_proposal);
-    peer.PutDynamicReplicationLeaseForTesting(
-        tenant, replacement, replacement_proposal,
-        make_lease(replacement_proposal));
+    peer.PutDynamicReplicationLeaseForTesting(tenant, replacement,
+                                              replacement_proposal,
+                                              make_lease(replacement_proposal));
 
     // The healthy replacement announces the cpu medium, and the invalidation
     // below is what takes it out of the announced set.
@@ -1105,8 +1104,8 @@ TEST_F(MasterServiceTenantQuotaTest,
             MasterServiceTestPeer::SegmentManager(service).getSegmentAccess();
         size_t metrics_dec_capacity = 0;
         ASSERT_EQ(ErrorCode::OK,
-                  segment_access.PrepareUnmountSegment(
-                      replacement_segment_id, metrics_dec_capacity));
+                  segment_access.PrepareUnmountSegment(replacement_segment_id,
+                                                       metrics_dec_capacity));
     }
 
     // Precondition of the discrimination: the replacement's replica is still
