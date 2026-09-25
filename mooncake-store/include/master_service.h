@@ -1063,6 +1063,14 @@ class MasterService {
     // leave a client acting on a key that is gone.
     void EraseReplicaActionLeasesForObject(const TenantId& tenant_id,
                                            std::string_view key);
+    // Drops one tenant's records, so the registry and these records retire
+    // together when a tenant goes away.
+    void ClearReplicaActionStateForTenant(const TenantId& tenant_id);
+    // Drops every tenant's records, for a reload that replaces all state: the
+    // leases and the candidate index are keyed by keys whose entries are gone,
+    // so keeping them would leave clients acting on objects that no longer
+    // exist and a candidate index that no publication owns.
+    void ClearReplicaActionStateForReload();
     [[nodiscard]] std::optional<ReplicaActionLease> FindDynamicReplicationLease(
         const TenantId& tenant_id, const UUID& proposal_id);
     // `entry` names the object the proposal belongs to, so a proposal cannot be
@@ -1338,7 +1346,10 @@ class MasterService {
     void LoadTenantQuotaPoliciesFromStoreOrThrow();
     void ApplyTenantQuotaPolicies(const TenantQuotaPolicySnapshot& snapshot);
     TenantQuotaPolicySnapshot BuildTenantQuotaPolicySnapshot() const;
+    // Every durable finalizer names the publication it was armed for and
+    // returns without a side effect once the route publishes another entry.
     void FinalizeRemovedReplicasAfterDurable(
+        const std::shared_ptr<ObjectEntry>& entry,
         const OpLogEntry& durable_entry,
         const std::vector<ReplicaID>& replica_ids, QuotaEraseMode quota_mode,
         const std::vector<std::string>& previous_media_hint = {});
@@ -1349,8 +1360,8 @@ class MasterService {
         std::shared_ptr<ObjectEntry> entry, const OpLogEntry& durable_entry,
         const std::chrono::system_clock::time_point& ttl);
     void FinalizeExpiredReplicationTaskAfterDurable(
-        const OpLogEntry& durable_entry, ReplicaID source_id,
-        const std::vector<ReplicaID>& target_ids,
+        std::shared_ptr<ObjectEntry> entry, const OpLogEntry& durable_entry,
+        ReplicaID source_id, const std::vector<ReplicaID>& target_ids,
         const UUID& dynamic_replication_lease_id,
         uint64_t dynamic_replication_version_epoch,
         const std::chrono::system_clock::time_point& ttl);
@@ -1368,8 +1379,8 @@ class MasterService {
         const std::function<bool(const Replica&)>& is_stale) const;
     tl::expected<void, ErrorCode> PersistStaleHandleCleanupForHA(
         const std::string& why, const TenantId& tenant_id,
-        const std::string& key, ObjectMetadata& metadata,
-        const StaleHandleCleanupPlan& plan);
+        const std::shared_ptr<ObjectEntry>& entry, const std::string& key,
+        ObjectMetadata& metadata, const StaleHandleCleanupPlan& plan);
     void RebuildGroupState();
     static void ApplySoftPinMetricDelta(int metric_delta);
     void ApplySoftPinEvaluation(

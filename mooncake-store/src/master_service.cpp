@@ -1557,6 +1557,17 @@ void MasterService::EraseReplicaActionLeasesForObject(const TenantId& tenant_id,
     it->second.leases.EraseForObject(key);
 }
 
+void MasterService::ClearReplicaActionStateForTenant(
+    const TenantId& tenant_id) {
+    std::lock_guard<std::mutex> lock(replica_action_mutex_);
+    replica_action_state_.erase(tenant_id);
+}
+
+void MasterService::ClearReplicaActionStateForReload() {
+    std::lock_guard<std::mutex> lock(replica_action_mutex_);
+    replica_action_state_.clear();
+}
+
 std::optional<ReplicaActionLease> MasterService::FindDynamicReplicationLease(
     const TenantId& tenant_id, const UUID& proposal_id) {
     std::lock_guard<std::mutex> lock(replica_action_mutex_);
@@ -1846,8 +1857,8 @@ MasterService::GroupEvictionResult MasterService::EvictGroupOrObject(
     for (const auto& member_entry : members_to_erase) {
         member_entry->WithExclusiveAccess(
             [&](ObjectMetadata& member_metadata, ObjectEntry::State& state) {
-                EraseMetadata(tenant, member_entry, member_metadata, state,
-                              tenant_id);
+                (void)EraseMetadata(tenant, member_entry, member_metadata,
+                                    state, tenant_id);
             });
     }
     return result;
@@ -2003,21 +2014,34 @@ tl::expected<void, ErrorCode> MasterService::SettlePrimaryWriteQuotaIfReady(
 }
 
 void MasterService::FinalizeRemovedReplicasAfterDurable(
-    const OpLogEntry& durable_entry, const std::vector<ReplicaID>& replica_ids,
-    QuotaEraseMode quota_mode,
+    const std::shared_ptr<ObjectEntry>& entry, const OpLogEntry& durable_entry,
+    const std::vector<ReplicaID>& replica_ids, QuotaEraseMode quota_mode,
     const std::vector<std::string>& previous_media_hint) {
-    if (replica_ids.empty()) {
+    if (entry == nullptr || replica_ids.empty()) {
         return;
     }
 
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const TenantId tenant_id(durable_entry.tenant_id);
-    // The whole read-modify-write runs under the entry's own lock, on the
-    // entry the route publishes now, so no point operation sees it mid-pop.
-    (void)WithObjectMetadataForWrite(
-        MakeObjectIdentityForRequest(durable_entry.object_key, tenant_id),
-        [&](metadata::Tenant& tenant, const std::shared_ptr<ObjectEntry>& entry,
-            ObjectMetadata& metadata, ObjectEntry::State& state) -> void {
+    const auto tenant = tenants_.Lookup(tenant_id);
+    if (tenant == nullptr) {
+        return;
+    }
+    // The plain published-object access, not the read-write one: the
+    // invalid-replica cleanup that accessor runs first would mutate whatever
+    // the route publishes now, including a replacement this cleanup does not
+    // own.
+    (void)tenant->WithPublishedObject(
+        durable_entry.object_key,
+        [&](ObjectMetadata& metadata, ObjectEntry::State& state) {
+            // Identity gate: act only while the route still publishes the
+            // entry this cleanup was armed for. A same-key recreate that landed
+            // while it was in flight keeps its own replicas, quota, KV state
+            // and task records untouched.
+            const auto published = tenant->Get(durable_entry.object_key);
+            if (published != entry) {
+                return;
+            }
             std::unordered_set<ReplicaID> ids(replica_ids.begin(),
                                               replica_ids.end());
             // Finalized replicas are already marked REMOVED, so their media is
@@ -2069,7 +2093,7 @@ void MasterService::FinalizeRemovedReplicasAfterDurable(
                         metadata.size * erased_memory_replicas;
                     auto release_result =
                         metadata.quota_ledger.ReleaseCommitted(
-                            GetBoundTenantQuotaHandle(tenant), release_bytes);
+                            GetBoundTenantQuotaHandle(*tenant), release_bytes);
                     LogTenantQuotaLedgerError(release_result,
                                               "release_committed", tenant_id,
                                               durable_entry.object_key);
@@ -2077,16 +2101,16 @@ void MasterService::FinalizeRemovedReplicasAfterDurable(
             }
             ReleaseLocalDiskUsage(erased_replicas);
             FreeDfsReplicas(metadata.user_key, erased_replicas);
-            CancelPromotionTaskForRemovedReplicas(tenant, metadata, state,
+            CancelPromotionTaskForRemovedReplicas(*tenant, metadata, state,
                                                   erased_replica_ids);
             if (!metadata.IsValid()) {
-                EraseMetadata(tenant, entry, metadata, state, tenant_id,
-                              quota_mode, previous_media);
+                (void)EraseMetadata(*tenant, published, metadata, state,
+                                    tenant_id, quota_mode, previous_media);
             } else {
                 SyncKvObjectState(durable_entry.object_key, metadata, tenant_id,
                                   previous_media);
                 auto settle_result =
-                    SettlePrimaryWriteQuotaIfReady(tenant, metadata);
+                    SettlePrimaryWriteQuotaIfReady(*tenant, metadata);
                 if (settle_result &&
                     metadata.AllReplicas(&Replica::fn_is_completed)) {
                     state.is_processing = false;
@@ -2113,7 +2137,13 @@ void MasterService::FinalizeMetadataEraseAfterDurable(
     // second time (refcounts, quota charges, KV removal events).
     entry->WithExclusiveAccess([&](ObjectMetadata& metadata,
                                    ObjectEntry::State& state) -> void {
-        EraseMetadata(*tenant, entry, metadata, state, tenant_id, quota_mode);
+        // Identity gate before any side effect: once the route publishes a
+        // replacement, this erase is not that publication's business.
+        if (state.is_torn_down || tenant->Get(entry->key()) != entry) {
+            return;
+        }
+        (void)EraseMetadata(*tenant, entry, metadata, state, tenant_id,
+                            quota_mode);
     });
 }
 
@@ -2122,15 +2152,20 @@ void MasterService::FinalizeExpiredProcessingReplicasAfterDurable(
     const std::chrono::system_clock::time_point& ttl) {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const TenantId tenant_id(durable_entry.tenant_id);
-    (void)WithObjectMetadataForWrite(
-        MakeObjectIdentityForRequest(durable_entry.object_key, tenant_id),
-        [&](metadata::Tenant& tenant,
-            const std::shared_ptr<ObjectEntry>& resolved,
-            ObjectMetadata& metadata, ObjectEntry::State& state) -> void {
+    const auto tenant = tenants_.Lookup(tenant_id);
+    if (tenant == nullptr || entry == nullptr) {
+        return;
+    }
+    // The plain published-object access, so a replacement that landed while
+    // this cleanup was in flight is not even swept for invalid replicas.
+    (void)tenant->WithPublishedObject(
+        durable_entry.object_key,
+        [&](ObjectMetadata& metadata, ObjectEntry::State& state) {
             // Identity gate: the durable cleanup was requested for the
-            // publication that is still routed, so a same-key recreate that
-            // landed while the entry was in flight keeps its replicas.
-            if (resolved != entry) {
+            // publication that is still routed, so a same-key recreate keeps
+            // its own replicas, quota and task state.
+            const auto published = tenant->Get(durable_entry.object_key);
+            if (published != entry) {
                 return;
             }
             // Snapshot before popping: the pop is what makes a medium
@@ -2145,13 +2180,14 @@ void MasterService::FinalizeExpiredProcessingReplicasAfterDurable(
                 discarded_replicas_.emplace_back(std::move(replicas), ttl);
             }
             if (!metadata.IsValid()) {
-                EraseMetadata(tenant, resolved, metadata, state, tenant_id,
-                              QuotaEraseMode::kFull, previous_media);
+                (void)EraseMetadata(*tenant, published, metadata, state,
+                                    tenant_id, QuotaEraseMode::kFull,
+                                    previous_media);
             } else {
                 SyncKvObjectState(durable_entry.object_key, metadata, tenant_id,
                                   previous_media);
                 auto settle_result =
-                    SettlePrimaryWriteQuotaIfReady(tenant, metadata);
+                    SettlePrimaryWriteQuotaIfReady(*tenant, metadata);
                 if (settle_result && state.is_processing) {
                     state.is_processing = false;
                 }
@@ -2160,17 +2196,28 @@ void MasterService::FinalizeExpiredProcessingReplicasAfterDurable(
 }
 
 void MasterService::FinalizeExpiredReplicationTaskAfterDurable(
-    const OpLogEntry& durable_entry, ReplicaID source_id,
-    const std::vector<ReplicaID>& target_ids,
+    std::shared_ptr<ObjectEntry> entry, const OpLogEntry& durable_entry,
+    ReplicaID source_id, const std::vector<ReplicaID>& target_ids,
     const UUID& dynamic_replication_lease_id,
     uint64_t dynamic_replication_version_epoch,
     const std::chrono::system_clock::time_point& ttl) {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const TenantId tenant_id(durable_entry.tenant_id);
-    (void)WithObjectMetadataForWrite(
-        MakeObjectIdentityForRequest(durable_entry.object_key, tenant_id),
-        [&](metadata::Tenant& tenant, const std::shared_ptr<ObjectEntry>& entry,
-            ObjectMetadata& metadata, ObjectEntry::State& state) -> void {
+    const auto tenant = tenants_.Lookup(tenant_id);
+    if (tenant == nullptr || entry == nullptr) {
+        return;
+    }
+    // The plain published-object access, so a replacement that landed while
+    // this cleanup was in flight is not even swept for invalid replicas.
+    (void)tenant->WithPublishedObject(
+        durable_entry.object_key,
+        [&](ObjectMetadata& metadata, ObjectEntry::State& state) {
+            // Identity gate before any side effect: the cleanup belongs to the
+            // publication that armed it.
+            const auto published = tenant->Get(durable_entry.object_key);
+            if (published != entry) {
+                return;
+            }
             // The task records the ids and the lease it was created with, so
             // the routed publication proves this cleanup belongs to it.
             if (!state.replication_task.has_value()) {
@@ -2199,7 +2246,7 @@ void MasterService::FinalizeExpiredReplicationTaskAfterDurable(
                                               target_ids.end());
             auto replicas = PopReplicasWithCacheTotalAccounting(
                 metadata, [&ids](const Replica& replica) {
-                return ids.contains(replica.id());
+                    return ids.contains(replica.id());
                 });
             std::vector<ReplicaID> erased_replica_ids;
             erased_replica_ids.reserve(replicas.size());
@@ -2215,11 +2262,12 @@ void MasterService::FinalizeExpiredReplicationTaskAfterDurable(
                 discarded_replicas_.emplace_back(std::move(replicas), ttl);
             }
             if (dynamic_task) {
-                ClearDynamicReplicationStateLocked(tenant_id, entry, state);
+                ClearDynamicReplicationStateLocked(tenant_id, published, state);
             }
             if (!metadata.IsValid()) {
-                EraseMetadata(tenant, entry, metadata, state, tenant_id,
-                              QuotaEraseMode::kFull, previous_media);
+                (void)EraseMetadata(*tenant, published, metadata, state,
+                                    tenant_id, QuotaEraseMode::kFull,
+                                    previous_media);
             } else {
                 // Publish before the task is dropped: dropping it ends this
                 // cleanup.
@@ -2227,7 +2275,7 @@ void MasterService::FinalizeExpiredReplicationTaskAfterDurable(
                                   previous_media);
                 if (state.replication_task.has_value()) {
                     ReleaseTenantQuota(
-                        GetBoundTenantQuotaHandle(tenant),
+                        GetBoundTenantQuotaHandle(*tenant),
                         state.replication_task->pending_quota_charge_bytes);
                     state.replication_task.reset();
                 }
@@ -2272,7 +2320,8 @@ MasterService::BuildStaleHandleCleanupPlan(
 }
 
 tl::expected<void, ErrorCode> MasterService::PersistStaleHandleCleanupForHA(
-    const std::string& why, const TenantId& tenant_id, const std::string& key,
+    const std::string& why, const TenantId& tenant_id,
+    const std::shared_ptr<ObjectEntry>& entry, const std::string& key,
     ObjectMetadata& metadata, const StaleHandleCleanupPlan& plan) {
     if (plan.removed_ids.empty() || !enable_oplog_) {
         return {};
@@ -2297,9 +2346,10 @@ tl::expected<void, ErrorCode> MasterService::PersistStaleHandleCleanupForHA(
     auto result = AppendReservedOpLogWithDurableFinalize(
         std::move(reservation.value()), op_type, tenant_id.value(), key,
         payload,
-        [this,
-         removed_ids = plan.removed_ids](const OpLogEntry& durable_entry) {
-            FinalizeRemovedReplicasAfterDurable(durable_entry, removed_ids,
+        [this, entry, removed_ids = plan.removed_ids](
+            const OpLogEntry& durable_entry) {
+            FinalizeRemovedReplicasAfterDurable(entry, durable_entry,
+                                                removed_ids,
                                                 QuotaEraseMode::kFull);
         });
     if (!result) {
@@ -2741,7 +2791,7 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
                             // callback.
                             auto persist_result =
                                 PersistStaleHandleCleanupForHA(
-                                    "ClearStaleHandles", tenant_id, key,
+                                    "ClearStaleHandles", tenant_id, entry, key,
                                     metadata, cleanup_plan);
                             if (!persist_result && !first_persist_error) {
                                 first_persist_error = persist_result.error();
@@ -2750,8 +2800,9 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
                         }
                         if (CleanupStaleHandles(key, tenant_id, *tenant,
                                                 metadata, state, is_stale)) {
-                            EraseMetadata(*tenant, entry, metadata, state,
-                                          tenant_id, QuotaEraseMode::kFull);
+                            (void)EraseMetadata(
+                                *tenant, entry, metadata, state, tenant_id,
+                                QuotaEraseMode::kFull);
                             swept_tenants.insert(tenant_id);
                         }
                         return;
@@ -2784,8 +2835,8 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
                         }
                         return;
                     }
-                    EraseMetadata(*tenant, entry, metadata, state, tenant_id,
-                                  QuotaEraseMode::kFull);
+                    (void)EraseMetadata(*tenant, entry, metadata, state,
+                                        tenant_id, QuotaEraseMode::kFull);
                     swept_tenants.insert(tenant_id);
                 });
         }
@@ -3943,11 +3994,11 @@ auto MasterService::BatchReplicaClear(
                                     std::move(reservation.value()),
                                     OpType::REMOVE, normalized_tenant.value(),
                                     key, {},
-                                    [this,
+                                    [this, entry,
                                      removed_ids = std::move(removed_ids)](
                                         const OpLogEntry& durable_entry) {
                                         FinalizeRemovedReplicasAfterDurable(
-                                            durable_entry, removed_ids,
+                                            entry, durable_entry, removed_ids,
                                             QuotaEraseMode::kFull);
                                     });
                             if (!persist_result) {
@@ -3965,8 +4016,8 @@ auto MasterService::BatchReplicaClear(
 
                     // Erase the entire metadata: every replica it holds is
                     // deallocated with it.
-                    EraseMetadata(tenant, entry, metadata, state,
-                                  normalized_tenant);
+                    (void)EraseMetadata(tenant, entry, metadata, state,
+                                        normalized_tenant);
                     cleared_keys.emplace_back(key);
                     VLOG(1)
                         << "BatchReplicaClear: tenant=" << normalized_tenant
@@ -4024,11 +4075,12 @@ auto MasterService::BatchReplicaClear(
                                         std::move(reservation.value()),
                                         OpType::REMOVE,
                                         normalized_tenant.value(), key, {},
-                                        [this,
+                                        [this, entry,
                                          removed_ids = std::move(removed_ids)](
                                             const OpLogEntry& durable_entry) {
                                             FinalizeRemovedReplicasAfterDurable(
-                                                durable_entry, removed_ids,
+                                                entry, durable_entry,
+                                                removed_ids,
                                                 QuotaEraseMode::kFull);
                                         });
                             } else {
@@ -4039,11 +4091,12 @@ auto MasterService::BatchReplicaClear(
                                         normalized_tenant.value(), key,
                                         SerializeMetadataForOpLogFromReplicaDescriptors(
                                             metadata, remaining),
-                                        [this,
+                                        [this, entry,
                                          removed_ids = std::move(removed_ids)](
                                             const OpLogEntry& durable_entry) {
                                             FinalizeRemovedReplicasAfterDurable(
-                                                durable_entry, removed_ids,
+                                                entry, durable_entry,
+                                                removed_ids,
                                                 QuotaEraseMode::kFull);
                                         });
                             }
@@ -4067,8 +4120,8 @@ auto MasterService::BatchReplicaClear(
                     // If no valid replicas remain, the object holds nothing
                     // readable and is erased entirely.
                     if (!metadata.IsValid()) {
-                        EraseMetadata(tenant, entry, metadata, state,
-                                      normalized_tenant);
+                        (void)EraseMetadata(tenant, entry, metadata, state,
+                                            normalized_tenant);
                     } else {
                         SyncKvObjectState(key, metadata, normalized_tenant,
                                           previous_kv_media);
@@ -4931,8 +4984,8 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                         metadata, retaining_clients);
                     if (!cleanup_plan.removed_ids.empty()) {
                         auto persist_result = PersistStaleHandleCleanupForHA(
-                            "PutStart(stale cleanup)", object_id.tenant_id, key,
-                            metadata, cleanup_plan);
+                            "PutStart(stale cleanup)", object_id.tenant_id,
+                            entry, key, metadata, cleanup_plan);
                         if (!persist_result) {
                             refused = persist_result.error();
                             return;
@@ -4944,9 +4997,9 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                         if (CleanupStaleHandles(key, object_id.tenant_id,
                                                 resolved_tenant, metadata,
                                                 state, retaining_clients)) {
-                            EraseMetadata(resolved_tenant, entry, metadata,
-                                          state, object_id.tenant_id,
-                                          QuotaEraseMode::kFull);
+                            (void)EraseMetadata(
+                                resolved_tenant, entry, metadata, state,
+                                object_id.tenant_id, QuotaEraseMode::kFull);
                             return;
                         }
                     }
@@ -4978,8 +5031,9 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                             metadata.put_start_time +
                                 put_start_release_timeout_sec_);
                     }
-                    EraseMetadata(resolved_tenant, entry, metadata, state,
-                                  object_id.tenant_id, QuotaEraseMode::kFull);
+                    (void)EraseMetadata(resolved_tenant, entry, metadata, state,
+                                        object_id.tenant_id,
+                                        QuotaEraseMode::kFull);
                 });
             if (refused.has_value()) {
                 return tl::make_unexpected(*refused);
@@ -5445,10 +5499,10 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
                     persist_result = AppendReservedOpLogWithDurableFinalize(
                         std::move(reservation.value()), OpType::REMOVE,
                         tenant_id.value(), key, {},
-                        [this, removed_ids = std::move(removed_ids)](
+                        [this, entry, removed_ids = std::move(removed_ids)](
                             const OpLogEntry& durable_entry) {
                             FinalizeRemovedReplicasAfterDurable(
-                                durable_entry, removed_ids,
+                                entry, durable_entry, removed_ids,
                                 QuotaEraseMode::kFull);
                         });
                 } else {
@@ -5457,10 +5511,10 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
                         tenant_id.value(), key,
                         SerializeMetadataForOpLogFromReplicaDescriptors(
                             metadata, remaining),
-                        [this, removed_ids = std::move(removed_ids)](
+                        [this, entry, removed_ids = std::move(removed_ids)](
                             const OpLogEntry& durable_entry) {
                             FinalizeRemovedReplicasAfterDurable(
-                                durable_entry, removed_ids,
+                                entry, durable_entry, removed_ids,
                                 QuotaEraseMode::kFull);
                         });
                 }
@@ -5489,8 +5543,8 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
                 // The revoke dropped the write's last replica, so the object
                 // goes with it: one teardown releases the refcounts, quota
                 // charges and KV removal events this publication still owns.
-                EraseMetadata(tenant, entry, metadata, state,
-                              object_id.tenant_id, QuotaEraseMode::kFull);
+                (void)EraseMetadata(tenant, entry, metadata, state,
+                                    object_id.tenant_id, QuotaEraseMode::kFull);
                 return {};
             }
 
@@ -5684,7 +5738,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
             BuildStaleHandleCleanupPlan(metadata, retaining_clients);
         if (!cleanup_plan.removed_ids.empty()) {
             auto persist_result = PersistStaleHandleCleanupForHA(
-                "UpsertStart(stale cleanup)", object_id.tenant_id, key,
+                "UpsertStart(stale cleanup)", object_id.tenant_id, entry, key,
                 metadata, cleanup_plan);
             if (!persist_result) {
                 settled.emplace(tl::make_unexpected(persist_result.error()));
@@ -5700,8 +5754,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 // EraseMetadata handles is_processing, replication_task,
                 // offloading_task (with dec_refcnt), and promotion task
                 // cleanup.
-                EraseMetadata(tenant, entry, metadata, state,
-                              object_id.tenant_id, QuotaEraseMode::kFull);
+                (void)EraseMetadata(tenant, entry, metadata, state,
+                                    object_id.tenant_id, QuotaEraseMode::kFull);
                 return;
             }
         }
@@ -5785,8 +5839,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     *case_a_committed_soft_pin_timeout <= now) {
                     case_a_committed_soft_pin_timeout.reset();
                 }
-                EraseMetadata(tenant, entry, metadata, state,
-                              object_id.tenant_id, QuotaEraseMode::kFull);
+                (void)EraseMetadata(tenant, entry, metadata, state,
+                                    object_id.tenant_id, QuotaEraseMode::kFull);
                 return;
             }
             auto settle_result =
@@ -5968,8 +6022,9 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
         // once the entry's lock is gone, so a reader in between finds the key
         // absent. Only this call's own per-key operation lock keeps another
         // PutStart or UpsertStart out of that window.
-        EraseMetadata(tenant, entry, metadata, state, object_id.tenant_id,
-                      QuotaEraseMode::kPreserveOld, previous_kv_media);
+        (void)EraseMetadata(tenant, entry, metadata, state,
+                            object_id.tenant_id,
+                            QuotaEraseMode::kPreserveOld, previous_kv_media);
         reallocating = true;
     };
 
@@ -6073,10 +6128,11 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                                 if (resolved != new_entry) {
                                     return;
                                 }
-                                EraseMetadata(resolved_tenant, resolved,
-                                              resolved_metadata, resolved_state,
-                                              object_id.tenant_id,
-                                              QuotaEraseMode::kFull);
+                                (void)EraseMetadata(
+                                    resolved_tenant, resolved,
+                                    resolved_metadata, resolved_state,
+                                    object_id.tenant_id,
+                                    QuotaEraseMode::kFull);
                             });
                         if (replacement_charge.ReplacedBytes() != 0) {
                             auto rollback_result =
@@ -6242,10 +6298,10 @@ auto MasterService::EvictDiskReplica(const UUID& client_id,
                         persist_result = AppendReservedOpLogWithDurableFinalize(
                             std::move(reservation.value()), OpType::REMOVE,
                             metadata.tenant_id.value(), key, {},
-                            [this, removed_ids = std::move(removed_ids)](
+                            [this, entry, removed_ids = std::move(removed_ids)](
                                 const OpLogEntry& durable_entry) {
                                 FinalizeRemovedReplicasAfterDurable(
-                                    durable_entry, removed_ids,
+                                    entry, durable_entry, removed_ids,
                                     QuotaEraseMode::kFull);
                             });
                     } else {
@@ -6254,10 +6310,10 @@ auto MasterService::EvictDiskReplica(const UUID& client_id,
                             metadata.tenant_id.value(), key,
                             SerializeMetadataForOpLogFromReplicaDescriptors(
                                 metadata, remaining),
-                            [this, removed_ids = std::move(removed_ids)](
+                            [this, entry, removed_ids = std::move(removed_ids)](
                                 const OpLogEntry& durable_entry) {
                                 FinalizeRemovedReplicasAfterDurable(
-                                    durable_entry, removed_ids,
+                                    entry, durable_entry, removed_ids,
                                     QuotaEraseMode::kFull);
                             });
                     }
@@ -6289,8 +6345,8 @@ auto MasterService::EvictDiskReplica(const UUID& client_id,
             SyncKvObjectState(key, metadata, object_id.tenant_id,
                               previous_kv_media);
             if (!metadata.IsValid()) {
-                EraseMetadata(tenant, entry, metadata, state,
-                              object_id.tenant_id);
+                (void)EraseMetadata(tenant, entry, metadata, state,
+                                    object_id.tenant_id);
             }
             return {};
         });
@@ -6644,8 +6700,8 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(
                                                    state);
                 if (!metadata.IsValid()) {
                     // Remove the object if it does not have any replicas.
-                    EraseMetadata(tenant, entry, metadata, state,
-                                  object_id.tenant_id);
+                    (void)EraseMetadata(tenant, entry, metadata, state,
+                                        object_id.tenant_id);
                 }
                 return tl::make_unexpected(ErrorCode::REPLICA_IS_GONE);
             }
@@ -6851,8 +6907,8 @@ tl::expected<void, ErrorCode> MasterService::CopyRevoke(
 
             if (!metadata.IsValid()) {
                 // Remove the object if it does not have any replicas.
-                EraseMetadata(tenant, entry, metadata, state,
-                              object_id.tenant_id);
+                (void)EraseMetadata(tenant, entry, metadata, state,
+                                    object_id.tenant_id);
             }
 
             return {};
@@ -7098,8 +7154,8 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
                 state.replication_task.reset();
                 if (!metadata.IsValid()) {
                     // Remove the object if it does not have any replicas.
-                    EraseMetadata(tenant, entry, metadata, state,
-                                  object_id.tenant_id);
+                    (void)EraseMetadata(tenant, entry, metadata, state,
+                                        object_id.tenant_id);
                 }
                 return tl::make_unexpected(ErrorCode::REPLICA_IS_GONE);
             }
@@ -7166,10 +7222,11 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
                         metadata.tenant_id.value(), key,
                         SerializeMetadataForOpLogFromReplicaDescriptors(
                             metadata, post),
-                        [this, removed_ids = std::vector<ReplicaID>{source_id}](
+                        [this, entry,
+                         removed_ids = std::vector<ReplicaID>{source_id}](
                             const OpLogEntry& durable_entry) {
                             FinalizeRemovedReplicasAfterDurable(
-                                durable_entry, removed_ids,
+                                entry, durable_entry, removed_ids,
                                 QuotaEraseMode::kFull);
                         });
                 } else {
@@ -7317,8 +7374,8 @@ tl::expected<void, ErrorCode> MasterService::MoveRevoke(
 
             if (!metadata.IsValid()) {
                 // Remove the object if it does not have any replicas.
-                EraseMetadata(tenant, entry, metadata, state,
-                              object_id.tenant_id);
+                (void)EraseMetadata(tenant, entry, metadata, state,
+                                    object_id.tenant_id);
             }
 
             return {};
@@ -7388,10 +7445,11 @@ auto MasterService::Remove(const std::string& key, const TenantId& tenant_id,
                         AppendReservedOpLogWithDurableFinalize(
                             std::move(reservation.value()), OpType::REMOVE,
                             object_id.tenant_id.value(), key, {},
-                            [this, removed_ids = std::move(removed_ids)](
+                            [this, entry, removed_ids = std::move(removed_ids)](
                                 const OpLogEntry& durable_entry) {
-                        FinalizeRemovedReplicasAfterDurable(
-                            durable_entry, removed_ids, QuotaEraseMode::kFull);
+                                FinalizeRemovedReplicasAfterDurable(
+                                    entry, durable_entry, removed_ids,
+                                    QuotaEraseMode::kFull);
                             });
                     if (!persist_result) {
                         return tl::make_unexpected(persist_result.error());
@@ -7399,7 +7457,8 @@ auto MasterService::Remove(const std::string& key, const TenantId& tenant_id,
                     return {};
                 }
             }
-            EraseMetadata(tenant, entry, metadata, state, object_id.tenant_id);
+            (void)EraseMetadata(tenant, entry, metadata, state,
+                                object_id.tenant_id);
             return {};
         });
     if (!outcome.has_value()) {
@@ -7488,11 +7547,11 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern,
                                     std::move(reservation.value()),
                                     OpType::REMOVE, normalized_tenant.value(),
                                     key, {},
-                                    [this,
+                                    [this, entry,
                                      removed_ids = std::move(removed_ids)](
                                         const OpLogEntry& durable_entry) {
                                         FinalizeRemovedReplicasAfterDurable(
-                                            durable_entry, removed_ids,
+                                            entry, durable_entry, removed_ids,
                                             QuotaEraseMode::kFull);
                                     });
                             if (!persist_result) {
@@ -7502,8 +7561,8 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern,
                             return;
                         }
                     }
-                    EraseMetadata(tenant, entry, metadata, state,
-                                  normalized_tenant);
+                    (void)EraseMetadata(tenant, entry, metadata, state,
+                                        normalized_tenant);
                     removed_count++;
                 });
         }
@@ -7594,11 +7653,12 @@ long MasterService::RemoveAll(bool force) {
                                         std::move(reservation.value()),
                                         OpType::REMOVE, tenant_id.value(), key,
                                         {},
-                                        [this,
+                                        [this, entry,
                                          removed_ids = std::move(removed_ids)](
                                             const OpLogEntry& durable_entry) {
                                             FinalizeRemovedReplicasAfterDurable(
-                                                durable_entry, removed_ids,
+                                                entry, durable_entry,
+                                                removed_ids,
                                                 QuotaEraseMode::kFull);
                                         });
                                 if (!persist_result) {
@@ -7618,8 +7678,8 @@ long MasterService::RemoveAll(bool force) {
 
                         total_freed_size += metadata.size * mem_rep_count;
                         ErasePromotionTaskLocked(*tenant, state);
-                        EraseMetadata(*tenant, entry, metadata, state,
-                                      tenant_id);
+                        (void)EraseMetadata(*tenant, entry, metadata, state,
+                                            tenant_id);
                         removed_count++;
                         erased_this_tenant = true;
                     } else {
@@ -7744,11 +7804,12 @@ long MasterService::RemoveAll(const TenantId& tenant_id, bool force) {
                                         std::move(reservation.value()),
                                         OpType::REMOVE,
                                         normalized_tenant.value(), key, {},
-                                        [this,
+                                        [this, entry,
                                          removed_ids = std::move(removed_ids)](
                                             const OpLogEntry& durable_entry) {
                                             FinalizeRemovedReplicasAfterDurable(
-                                                durable_entry, removed_ids,
+                                                entry, durable_entry,
+                                                removed_ids,
                                                 QuotaEraseMode::kFull);
                                         });
                                 if (!persist_result) {
@@ -7764,8 +7825,8 @@ long MasterService::RemoveAll(const TenantId& tenant_id, bool force) {
                         }
                         total_freed_size += metadata.size * mem_rep_count;
                         ErasePromotionTaskLocked(*tenant_handle, state);
-                        EraseMetadata(*tenant_handle, entry, metadata, state,
-                                      normalized_tenant);
+                        (void)EraseMetadata(*tenant_handle, entry, metadata,
+                                            state, normalized_tenant);
                         removed_count++;
                         erased_any_object = true;
                     } else {
@@ -7843,8 +7904,8 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
                     BuildStaleHandleCleanupPlan(metadata, retaining_clients);
                 if (!cleanup_plan.removed_ids.empty()) {
                     auto persist_result = PersistStaleHandleCleanupForHA(
-                        "BatchRemove(stale cleanup)", normalized_tenant, key,
-                        metadata, cleanup_plan);
+                        "BatchRemove(stale cleanup)", normalized_tenant, entry,
+                        key, metadata, cleanup_plan);
                     if (!persist_result) {
                         return tl::make_unexpected(persist_result.error());
                     }
@@ -7857,8 +7918,9 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
                     if (CleanupStaleHandles(key, normalized_tenant, tenant,
                                             metadata, state,
                                             retaining_clients)) {
-                        EraseMetadata(tenant, entry, metadata, state,
-                                      normalized_tenant, QuotaEraseMode::kFull);
+                        (void)EraseMetadata(tenant, entry, metadata, state,
+                                            normalized_tenant,
+                                            QuotaEraseMode::kFull);
                         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
                     }
                 }
@@ -7901,10 +7963,11 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
                             AppendReservedOpLogWithDurableFinalize(
                                 std::move(reservation.value()), OpType::REMOVE,
                                 normalized_tenant.value(), key, {},
-                                [this, removed_ids = std::move(removed_ids)](
+                                [this, entry,
+                                 removed_ids = std::move(removed_ids)](
                                     const OpLogEntry& durable_entry) {
                                     FinalizeRemovedReplicasAfterDurable(
-                                        durable_entry, removed_ids,
+                                        entry, durable_entry, removed_ids,
                                         QuotaEraseMode::kFull);
                                 });
                         if (!persist_result) {
@@ -7913,8 +7976,8 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
                         return {};
                     }
                 }
-                EraseMetadata(tenant, entry, metadata, state, normalized_tenant,
-                              QuotaEraseMode::kFull);
+                (void)EraseMetadata(tenant, entry, metadata, state,
+                                    normalized_tenant, QuotaEraseMode::kFull);
                 return {};
             });
         if (!outcome.has_value()) {
@@ -8108,9 +8171,9 @@ void MasterService::RunDfsEviction() {
                                                            erased, "disk",
                                                            metadata, tenant_id);
                                 if (!metadata.IsValid()) {
-                                    EraseMetadata(tenant, entry, metadata,
-                                                  state, tenant_id,
-                                                  QuotaEraseMode::kFull);
+                                    (void)EraseMetadata(tenant, entry, metadata,
+                                                        state, tenant_id,
+                                                        QuotaEraseMode::kFull);
                                 }
                             }
                         });
@@ -10428,7 +10491,8 @@ void MasterService::DiscardExpiredProcessingReplicas(
                 metadata.AllReplicas(&Replica::fn_is_completed)) {
                 metadata.ClearPendingSoftPinIfNoViableReplica();
                 if (!metadata.IsValid()) {
-                    EraseMetadata(tenant, entry, metadata, state, tenant_id);
+                    (void)EraseMetadata(tenant, entry, metadata, state,
+                                        tenant_id);
                 } else {
                     auto settle_result =
                         SettlePrimaryWriteQuotaIfReady(tenant, metadata);
@@ -10498,7 +10562,8 @@ void MasterService::DiscardExpiredProcessingReplicas(
                     discarded_replicas.emplace_back(std::move(replicas), ttl);
                 }
                 if (!metadata.IsValid()) {
-                    EraseMetadata(tenant, entry, metadata, state, tenant_id);
+                    (void)EraseMetadata(tenant, entry, metadata, state,
+                                        tenant_id);
                 } else {
                     auto settle_result =
                         SettlePrimaryWriteQuotaIfReady(tenant, metadata);
@@ -10558,13 +10623,13 @@ void MasterService::DiscardExpiredProcessingReplicas(
                         persist_result = AppendOpLogWithDurableFinalize(
                             OpType::REMOVE, tenant_id.value(), key, {},
                             enable_oplog_
-                                ? [this, source_id,
+                                ? [this, entry, source_id,
                                    target_ids = std::move(target_ids),
                                    dynamic_lease_id, dynamic_version_epoch,
                                    ttl](const OpLogEntry& durable_entry) {
                                       FinalizeExpiredReplicationTaskAfterDurable(
-                                          durable_entry, source_id, target_ids,
-                                          dynamic_lease_id,
+                                          entry, durable_entry, source_id,
+                                          target_ids, dynamic_lease_id,
                                           dynamic_version_epoch, ttl);
                                   }
                                 : DurableFinalizeCallback{});
@@ -10574,13 +10639,13 @@ void MasterService::DiscardExpiredProcessingReplicas(
                             SerializeMetadataForOpLogFromReplicaDescriptors(
                                 metadata, post_descriptors),
                             enable_oplog_
-                                ? [this, source_id,
+                                ? [this, entry, source_id,
                                    target_ids = std::move(target_ids),
                                    dynamic_lease_id, dynamic_version_epoch,
                                    ttl](const OpLogEntry& durable_entry) {
                                       FinalizeExpiredReplicationTaskAfterDurable(
-                                          durable_entry, source_id, target_ids,
-                                          dynamic_lease_id,
+                                          entry, durable_entry, source_id,
+                                          target_ids, dynamic_lease_id,
                                           dynamic_version_epoch, ttl);
                                   }
                                 : DurableFinalizeCallback{});
@@ -10624,7 +10689,8 @@ void MasterService::DiscardExpiredProcessingReplicas(
                     ClearDynamicReplicationStateLocked(tenant_id, entry, state);
                 }
                 if (!metadata.IsValid()) {
-                    EraseMetadata(tenant, entry, metadata, state, tenant_id);
+                    (void)EraseMetadata(tenant, entry, metadata, state,
+                                        tenant_id);
                 } else {
                     ReleaseTenantQuota(GetBoundTenantQuotaHandle(tenant),
                                        task.pending_quota_charge_bytes);
@@ -10986,8 +11052,8 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
                         entry->WithExclusiveAccess(
                             [&](ObjectMetadata& metadata,
                                 ObjectEntry::State& state) {
-                        EraseMetadata(*tenant, entry, metadata, state,
-                                      tenant_id);
+                        (void)EraseMetadata(*tenant, entry, metadata, state,
+                                            tenant_id);
                             });
                     }
                 });
@@ -11233,8 +11299,8 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
                     // route still publishes exactly this entry.
                     const auto entry = tenant.Get(key);
                     assert(entry != nullptr);
-                    EraseMetadata(tenant, entry, metadata, state,
-                                  normalized_tenant);
+                    (void)EraseMetadata(tenant, entry, metadata, state,
+                                        normalized_tenant);
                 }
             });
         if (!ran) {
@@ -11290,8 +11356,8 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
                 if (!metadata.IsValid()) {
                     const auto entry = tenant.Get(key);
                     assert(entry != nullptr);
-                    EraseMetadata(tenant, entry, metadata, state,
-                                  normalized_tenant);
+                    (void)EraseMetadata(tenant, entry, metadata, state,
+                                        normalized_tenant);
                 }
             });
         return result;
@@ -11514,6 +11580,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
     // succeeds so a consumed reservation cannot strand REMOVED replicas.
     auto persist_evict_oplog_or_skip =
         [&, this](const TenantId& tenant_id, const std::string& key,
+                  const std::shared_ptr<ObjectEntry>& entry,
                   ObjectMetadata& metadata) -> tl::expected<void, ErrorCode> {
         if (!enable_oplog_) {
             return {};
@@ -11544,9 +11611,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
             persist_result = AppendReservedOpLogWithDurableFinalize(
                 std::move(reservation.value()), OpType::REMOVE,
                 tenant_id.value(), key, {},
-                [this, removed_ids](const OpLogEntry& durable_entry) {
+                [this, entry, removed_ids](const OpLogEntry& durable_entry) {
                     FinalizeRemovedReplicasAfterDurable(
-                        durable_entry, removed_ids, QuotaEraseMode::kFull);
+                        entry, durable_entry, removed_ids,
+                        QuotaEraseMode::kFull);
                 });
         } else {
             persist_result = AppendReservedOpLogWithDurableFinalize(
@@ -11554,9 +11622,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 tenant_id.value(), key,
                 SerializeMetadataForOpLogFromReplicaDescriptors(metadata,
                                                                 remaining),
-                [this, removed_ids](const OpLogEntry& durable_entry) {
+                [this, entry, removed_ids](const OpLogEntry& durable_entry) {
                     FinalizeRemovedReplicasAfterDurable(
-                        durable_entry, removed_ids, QuotaEraseMode::kFull);
+                        entry, durable_entry, removed_ids,
+                        QuotaEraseMode::kFull);
                 });
         }
         if (!persist_result) {
@@ -11606,7 +11675,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
         EvictionResult direct_result;
         const bool ran = tenant.WithPublishedObject(
             key, [&](ObjectMetadata& metadata, ObjectEntry::State& state) {
-                // Re-validate: state may have changed since the census. Soft
+                // Re-validation: state may have changed since the census. Soft
                 // pins are only a blocker when this pass is not allowed to
                 // evict them.
                 if (now < metadata.EvictionDeadline() ||
@@ -11620,8 +11689,12 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     group_id = metadata.group_id;
                     return;
                 }
-                auto submission =
-                    persist_evict_oplog_or_skip(tenant_id, key, metadata);
+                // The callback runs under this entry's own lock, so this is the
+                // publication the durable cleanup below belongs to.
+                const auto entry = tenant.Get(key);
+                assert(entry != nullptr);
+                auto submission = persist_evict_oplog_or_skip(tenant_id, key,
+                                                              entry, metadata);
                 if (!submission) {
                     direct_result.stop_scan = true;
                     return;
@@ -11639,7 +11712,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     // route still publishes exactly this entry.
                     const auto entry = tenant.Get(key);
                     assert(entry != nullptr);
-                    EraseMetadata(tenant, entry, metadata, state, tenant_id);
+                    (void)EraseMetadata(tenant, entry, metadata, state,
+                                        tenant_id);
                 }
             });
         if (!ran) {
@@ -11664,8 +11738,12 @@ void MasterService::BatchEvict(double evict_ratio_target,
                       ObjectMetadata& member_metadata,
                       ObjectEntry::State& state,
                       metadata::Tenant& member_tenant) -> EvictMemberOutcome {
-            auto submission = persist_evict_oplog_or_skip(tenant_id, member_key,
-                                                          member_metadata);
+            // The callback runs under this member's own lock, so this is the
+            // publication the durable cleanup below belongs to.
+            const auto member_entry = member_tenant.Get(member_key);
+            assert(member_entry != nullptr);
+            auto submission = persist_evict_oplog_or_skip(
+                tenant_id, member_key, member_entry, member_metadata);
             if (!submission) {
                 return {.stop_scan = true};
             }
@@ -11700,8 +11778,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     if (!metadata.IsValid()) {
                         const auto entry = tenant.Get(key);
                         assert(entry != nullptr);
-                        EraseMetadata(tenant, entry, metadata, state,
-                                      tenant_id);
+                        (void)EraseMetadata(tenant, entry, metadata, state,
+                                            tenant_id);
                     }
                 });
         }
@@ -11867,7 +11945,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
     const long primary_no_pin_num =
         std::min(ideal_evict_num, static_cast<long>(no_pin_count));
 
-    // Re-scan the tenants and copy full identities only for objects inside the
+    // Re-scan metadata and copy full identities only for objects inside the
     // requested timestamp range. The eligibility conditions are identical to
     // the census above, so the selected set matches what the census counted.
     auto collect_candidates = [&](bool use_cutoff,
@@ -12303,6 +12381,10 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
                                                                metadata,
                                                            ObjectEntry::State&
                                                                state) {
+                    // Runs under this entry's own lock, so this is the
+                    // publication the durable cleanup below belongs to.
+                    const auto entry = tenant->Get(key);
+                    assert(entry != nullptr);
                     if (metadata.IsHardPinned() ||
                         !metadata.IsLeaseExpired(now) ||
                         IsSoftPinActive(metadata, now)) {
@@ -12347,11 +12429,12 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
                                         std::move(reservation.value()),
                                         OpType::REMOVE, tenant_id.value(), key,
                                         {},
-                                        [this,
+                                        [this, entry,
                                          removed_ids = std::move(removed_ids)](
                                             const OpLogEntry& durable_entry) {
                                             FinalizeRemovedReplicasAfterDurable(
-                                                durable_entry, removed_ids,
+                                                entry, durable_entry,
+                                                removed_ids,
                                                 QuotaEraseMode::kFull);
                                         });
                             } else {
@@ -12361,11 +12444,12 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
                                         OpType::PUT_END, tenant_id.value(), key,
                                         SerializeMetadataForOpLogFromReplicaDescriptors(
                                             metadata, remaining),
-                                        [this,
+                                        [this, entry,
                                          removed_ids = std::move(removed_ids)](
                                             const OpLogEntry& durable_entry) {
                                             FinalizeRemovedReplicasAfterDurable(
-                                                durable_entry, removed_ids,
+                                                entry, durable_entry,
+                                                removed_ids,
                                                 QuotaEraseMode::kFull);
                                         });
                             }
@@ -12421,8 +12505,8 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
                         // the route still publishes exactly this entry.
                         const auto entry = tenant->Get(key);
                         assert(entry != nullptr);
-                        EraseMetadata(*tenant, entry, metadata, state,
-                                      tenant_id);
+                        (void)EraseMetadata(*tenant, entry, metadata, state,
+                                            tenant_id);
                     }
                 });
             }
@@ -13017,8 +13101,15 @@ void MasterService::MetadataSerializer::Reset() {
         });
         for (const auto& tenant_id : tenant_ids) {
             service_->tenants_.Remove(tenant_id);
+            // The tenant and its records retire together: a lease or a
+            // candidate index entry left behind would name a key no
+            // publication owns.
+            service_->ClearReplicaActionStateForTenant(tenant_id);
         }
     }
+    // Records of tenants that are no longer registered would not be reached by
+    // the loop above, so the table is emptied outright.
+    service_->ClearReplicaActionStateForReload();
     // Group membership and the shared leases live inside each tenant, so
     // dropping the tenants above cleared them with it.
     {

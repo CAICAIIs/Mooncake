@@ -447,16 +447,27 @@ class MasterServiceTestPeer {
     }
 
     void FinalizeRemovedReplicasAfterDurable(
+        const std::shared_ptr<ObjectEntry>& entry,
         const OpLogEntry& durable_entry,
         const std::vector<ReplicaID>& replica_ids, QuotaEraseMode quota_mode,
         const std::vector<std::string>& previous_media_hint = {}) {
         service_.FinalizeRemovedReplicasAfterDurable(
-            durable_entry, replica_ids, quota_mode, previous_media_hint);
+            entry, durable_entry, replica_ids, quota_mode, previous_media_hint);
     }
 
     std::shared_ptr<ClientLivenessRecord> FindClientRecord(
         const UUID& client_id) const {
         return service_.FindClientRecord(client_id);
+    }
+
+    // Test access to the service-owned lease table: the dynamic-replication
+    // proposal path files a lease under the publication that owns the
+    // proposal, and a test stages that record directly.
+    void PutDynamicReplicationLeaseForTesting(
+        const TenantId& tenant_id, const std::shared_ptr<ObjectEntry>& entry,
+        const UUID& proposal_id, ReplicaActionLease lease) {
+        service_.PutDynamicReplicationLease(tenant_id, entry, proposal_id,
+                                            std::move(lease));
     }
 
     TenantQuotaHandle GetBoundTenantQuotaHandle(
