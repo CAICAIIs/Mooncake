@@ -3,10 +3,12 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <cstdlib>
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace mooncake {
@@ -128,6 +130,37 @@ TEST(MemcpyWorkerPoolTest, ReportsTheFailureOfAnyChunk) {
     // A repeated report does not change the published result.
     state->complete_chunk(ErrorCode::OK);
     EXPECT_EQ(state->get_result(), ErrorCode::TRANSFER_FAIL);
+}
+
+TEST(MemcpyWorkerPoolTest, AConcurrentFailureIsNeverReportedAsSuccess) {
+    // The copy that fails and the copy that finishes last race for the
+    // publication of the result. The failing report must win regardless of
+    // which one arrives last.
+    constexpr int kRounds = 20000;
+    int reported_success = 0;
+
+    for (int round = 0; round < kRounds; ++round) {
+        auto state = std::make_shared<MemcpyOperationState>(2);
+        std::atomic<int> ready{0};
+        auto report = [&state, &ready](ErrorCode code) {
+            ready.fetch_add(1, std::memory_order_acq_rel);
+            while (ready.load(std::memory_order_acquire) < 2) {
+                std::this_thread::yield();
+            }
+            state->complete_chunk(code);
+        };
+
+        std::thread failing(report, ErrorCode::TRANSFER_FAIL);
+        std::thread succeeding(report, ErrorCode::OK);
+        failing.join();
+        succeeding.join();
+
+        if (state->get_result() == ErrorCode::OK) {
+            ++reported_success;
+        }
+    }
+
+    EXPECT_EQ(reported_success, 0);
 }
 
 }  // namespace

@@ -155,6 +155,9 @@ class EmptyOperationState : public OperationState {
  * One state can be shared by several tasks when the submitter splits a batch
  * of copies across the pool. Every task reports exactly once through
  * complete_chunk(); the last one publishes the result the future returns.
+ * The remaining count, the recorded failure and the published result are all
+ * updated under the same mutex, so a failing report can never lose the race
+ * against the report that happens to arrive last.
  */
 class MemcpyOperationState : public OperationState {
    public:
@@ -167,35 +170,27 @@ class MemcpyOperationState : public OperationState {
     }
 
     void complete_chunk(ErrorCode error_code) {
-        size_t remaining = pending_chunks_.load(std::memory_order_acquire);
-        while (remaining > 0) {
-            if (pending_chunks_.compare_exchange_weak(
-                    remaining, remaining - 1, std::memory_order_acq_rel,
-                    std::memory_order_acquire)) {
-                break;
-            }
-        }
-        if (remaining == 0) {
-            // The result is already published; ignore the extra report.
-            return;
-        }
-
-        if (remaining > 1) {
-            if (error_code != ErrorCode::OK) {
-                std::lock_guard<std::mutex> lock(mutex_);
-                if (!failure_.has_value()) failure_ = error_code;
-            }
-            return;
-        }
-
-        ErrorCode final_code = error_code;
+        bool publish = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (failure_.has_value()) final_code = *failure_;
-            assert(!result_.has_value());
-            result_.emplace(final_code);
+            if (result_.has_value()) {
+                // The result is already published; ignore the extra report.
+                return;
+            }
+            if (error_code != ErrorCode::OK && !failure_.has_value()) {
+                failure_ = error_code;
+            }
+            if (pending_chunks_ > 0) {
+                --pending_chunks_;
+            }
+            if (pending_chunks_ == 0) {
+                result_.emplace(failure_.value_or(ErrorCode::OK));
+                publish = true;
+            }
         }
-        cv_.notify_all();
+        if (publish) {
+            cv_.notify_all();
+        }
     }
 
     // Shorthand for a task that owns its state exclusively.
@@ -211,7 +206,7 @@ class MemcpyOperationState : public OperationState {
     }
 
    private:
-    std::atomic<size_t> pending_chunks_;
+    size_t pending_chunks_;             // Guarded by mutex_.
     std::optional<ErrorCode> failure_;  // Guarded by mutex_.
 };
 

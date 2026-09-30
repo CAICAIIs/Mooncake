@@ -38,12 +38,12 @@ class MemcpyWorkerPoolConfigTest : public ::testing::Test {
 
 TEST_F(MemcpyWorkerPoolConfigTest, DefaultsSilentlyForUnsetAndEmpty) {
     testing::internal::CaptureStderr();
-    EXPECT_EQ(MemcpyWorkerPoolConfig::FromEnvironment().worker_count, 8);
+    EXPECT_EQ(MemcpyWorkerPoolConfig::FromEnvironment().worker_count, 1);
     EXPECT_TRUE(testing::internal::GetCapturedStderr().empty());
 
     ASSERT_EQ(setenv("MC_STORE_MEMCPY_WORKERS", "", 1), 0);
     testing::internal::CaptureStderr();
-    EXPECT_EQ(MemcpyWorkerPoolConfig::FromEnvironment().worker_count, 8);
+    EXPECT_EQ(MemcpyWorkerPoolConfig::FromEnvironment().worker_count, 1);
     EXPECT_TRUE(testing::internal::GetCapturedStderr().empty());
 }
 
@@ -65,11 +65,11 @@ TEST_F(MemcpyWorkerPoolConfigTest, InvalidValuesWarnOnceAndFallBack) {
         SCOPED_TRACE(value);
         ASSERT_EQ(setenv("MC_STORE_MEMCPY_WORKERS", value, 1), 0);
         testing::internal::CaptureStderr();
-        EXPECT_EQ(MemcpyWorkerPoolConfig::FromEnvironment().worker_count, 8);
+        EXPECT_EQ(MemcpyWorkerPoolConfig::FromEnvironment().worker_count, 1);
         const auto log = testing::internal::GetCapturedStderr();
         EXPECT_NE(log.find(std::string("Invalid value for "
                                        "MC_STORE_MEMCPY_WORKERS: ") +
-                           value + ", using default 8"),
+                           value + ", using default 1"),
                   std::string::npos);
     }
 }

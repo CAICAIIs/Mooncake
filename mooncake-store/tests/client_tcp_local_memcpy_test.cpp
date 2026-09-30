@@ -8,6 +8,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "allocator.h"
@@ -427,6 +428,79 @@ TEST_F(TcpLocalMemcpyAutoEnableTest,
     ASSERT_TRUE(get.has_value()) << "Get failed: " << toString(get.error());
     ASSERT_EQ(std::memcmp(out.data(), prepared.payload.data(), out.size()), 0);
     EXPECT_EQ(sink.strategy(), "TRANSFER_ENGINE");
+}
+
+TEST_F(TcpLocalMemcpyAutoEnableTest,
+       BatchedLocalTransfersSurviveASizedWorkerPool) {
+    // Runs the real batch entry points with a pool wider than one worker, so
+    // the split of a write batch and the per-key read tasks both go through
+    // the paths the change touches.
+    EnvGuard workers_guard("MC_STORE_MEMCPY_WORKERS");
+    ASSERT_EQ(setenv("MC_STORE_MEMCPY_WORKERS", "4", 1), 0);
+
+    runtime_ = CreateRuntime("localhost", "P2PHANDSHAKE");
+    ASSERT_TRUE(runtime_.client != nullptr);
+
+    constexpr size_t kObjects = 24;
+    constexpr size_t kPayload = 128 * 1024;
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = runtime_.host_name;
+
+    std::vector<std::string> keys;
+    std::vector<std::string> payloads;
+    std::vector<std::vector<Slice>> batched_slices;
+    std::vector<void*> write_buffers;
+
+    for (size_t i = 0; i < kObjects; ++i) {
+        std::string payload(kPayload, static_cast<char>('a' + (i % 26)));
+        payload[0] = static_cast<char>(i);
+        payload[kPayload - 1] = static_cast<char>(i ^ 0x5a);
+
+        void* buffer = runtime_.io_allocator->allocate(kPayload);
+        ASSERT_NE(buffer, nullptr);
+        std::memcpy(buffer, payload.data(), kPayload);
+        write_buffers.push_back(buffer);
+
+        keys.emplace_back("batch_local_memcpy_key_" + std::to_string(i));
+        payloads.emplace_back(std::move(payload));
+        batched_slices.push_back({Slice{buffer, kPayload}});
+    }
+
+    auto puts = runtime_.client->BatchPut(keys, batched_slices, config);
+    ASSERT_EQ(puts.size(), kObjects);
+    for (size_t i = 0; i < kObjects; ++i) {
+        ASSERT_TRUE(puts[i].has_value())
+            << "BatchPut failed for key " << keys[i] << ": "
+            << toString(puts[i].error());
+    }
+
+    std::unordered_map<std::string, std::vector<Slice>> read_slices;
+    std::vector<void*> read_buffers;
+    for (size_t i = 0; i < kObjects; ++i) {
+        void* buffer = runtime_.io_allocator->allocate(kPayload);
+        ASSERT_NE(buffer, nullptr);
+        std::memset(buffer, 0, kPayload);
+        read_buffers.push_back(buffer);
+        read_slices.emplace(keys[i],
+                            std::vector<Slice>{Slice{buffer, kPayload}});
+    }
+
+    auto gets = runtime_.client->BatchGet(keys, read_slices);
+    ASSERT_EQ(gets.size(), kObjects);
+    for (size_t i = 0; i < kObjects; ++i) {
+        ASSERT_TRUE(gets[i].has_value())
+            << "BatchGet failed for key " << keys[i] << ": "
+            << toString(gets[i].error());
+        EXPECT_EQ(std::memcmp(read_buffers[i], payloads[i].data(), kPayload), 0)
+            << "payload mismatch for key " << keys[i];
+    }
+
+    for (size_t i = 0; i < kObjects; ++i) {
+        runtime_.io_allocator->deallocate(write_buffers[i], kPayload);
+        runtime_.io_allocator->deallocate(read_buffers[i], kPayload);
+    }
 }
 
 class HotCacheRedirectStrategyTest
