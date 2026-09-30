@@ -16,6 +16,7 @@
 #include "config/transfer_submitter_config.h"
 #include "config/nof_debug_config.h"
 #include "config/fileread_worker_pool_config.h"
+#include "config/memcpy_worker_pool_config.h"
 #include "config/nof_worker_pool_config.h"
 #include "device/accelerator_registry.h"
 #include "transfer_engine.h"
@@ -624,16 +625,18 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
 // ============================================================================
 // MemcpyWorkerPool Implementation
 // ============================================================================
-// Since memcpy is bound by memory bandwidth, we only need one worker thread.
-constexpr int kDefaultMemcpyWorkers = 1;
-
+// A single worker keeps a large copy at memory bandwidth, but it also
+// serializes the queue handoff: a batched read submits one task per key, so
+// small objects spend their time waiting for that one thread instead of
+// copying. The pool size is configurable so both regimes can be served.
 MemcpyWorkerPool::MemcpyWorkerPool() : shutdown_(false) {
-    VLOG(1) << "Creating MemcpyWorkerPool with " << kDefaultMemcpyWorkers
-            << " workers";
+    const int worker_count =
+        MemcpyWorkerPoolConfig::FromEnvironment().worker_count;
+    VLOG(1) << "Creating MemcpyWorkerPool with " << worker_count << " workers";
 
     // Start worker threads
-    workers_.reserve(kDefaultMemcpyWorkers);
-    for (int i = 0; i < kDefaultMemcpyWorkers; ++i) {
+    workers_.reserve(worker_count);
+    for (int i = 0; i < worker_count; ++i) {
         workers_.emplace_back(&MemcpyWorkerPool::workerThread, this);
     }
 }
@@ -662,7 +665,7 @@ void MemcpyWorkerPool::submitTask(MemcpyTask task) {
         if (shutdown_.load()) {
             LOG(WARNING)
                 << "Attempting to submit task to shutdown MemcpyWorkerPool";
-            task.state->set_completed(ErrorCode::TRANSFER_FAIL);
+            task.state->complete_chunk(ErrorCode::TRANSFER_FAIL);
             return;
         }
         task_queue_.push(std::move(task));
@@ -753,11 +756,11 @@ void MemcpyWorkerPool::workerThread() {
                 VLOG(2) << "Memcpy task completed with "
                         << task.operations.size() << " operations"
                         << (ok ? "" : " (with GPU copy failure)");
-                task.state->set_completed(ok ? ErrorCode::OK
-                                             : ErrorCode::TRANSFER_FAIL);
+                task.state->complete_chunk(ok ? ErrorCode::OK
+                                              : ErrorCode::TRANSFER_FAIL);
             } catch (const std::exception& e) {
                 LOG(ERROR) << "Exception during async memcpy: " << e.what();
-                task.state->set_completed(ErrorCode::TRANSFER_FAIL);
+                task.state->complete_chunk(ErrorCode::TRANSFER_FAIL);
             }
         }
     }
@@ -1704,13 +1707,36 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
 
 std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperations(
     std::vector<MemcpyOperation> operations) {
-    auto state = std::make_shared<MemcpyOperationState>();
     const size_t operation_count = operations.size();
-    MemcpyTask task(std::move(operations), state);
-    memcpy_pool_->submitTask(std::move(task));
+    // A batch of independent copies can use the whole pool: split it into one
+    // task per worker so a single large batch is not serialized on one thread.
+    const size_t worker_count = memcpy_pool_->workerCount();
+    const size_t chunk_count =
+        worker_count > 0 ? std::min(operation_count, worker_count) : 0;
+
+    if (chunk_count <= 1) {
+        auto state = std::make_shared<MemcpyOperationState>();
+        MemcpyTask task(std::move(operations), state);
+        memcpy_pool_->submitTask(std::move(task));
+        VLOG(1) << "Memcpy transfer submitted to worker pool with "
+                << operation_count << " operations";
+        return TransferFuture(state);
+    }
+
+    const size_t chunk_size = operation_count / chunk_count;
+    const size_t remainder = operation_count % chunk_count;
+    auto state = std::make_shared<MemcpyOperationState>(chunk_count);
+    size_t start = 0;
+    for (size_t chunk = 0; chunk < chunk_count; ++chunk) {
+        const size_t length = chunk_size + (chunk < remainder ? 1 : 0);
+        std::vector<MemcpyOperation> part(operations.begin() + start,
+                                          operations.begin() + start + length);
+        start += length;
+        memcpy_pool_->submitTask(MemcpyTask(std::move(part), state));
+    }
 
     VLOG(1) << "Memcpy transfer submitted to worker pool with "
-            << operation_count << " operations";
+            << operation_count << " operations in " << chunk_count << " tasks";
 
     return TransferFuture(state);
 }

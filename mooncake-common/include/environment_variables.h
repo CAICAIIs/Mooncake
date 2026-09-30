@@ -208,6 +208,7 @@ struct TransferSubmitterEnvironmentVariables {
     // Keep the raw string to preserve the legacy token set, whitespace,
     // invalid-value fallback, and warning behavior.
     MC_DEFINE_ENV_VAR(std::string, MC_STORE_MEMCPY);
+    MC_DEFINE_ENV_VAR(std::string, MC_STORE_MEMCPY_WORKERS);
 };
 
 struct FilereadWorkerPoolEnvironmentVariables {

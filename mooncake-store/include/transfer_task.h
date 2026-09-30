@@ -151,22 +151,55 @@ class EmptyOperationState : public OperationState {
 
 /**
  * @brief Operation state for local memcpy transfers
+ *
+ * One state can be shared by several tasks when the submitter splits a batch
+ * of copies across the pool. Every task reports exactly once through
+ * complete_chunk(); the last one publishes the result the future returns.
  */
 class MemcpyOperationState : public OperationState {
    public:
+    explicit MemcpyOperationState(size_t pending_chunks = 1)
+        : pending_chunks_(pending_chunks) {}
+
     bool is_completed() override {
         std::lock_guard<std::mutex> lock(mutex_);
         return result_.has_value();
     }
 
-    void set_completed(ErrorCode error_code) {
+    void complete_chunk(ErrorCode error_code) {
+        size_t remaining = pending_chunks_.load(std::memory_order_acquire);
+        while (remaining > 0) {
+            if (pending_chunks_.compare_exchange_weak(
+                    remaining, remaining - 1, std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                break;
+            }
+        }
+        if (remaining == 0) {
+            // The result is already published; ignore the extra report.
+            return;
+        }
+
+        if (remaining > 1) {
+            if (error_code != ErrorCode::OK) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (!failure_.has_value()) failure_ = error_code;
+            }
+            return;
+        }
+
+        ErrorCode final_code = error_code;
         {
             std::lock_guard<std::mutex> lock(mutex_);
+            if (failure_.has_value()) final_code = *failure_;
             assert(!result_.has_value());
-            result_.emplace(error_code);
+            result_.emplace(final_code);
         }
         cv_.notify_all();
     }
+
+    // Shorthand for a task that owns its state exclusively.
+    void set_completed(ErrorCode error_code) { complete_chunk(error_code); }
 
     void wait_for_completion() override {
         std::unique_lock<std::mutex> lock(mutex_);
@@ -176,6 +209,10 @@ class MemcpyOperationState : public OperationState {
     TransferStrategy get_strategy() const override {
         return TransferStrategy::LOCAL_MEMCPY;
     }
+
+   private:
+    std::atomic<size_t> pending_chunks_;
+    std::optional<ErrorCode> failure_;  // Guarded by mutex_.
 };
 
 /**
@@ -373,8 +410,9 @@ struct MemcpyTask {
 /**
  * @brief Thread pool for asynchronous memcpy operations
  *
- * This class manages a single worker thread that executes memcpy operations
- * asynchronously.
+ * This class manages worker threads that execute memcpy operations
+ * asynchronously. One task is executed whole by one worker; the worker count
+ * comes from MemcpyWorkerPoolConfig.
  */
 class MemcpyWorkerPool {
    public:
@@ -393,7 +431,17 @@ class MemcpyWorkerPool {
      */
     void submitTask(MemcpyTask task);
 
+    /**
+     * @brief Number of worker threads serving this pool
+     *
+     * Callers use it to decide how many chunks one batch of copies can be
+     * split into.
+     */
+    size_t workerCount() const { return workers_.size(); }
+
    private:
+    friend class MemcpyWorkerPoolTestPeer;
+
     void workerThread();
 
     std::vector<std::thread> workers_;
