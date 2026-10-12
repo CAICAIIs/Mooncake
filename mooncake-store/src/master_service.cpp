@@ -1525,7 +1525,8 @@ uint64_t MasterService::CompletedMemoryQuotaCharge(
             return replica.is_memory_replica() && replica.is_completed();
         });
     const unsigned __int128 charge =
-        static_cast<unsigned __int128>(metadata.size) * completed_replicas;
+        static_cast<unsigned __int128>(metadata.TotalLength()) *
+        completed_replicas;
     return charge > std::numeric_limits<uint64_t>::max()
                ? std::numeric_limits<uint64_t>::max()
                : static_cast<uint64_t>(charge);
@@ -2214,18 +2215,19 @@ void MasterService::FinalizeRemovedReplicasAfterDurable(
             has_processing_memory) {
             const uint64_t committed_charge =
                 metadata.quota_ledger.CommittedBytes();
-            if (metadata.size > committed_charge / erased_memory_replicas) {
+            if (metadata.TotalLength() >
+                committed_charge / erased_memory_replicas) {
                 LOG(ERROR) << "tenant quota removed-replica release exceeds "
                               "committed bytes, tenant="
                            << tenant_id.value()
                            << ", key=" << durable_entry.object_key
-                           << ", object_size=" << metadata.size
+                           << ", object_size=" << metadata.TotalLength()
                            << ", erased_memory_replicas="
                            << erased_memory_replicas
                            << ", committed_bytes=" << committed_charge;
             } else {
                 const uint64_t release_bytes =
-                    metadata.size * erased_memory_replicas;
+                    metadata.TotalLength() * erased_memory_replicas;
                 auto release_result = metadata.quota_ledger.ReleaseCommitted(
                     GetBoundTenantQuotaHandle(*tenant), release_bytes);
                 LogTenantQuotaLedgerError(release_result, "release_committed",
@@ -2457,7 +2459,8 @@ MasterService::BuildStaleHandleCleanupPlan(
             has_valid_after_cleanup = true;
         }
     }
-    plan.would_invalidate = metadata.size == 0 || !has_valid_after_cleanup;
+    plan.would_invalidate =
+        metadata.TotalLength() == 0 || !has_valid_after_cleanup;
     return plan;
 }
 
@@ -4506,12 +4509,12 @@ auto MasterService::GetReplicaList(const std::string& key,
                 if (replica_list[0].is_memory_replica()) {
                     MasterMetricManager::instance().inc_mem_cache_hit_nums();
                     MasterMetricManager::instance().inc_mem_cache_hit_bytes(
-                        static_cast<int64_t>(metadata.size));
+                        static_cast<int64_t>(metadata.TotalLength()));
                 } else if (replica_list[0].is_local_disk_replica() ||
                            replica_list[0].is_disk_replica()) {
                     MasterMetricManager::instance().inc_file_cache_hit_nums();
                     MasterMetricManager::instance().inc_file_cache_hit_bytes(
-                        static_cast<int64_t>(metadata.size));
+                        static_cast<int64_t>(metadata.TotalLength()));
                 }
                 MasterMetricManager::instance().inc_valid_get_nums();
                 // Grant a lease to the object so it will not be removed
@@ -4550,7 +4553,7 @@ auto MasterService::GetReplicaList(const std::string& key,
 
                 return GetReplicaListResponse(std::move(replica_list),
                                               default_kv_lease_ttl_,
-                                              metadata.object_checksum);
+                                              metadata.GetPart(0).checksum());
             });
     }
     if (!outcome.has_value()) {
@@ -4599,7 +4602,7 @@ auto MasterService::GetReplicaListForAdmin(const std::string& key,
 
             return GetReplicaListResponse(std::move(replica_list),
                                           default_kv_lease_ttl_,
-                                          metadata.object_checksum);
+                                          metadata.GetPart(0).checksum());
         });
     if (!outcome.has_value()) {
         VLOG(1) << "key=" << key << ", info=object_not_found";
@@ -4688,15 +4691,15 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                             MasterMetricManager::instance()
                                 .inc_mem_cache_hit_nums();
                             MasterMetricManager::instance()
-                                .inc_mem_cache_hit_bytes(
-                                    static_cast<int64_t>(metadata.size));
+                                .inc_mem_cache_hit_bytes(static_cast<int64_t>(
+                                    metadata.TotalLength()));
                         } else if (replica_list[0].is_local_disk_replica() ||
                                    replica_list[0].is_disk_replica()) {
                             MasterMetricManager::instance()
                                 .inc_file_cache_hit_nums();
                             MasterMetricManager::instance()
-                                .inc_file_cache_hit_bytes(
-                                    static_cast<int64_t>(metadata.size));
+                                .inc_file_cache_hit_bytes(static_cast<int64_t>(
+                                    metadata.TotalLength()));
                         }
                         MasterMetricManager::instance().inc_valid_get_nums();
                         metadata.GrantReadLease(
@@ -4737,9 +4740,9 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                             }
                         }
 
-                        return GetReplicaListResponse(std::move(replica_list),
-                                                      default_kv_lease_ttl_,
-                                                      metadata.object_checksum);
+                        return GetReplicaListResponse(
+                            std::move(replica_list), default_kv_lease_ttl_,
+                            metadata.GetPart(0).checksum());
                     });
                 if (outcome.has_value()) {
                     results[original_idx] = std::move(*outcome);
@@ -4804,9 +4807,9 @@ MasterService::BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
                         return tl::make_unexpected(
                             ErrorCode::REPLICA_IS_NOT_READY);
                     }
-                    return GetReplicaListResponse(std::move(replica_list),
-                                                  default_kv_lease_ttl_,
-                                                  metadata.object_checksum);
+                    return GetReplicaListResponse(
+                        std::move(replica_list), default_kv_lease_ttl_,
+                        metadata.GetPart(0).checksum());
                 });
             if (outcome.has_value()) {
                 results[original_idx] = std::move(*outcome);
@@ -5499,7 +5502,8 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
                 replica_type == ReplicaType::ALL ||
                 replica_type == ReplicaType::MEMORY ||
                 replica_type == ReplicaType::NOF_SSD) {
-                metadata.object_checksum = object_meta.object_checksum;
+                metadata.MutablePart(0).SetChecksum(
+                    object_meta.object_checksum);
             }
 
             auto settle_result =
@@ -6158,7 +6162,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
         // An in-place Upsert returns and overwrites the existing buffers, so
         // every completed Client-owned target must still be serving before any
         // queue or metadata state is changed.
-        if (metadata.size == slice_length &&
+        if (metadata.TotalLength() == slice_length &&
             metadata.HasReplica([](const Replica& replica) {
                 if (!replica.is_completed() ||
                     (!replica.is_memory_replica() &&
@@ -6239,7 +6243,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
         // holds for a replica that bucket eviction already took: the requested
         // topology is restored by allocating it again.
         bool restore_missing_bucket_dfs = false;
-        if (metadata.size == slice_length) {
+        if (metadata.TotalLength() == slice_length) {
             // Validate same-size DFS topology before changing storage.
             const size_t existing_dfs_replicas =
                 metadata.CountReplicas(&Replica::fn_is_dfs_replica);
@@ -6286,7 +6290,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
         const bool has_bucket_dfs_replica =
             bucket_allocator_ != nullptr &&
             metadata.HasReplica(&Replica::fn_is_dfs_replica);
-        if (metadata.size == slice_length && !has_read_lease &&
+        if (metadata.TotalLength() == slice_length && !has_read_lease &&
             !has_bucket_dfs_replica && !restore_missing_bucket_dfs) {
             metadata.client_id = client_id;
             metadata.put_start_time = now;
@@ -6910,9 +6914,9 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
                     ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
             }
 
-            const uint64_t pending_quota_charge =
-                SaturatingMultiply(static_cast<uint64_t>(metadata.size),
-                                   static_cast<uint64_t>(new_replica_count));
+            const uint64_t pending_quota_charge = SaturatingMultiply(
+                static_cast<uint64_t>(metadata.TotalLength()),
+                static_cast<uint64_t>(new_replica_count));
             auto quota_result = ChargeTenantQuota(
                 GetBoundTenantQuotaHandle(tenant), pending_quota_charge);
             if (!quota_result) {
@@ -6955,7 +6959,7 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
                 }
 
                 auto replica = allocation_strategy_->AllocateFrom(
-                    allocator_snapshot, metadata.size, tgt_segment);
+                    allocator_snapshot, metadata.TotalLength(), tgt_segment);
                 if (!replica.has_value()) {
                     LOG(ERROR)
                         << "key=" << key << ", tgt_segment=" << tgt_segment
@@ -7154,9 +7158,9 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(
                 auto replica = metadata.GetReplicaByID(replica_id);
                 if (replica != nullptr) {
                     replica->mark_complete();
-                    completed_quota_charge =
-                        SaturatingAdd(completed_quota_charge,
-                                      static_cast<uint64_t>(metadata.size));
+                    completed_quota_charge = SaturatingAdd(
+                        completed_quota_charge,
+                        static_cast<uint64_t>(metadata.TotalLength()));
                 }
             }
 
@@ -7404,8 +7408,8 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
             // admitted MoveStart.
             serving_guard.reset();
             if (metadata.GetReplicaBySegmentName(tgt_segment) == nullptr) {
-                const uint64_t pending_quota_charge =
-                    SaturatingMultiply(static_cast<uint64_t>(metadata.size), 1);
+                const uint64_t pending_quota_charge = SaturatingMultiply(
+                    static_cast<uint64_t>(metadata.TotalLength()), 1);
                 auto quota_result = ChargeTenantQuota(
                     GetBoundTenantQuotaHandle(tenant), pending_quota_charge);
                 if (!quota_result) {
@@ -7429,7 +7433,7 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
                         allocator_access.SnapshotAllocatorManager();
                 }
                 auto replica = allocation_strategy_->AllocateFrom(
-                    allocator_snapshot, metadata.size, tgt_segment);
+                    allocator_snapshot, metadata.TotalLength(), tgt_segment);
                 if (!replica.has_value()) {
                     LOG(ERROR)
                         << "key=" << key << ", tgt_segment=" << tgt_segment
@@ -7447,9 +7451,10 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
             }
 
             const uint64_t pending_quota_charge =
-                replicas.empty() ? 0
-                                 : SaturatingMultiply(
-                                       static_cast<uint64_t>(metadata.size), 1);
+                replicas.empty()
+                    ? 0
+                    : SaturatingMultiply(
+                          static_cast<uint64_t>(metadata.TotalLength()), 1);
 
             MoveStartResponse response;
             std::vector<ReplicaID> replica_ids;
@@ -7667,7 +7672,8 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
                 auto settle_result = metadata.quota_ledger.SettleAdditional(
                     GetBoundTenantQuotaHandle(tenant),
                     task.pending_quota_charge_bytes,
-                    has_target ? static_cast<uint64_t>(metadata.size) : 0);
+                    has_target ? static_cast<uint64_t>(metadata.TotalLength())
+                               : 0);
                 if (!settle_result) {
                     LogTenantQuotaLedgerError(settle_result,
                                               "settle_additional",
@@ -7688,7 +7694,7 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
                         auto release_result =
                             metadata.quota_ledger.ReleaseCommitted(
                                 GetBoundTenantQuotaHandle(tenant),
-                                static_cast<uint64_t>(metadata.size));
+                                static_cast<uint64_t>(metadata.TotalLength()));
                         if (!release_result) {
                             LogTenantQuotaLedgerError(release_result,
                                                       "release_committed",
@@ -8082,13 +8088,14 @@ long MasterService::RemoveAll(bool force) {
                                     return;
                                 }
                                 total_freed_size +=
-                                    metadata.size * mem_rep_count;
+                                    metadata.TotalLength() * mem_rep_count;
                                 removed_count++;
                                 return;
                             }
                         }
 
-                        total_freed_size += metadata.size * mem_rep_count;
+                        total_freed_size +=
+                            metadata.TotalLength() * mem_rep_count;
                         (void)EraseMetadata(*tenant, entry, metadata, state,
                                             tenant_id);
                         removed_count++;
@@ -8216,12 +8223,13 @@ long MasterService::RemoveAll(const TenantId& tenant_id, bool force) {
                                     return;
                                 }
                                 total_freed_size +=
-                                    metadata.size * mem_rep_count;
+                                    metadata.TotalLength() * mem_rep_count;
                                 removed_count++;
                                 return;
                             }
                         }
-                        total_freed_size += metadata.size * mem_rep_count;
+                        total_freed_size +=
+                            metadata.TotalLength() * mem_rep_count;
                         (void)EraseMetadata(*tenant_handle, entry, metadata,
                                             state, normalized_tenant);
                         removed_count++;
@@ -10023,11 +10031,12 @@ MasterService::SelectDynamicReplicaPlan(
         if (segment_access.QuerySegments(segment.name, used, capacity) !=
                 ErrorCode::OK ||
             capacity == 0 || used >= capacity ||
-            capacity - used < metadata.size) {
+            capacity - used < metadata.TotalLength()) {
             return false;
         }
-        const double util_after = static_cast<double>(used + metadata.size) /
-                                  static_cast<double>(capacity);
+        const double util_after =
+            static_cast<double>(used + metadata.TotalLength()) /
+            static_cast<double>(capacity);
         return util_after < kDynamicReplicationTargetHighWatermark;
     };
 
@@ -10207,7 +10216,7 @@ MasterService::SubmitReplicaActionProposalLocked(
                 return tl::make_unexpected(ErrorCode::INVALID_VERSION);
             }
             if (proposal.object_size_bytes != 0 &&
-                proposal.object_size_bytes != metadata.size) {
+                proposal.object_size_bytes != metadata.TotalLength()) {
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
             if (metadata.DynamicReplicationRecreateBlocked(
@@ -11389,12 +11398,23 @@ void MasterService::DiscardExpiredInFlightState(
 void MasterService::DiscardExpiredProcessingReplicas(
     metadata::Tenant& tenant, const TenantId& tenant_id,
     const std::chrono::system_clock::time_point& now) {
-    // The snapshot walks every object of the tenant once; the discard below
-    // reads an object under its own lock only when it has something in flight.
-    const auto entries = tenant.SnapshotObjects();
-
-    DiscardExpiredInFlightState(tenant, tenant_id, entries, 0, entries.size(),
-                                now);
+    // The walk goes one stripe at a time and one chunk of a stripe at a time,
+    // so it holds a chunk of handles and the in-flight subset of that chunk
+    // instead of every object of the tenant. The discard below reads an object
+    // under its own lock only when it has something in flight, and each chunk
+    // is released before the next one is taken.
+    for (size_t stripe = 0; stripe < metadata::Tenant::kObjectStripeCount;
+         ++stripe) {
+        // The callback reports whether the walk continues, so a stripe that
+        // keeps growing cannot keep this pass here.
+        (void)tenant.VisitStripeChunk(
+            stripe,
+            [&](const std::vector<std::shared_ptr<ObjectEntry>>& objects) {
+                DiscardExpiredInFlightState(tenant, tenant_id, objects, 0,
+                                            objects.size(), now);
+                return true;
+            });
+    }
 }
 
 uint64_t MasterService::ReleaseExpiredDiscardedReplicas(
@@ -11828,7 +11848,7 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
                                           metadata.tenant_id,
                                           metadata.user_key);
             }
-            return metadata.size * replica_count;
+            return metadata.TotalLength() * replica_count;
         };
     long offload_queued_this_call = 0;
     long offload_deferred_count = 0;
@@ -11997,15 +12017,16 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
     };
 
     auto pass = [&](bool allow_soft_pinned) {
-        // One route stripe at a time, in stripe order: a stripe's handles only
-        // name the keys to consider, each key is resolved and re-validated
-        // under its own lock inside try_evict_group_or_object, and the pass
-        // stops as soon as the target is met, so a tenant's whole population is
-        // never held at once. The order is the one a whole-tenant snapshot
-        // yielded the same keys in, stripe by stripe, and a stripe's keys are
-        // collected when the walk reaches that stripe: an object whose state
-        // changes while the pass runs is judged at the stripe it is taken in,
-        // which is the metadata the eviction re-validates anyway.
+        // One route stripe at a time and one chunk of a stripe at a time, in
+        // stripe order: a chunk's handles only name the keys to consider, each
+        // key is resolved and re-validated under its own lock inside
+        // try_evict_group_or_object, and the pass stops as soon as the target
+        // is met, so a tenant's whole population is never held at once. The
+        // order is the one a whole-tenant snapshot yielded the same keys in,
+        // stripe by stripe and chunk by chunk, and a chunk's keys are collected
+        // when the walk reaches that chunk: an object whose state changes while
+        // the pass runs is judged at the chunk it is taken in, which is the
+        // metadata the eviction re-validates anyway.
         //
         // The popped replicas are held only until the key that owned them has
         // been torn down, so a quota-driven pass returns the freed space to the
@@ -12014,30 +12035,36 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
         for (size_t stripe = 0; stripe < metadata::Tenant::kObjectStripeCount &&
                                 total.freed_bytes < target_bytes;
              ++stripe) {
-            std::vector<std::string> candidate_keys;
-            for (const auto& entry : tenant.SnapshotStripe(stripe)) {
-                entry->WithSharedAccess([&](const ObjectMetadata& metadata,
-                                            const ObjectEntry::State&) {
-                    if (metadata.IsHardPinned() ||
-                        !metadata.IsLeaseExpired(now) ||
-                        (!allow_soft_pinned &&
-                         IsSoftPinActive(metadata, now)) ||
-                        !can_evict_replicas(metadata)) {
-                        return;
+            (void)tenant.VisitStripeChunk(
+                stripe,
+                [&](const std::vector<std::shared_ptr<ObjectEntry>>& objects) {
+                    std::vector<std::string> candidate_keys;
+                    for (const auto& entry : objects) {
+                        entry->WithSharedAccess(
+                            [&](const ObjectMetadata& metadata,
+                                const ObjectEntry::State&) {
+                                if (metadata.IsHardPinned() ||
+                                    !metadata.IsLeaseExpired(now) ||
+                                    (!allow_soft_pinned &&
+                                     IsSoftPinActive(metadata, now)) ||
+                                    !can_evict_replicas(metadata)) {
+                                    return;
+                                }
+                                candidate_keys.push_back(entry->key());
+                            });
                     }
-                    candidate_keys.push_back(entry->key());
+                    for (const auto& key : candidate_keys) {
+                        if (total.freed_bytes >= target_bytes) {
+                            break;
+                        }
+                        auto evict_result = try_evict_group_or_object(
+                            key, allow_soft_pinned, deferred_replicas);
+                        total.freed_bytes += evict_result.freed_bytes;
+                        total.evicted_objects += evict_result.evicted_objects;
+                        deferred_replicas.clear();
+                    }
+                    return total.freed_bytes < target_bytes;
                 });
-            }
-            for (const auto& key : candidate_keys) {
-                if (total.freed_bytes >= target_bytes) {
-                    break;
-                }
-                auto evict_result = try_evict_group_or_object(
-                    key, allow_soft_pinned, deferred_replicas);
-                total.freed_bytes += evict_result.freed_bytes;
-                total.evicted_objects += evict_result.evicted_objects;
-                deferred_replicas.clear();
-            }
         }
     };
 
@@ -12103,7 +12130,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
         [&, this](metadata::Tenant& tenant, ObjectMetadata& metadata,
                   std::vector<std::vector<Replica>>& deferred_replicas) {
             if (enable_oplog_) {
-                return metadata.size *
+                return metadata.TotalLength() *
                        metadata.CountReplicas([](const Replica& replica) {
                            return replica.is_memory_replica() &&
                                   replica.status() == ReplicaStatus::REMOVED;
@@ -12131,7 +12158,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                           metadata.tenant_id,
                                           metadata.user_key);
             }
-            return metadata.size * replica_count;
+            return metadata.TotalLength() * replica_count;
         };
 
     // --- Offload-on-evict support ---
@@ -12496,12 +12523,12 @@ void MasterService::BatchEvict(double evict_ratio_target,
             : std::clamp(census_chunks, size_t{1},
                          static_cast<size_t>(kMaxCensusThreads));
 
-    // Hands route stripes to `fn(walker, tenant_id, tenant, objects)` on
-    // `num_threads` walkers: a walker copies the handles of the stripe it took
-    // under that stripe's lock, hands them over, and holds nothing of the route
-    // before it takes its next stripe. An empty stripe is skipped, so a sparse
-    // route costs one lock and no allocation per stripe.
-    const auto for_each_stripe = [&](auto&& fn) {
+    // Hands (tenant, stripe) pairs to `fn(walker, tenant_id, tenant, stripe)`
+    // on `num_threads` walkers. The walker opens the stripe and takes its
+    // objects a chunk at a time through VisitStripeChunk, so what it holds is
+    // one chunk rather than a whole route, and it holds nothing of the route
+    // between stripes.
+    const auto for_each_stripe_parallel = [&](auto&& fn) {
         std::atomic<size_t> next_stripe{0};
         std::vector<std::thread> walkers;
         walkers.reserve(num_threads);
@@ -12516,18 +12543,30 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     const CensusStripe& work = census_stripes[index];
                     const CensusTenant& census_tenant =
                         census_tenants[work.tenant_index];
-                    auto objects =
-                        census_tenant.tenant->SnapshotStripe(work.stripe_index);
-                    if (objects.empty()) {
-                        continue;
-                    }
                     fn(walker, census_tenant.tenant_id, *census_tenant.tenant,
-                       objects);
+                       work.stripe_index);
                 }
             });
         }
         for (auto& walker : walkers) {
             walker.join();
+        }
+    };
+    // The same pairs in tenant and stripe order on the calling thread, for a
+    // walk that evicts: eviction updates the counters, the deferred replicas
+    // and the scan flags of this pass, so it runs on one thread. `fn` returns
+    // false to stop the walk, which is how a pass that has met its target
+    // leaves it.
+    const auto for_each_stripe_in_order = [&](auto&& fn) {
+        for (const auto& census_tenant : census_tenants) {
+            for (size_t stripe_index = 0;
+                 stripe_index < metadata::Tenant::kObjectStripeCount;
+                 ++stripe_index) {
+                if (!fn(census_tenant.tenant_id, *census_tenant.tenant,
+                        stripe_index)) {
+                    return;
+                }
+            }
         }
     };
     constexpr size_t kMinReserveSlack = 1024;
@@ -12555,25 +12594,23 @@ void MasterService::BatchEvict(double evict_ratio_target,
     // in, and its change shows in the next pass.
     std::atomic<long> object_count{0};
 
-    for_each_stripe(
-        [&](size_t walker, const TenantId& tenant_id,
-            metadata::Tenant& stripe_tenant,
-            const std::vector<std::shared_ptr<ObjectEntry>>& objects) {
-            object_count.fetch_add(static_cast<long>(objects.size()),
-                                   std::memory_order_relaxed);
-            for (size_t begin = 0; begin < objects.size();
-                 begin += kCensusChunkObjects) {
-                const size_t end =
-                    std::min(begin + kCensusChunkObjects, objects.size());
+    for_each_stripe_parallel([&](size_t walker, const TenantId& tenant_id,
+                                 metadata::Tenant& stripe_tenant,
+                                 size_t stripe_index) {
+        (void)stripe_tenant.VisitStripeChunk(
+            stripe_index,
+            [&](const std::vector<std::shared_ptr<ObjectEntry>>& objects) {
+                object_count.fetch_add(static_cast<long>(objects.size()),
+                                       std::memory_order_relaxed);
                 // This chunk is settled before it is counted, so an object
-                // whose in-flight state expired is read once, already settled.
+                // whose in-flight state expired is read once, already
+                // settled.
                 DiscardExpiredInFlightState(stripe_tenant, tenant_id, objects,
-                                            begin, end, now);
-                for (size_t i = begin; i < end; ++i) {
-                    const auto& entry = objects[i];
-                    // The stripe only names the keys to consider: every
-                    // eviction re-resolves its candidate under that object's
-                    // own lock.
+                                            0, objects.size(), now);
+                for (const auto& entry : objects) {
+                    // The chunk only names the keys to consider: every
+                    // eviction re-resolves its candidate under that
+                    // object's own lock.
                     entry->WithSharedAccess([&](const ObjectMetadata& metadata,
                                                 const ObjectEntry::State&) {
                         if (metadata.IsHardPinned()) {
@@ -12583,10 +12620,11 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         if (has_evictable) {
                             local_eviction_base[walker]++;
                         }
-                        // Grouped objects are evicted all-or-none, so rank them
-                        // by the shared group TTL instead of each member's own
-                        // lease: this keeps the candidate cutoff aligned with
-                        // group boundaries and prevents over-eviction.
+                        // Grouped objects are evicted all-or-none, so
+                        // rank them by the shared group TTL instead of
+                        // each member's own lease: this keeps the
+                        // candidate cutoff aligned with group
+                        // boundaries and prevents over-eviction.
                         const auto deadline = metadata.EvictionDeadline();
                         if (now < deadline || !has_evictable) {
                             return;
@@ -12603,8 +12641,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         }
                     });
                 }
-            }
-        });
+                return true;
+            });
+    });
 
     // Merge per-thread results
     long total_eviction_base = 0;
@@ -12661,49 +12700,57 @@ void MasterService::BatchEvict(double evict_ratio_target,
     const long primary_no_pin_num =
         std::min(ideal_evict_num, static_cast<long>(no_pin_count));
 
-    // Re-scan the stripes and copy full identities only for objects inside the
-    // requested timestamp range. The eligibility conditions are identical to
-    // the census above, so an object the census counted is selected on the same
-    // conditions, and one the route gained or lost since is selected on the
-    // metadata it carries now, which is what the eviction re-validates anyway.
-    // The re-scan goes one stripe at a time again, so it holds no more of the
+    // Re-scan the stripes, one chunk of one stripe at a time, and copy full
+    // identities only for objects inside the requested timestamp range. The
+    // eligibility conditions are identical to the census above, so an object
+    // the census counted is selected on the same conditions, and one the route
+    // gained or lost since is selected on the metadata it carries now, which is
+    // what the eviction re-validates anyway. The re-scan holds no more of the
     // route than the census did.
     auto collect_candidates = [&](bool use_cutoff,
                                   std::chrono::system_clock::time_point cutoff,
                                   bool collect_older_or_equal) {
         std::vector<std::vector<Candidate>> local_frontier(num_threads);
 
-        for_each_stripe(
-            [&](size_t walker, const TenantId& tenant_id, metadata::Tenant&,
-                const std::vector<std::shared_ptr<ObjectEntry>>& objects) {
-                for (const auto& entry : objects) {
-                    entry->WithSharedAccess([&](const ObjectMetadata& metadata,
-                                                const ObjectEntry::State&) {
-                        if (metadata.IsHardPinned() ||
-                            IsSoftPinActive(metadata, now) ||
-                            !can_evict_replicas(metadata)) {
-                            return;
-                        }
-                        // Group-aware eviction deadline (shared group TTL
-                        // for grouped objects) so the cutoff matches
-                        // eviction.
-                        const auto deadline = metadata.EvictionDeadline();
-                        if (now < deadline) {
-                            return;
-                        }
-                        if (use_cutoff) {
-                            const bool in_range = collect_older_or_equal
-                                                      ? deadline <= cutoff
-                                                      : deadline > cutoff;
-                            if (!in_range) {
-                                return;
-                            }
-                        }
-                        local_frontier[walker].push_back(
-                            {tenant_id, entry->key(), deadline});
-                    });
-                }
-            });
+        for_each_stripe_parallel([&](size_t walker, const TenantId& tenant_id,
+                                     metadata::Tenant& stripe_tenant,
+                                     size_t stripe_index) {
+            (void)stripe_tenant.VisitStripeChunk(
+                stripe_index,
+                [&](const std::vector<std::shared_ptr<ObjectEntry>>& objects) {
+                    for (const auto& entry : objects) {
+                        entry->WithSharedAccess(
+                            [&](const ObjectMetadata& metadata,
+                                const ObjectEntry::State&) {
+                                if (metadata.IsHardPinned() ||
+                                    IsSoftPinActive(metadata, now) ||
+                                    !can_evict_replicas(metadata)) {
+                                    return;
+                                }
+                                // Group-aware eviction deadline (shared
+                                // group TTL for grouped objects) so the
+                                // cutoff matches eviction.
+                                const auto deadline =
+                                    metadata.EvictionDeadline();
+                                if (now < deadline) {
+                                    return;
+                                }
+                                if (use_cutoff) {
+                                    const bool in_range =
+                                        collect_older_or_equal
+                                            ? deadline <= cutoff
+                                            : deadline > cutoff;
+                                    if (!in_range) {
+                                        return;
+                                    }
+                                }
+                                local_frontier[walker].push_back(
+                                    {tenant_id, entry->key(), deadline});
+                            });
+                    }
+                    return true;
+                });
+        });
 
         size_t total = 0;
         for (const auto& v : local_frontier) total += v.size();
@@ -12850,43 +12897,57 @@ void MasterService::BatchEvict(double evict_ratio_target,
             auto target_timeout = no_pin_objects[target_evict_num - 1];
 
             // Evict via key lookup, avoiding a second route traversal per
-            // candidate: one walk collects the keys inside the target timeout,
-            // and eviction re-resolves each under its own lock.
-            {
-                std::vector<std::pair<TenantId, std::string>> to_evict;
-                tenants_.Visit(
-                    [&](const TenantId& tenant_id,
-                        const std::shared_ptr<metadata::Tenant>& tenant) {
-                        for (const auto& entry : tenant->SnapshotObjects()) {
+            // candidate: one chunk of one stripe collects the keys inside the
+            // target timeout, that chunk is evicted, and the next chunk is
+            // taken after it, so the walk holds a chunk of handles and a chunk
+            // of candidate keys rather than every candidate of every tenant.
+            // The eviction runs on this thread: it updates the counters and the
+            // deferred replicas of this pass.
+            std::vector<std::pair<TenantId, std::string>> to_evict;
+            for_each_stripe_in_order([&](const TenantId& tenant_id,
+                                         metadata::Tenant& tenant,
+                                         size_t stripe_index) {
+                (void)tenant.VisitStripeChunk(
+                    stripe_index,
+                    [&](const std::vector<std::shared_ptr<ObjectEntry>>&
+                            objects) {
+                        to_evict.clear();
+                        for (const auto& entry : objects) {
                             entry->WithSharedAccess(
                                 [&](const ObjectMetadata& metadata,
                                     const ObjectEntry::State&) {
-                                    if (!metadata.IsHardPinned() &&
-                                        now >= metadata.EvictionDeadline() &&
-                                        metadata.EvictionDeadline() <=
-                                            target_timeout &&
-                                        !IsSoftPinActive(metadata, now) &&
-                                        can_evict_replicas(metadata)) {
-                                        to_evict.emplace_back(tenant_id,
-                                                              entry->key());
+                                    const auto deadline =
+                                        metadata.EvictionDeadline();
+                                    if (metadata.IsHardPinned() ||
+                                        now < deadline ||
+                                        deadline > target_timeout ||
+                                        IsSoftPinActive(metadata, now) ||
+                                        !can_evict_replicas(metadata)) {
+                                        return;
                                     }
+                                    to_evict.emplace_back(tenant_id,
+                                                          entry->key());
                                 });
                         }
+                        for (auto& c : to_evict) {
+                            if (target_evict_num <= 0 || stop_eviction_scan) {
+                                break;
+                            }
+                            auto evict_result = try_evict_group_or_object(
+                                c.first, c.second,
+                                /*allow_soft_pinned=*/false, deferred_replicas);
+                            total_freed_size += evict_result.freed_bytes;
+                            evicted_count += evict_result.evicted_objects;
+                            target_evict_num -= evict_result.evicted_objects;
+                            if (evict_result.stop_scan) {
+                                stop_eviction_scan = true;
+                            }
+                        }
+                        return target_evict_num > 0 && !stop_eviction_scan;
                     });
-                for (auto& c : to_evict) {
-                    if (target_evict_num <= 0 || stop_eviction_scan) break;
-                    auto evict_result = try_evict_group_or_object(
-                        c.first, c.second,
-                        /*allow_soft_pinned=*/false, deferred_replicas);
-                    total_freed_size += evict_result.freed_bytes;
-                    evicted_count += evict_result.evicted_objects;
-                    target_evict_num -= evict_result.evicted_objects;
-                    if (evict_result.stop_scan) {
-                        stop_eviction_scan = true;
-                    }
-                }
-                deferred_replicas.clear();
-            }
+                return target_evict_num > 0 && !stop_eviction_scan;
+            });
+            deferred_replicas.clear();
         } else if (!soft_pin_objects.empty()) {
             // Second pass B: Prioritize evicting objects without soft pin,
             // but also allow evicting soft pinned objects.
@@ -12898,12 +12959,16 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 soft_pin_objects.end());
             auto soft_target_timeout = soft_pin_objects[soft_pin_evict_num - 1];
 
-            {
-                std::vector<std::pair<TenantId, std::string>> to_evict;
-                tenants_.Visit(
-                    [&](const TenantId& tenant_id,
-                        const std::shared_ptr<metadata::Tenant>& tenant) {
-                        for (const auto& entry : tenant->SnapshotObjects()) {
+            std::vector<std::pair<TenantId, std::string>> to_evict;
+            for_each_stripe_in_order([&](const TenantId& tenant_id,
+                                         metadata::Tenant& tenant,
+                                         size_t stripe_index) {
+                (void)tenant.VisitStripeChunk(
+                    stripe_index,
+                    [&](const std::vector<std::shared_ptr<ObjectEntry>>&
+                            objects) {
+                        to_evict.clear();
+                        for (const auto& entry : objects) {
                             entry->WithSharedAccess(
                                 [&](const ObjectMetadata& metadata,
                                     const ObjectEntry::State&) {
@@ -12920,21 +12985,25 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                     }
                                 });
                         }
+                        for (auto& c : to_evict) {
+                            if (target_evict_num <= 0 || stop_eviction_scan) {
+                                break;
+                            }
+                            auto evict_result = try_evict_group_or_object(
+                                c.first, c.second,
+                                /*allow_soft_pinned=*/true, deferred_replicas);
+                            total_freed_size += evict_result.freed_bytes;
+                            evicted_count += evict_result.evicted_objects;
+                            target_evict_num -= evict_result.evicted_objects;
+                            if (evict_result.stop_scan) {
+                                stop_eviction_scan = true;
+                            }
+                        }
+                        return target_evict_num > 0 && !stop_eviction_scan;
                     });
-                for (auto& c : to_evict) {
-                    if (target_evict_num <= 0 || stop_eviction_scan) break;
-                    auto evict_result = try_evict_group_or_object(
-                        c.first, c.second,
-                        /*allow_soft_pinned=*/true, deferred_replicas);
-                    total_freed_size += evict_result.freed_bytes;
-                    evicted_count += evict_result.evicted_objects;
-                    target_evict_num -= evict_result.evicted_objects;
-                    if (evict_result.stop_scan) {
-                        stop_eviction_scan = true;
-                    }
-                }
-                deferred_replicas.clear();
-            }
+                return target_evict_num > 0 && !stop_eviction_scan;
+            });
+            deferred_replicas.clear();
         } else {
             LOG(ERROR) << "Error in second pass eviction: target_evict_num="
                        << target_evict_num
@@ -13046,152 +13115,296 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
         static_cast<long>(std::ceil(object_count * evict_ratio_target));
 
     if (ideal_evict_num > 0) {
-        tenants_.Visit([&](const TenantId& tenant_id,
-                           const std::shared_ptr<metadata::Tenant>& tenant) {
-            if (evicted_count >= ideal_evict_num) {
-                return;
-            }
-            // The snapshot only names the keys to consider: each one is
-            // resolved again under its own lock below.
-            for (const auto& snapshot_entry : tenant->SnapshotObjects()) {
+        tenants_.Visit(
+            [&](const TenantId& tenant_id,
+                const std::shared_ptr<metadata::Tenant>& tenant) {
                 if (evicted_count >= ideal_evict_num) {
-                    break;
+                    return;
                 }
-                const std::string& key = snapshot_entry->key();
-                (void)tenant->WithPublishedObject(key, [&](ObjectMetadata&
-                                                               metadata,
-                                                           ObjectEntry::State&
-                                                               state) {
-                    // Runs under this entry's own lock, so this is the
-                    // publication the durable cleanup below belongs to.
-                    const auto entry = tenant->Get(key);
-                    assert(entry != nullptr);
-                    if (metadata.IsHardPinned() ||
-                        !metadata.IsLeaseExpired(now) ||
-                        IsSoftPinActive(metadata, now)) {
-                        return;
-                    }
+                // One stripe at a time, one chunk of a stripe at a time: a
+                // chunk only names the keys to consider, each one is resolved
+                // again under its own lock below, and the chunk is released
+                // before the next one is taken, so the walk never holds the
+                // tenant's whole population.
+                for (size_t stripe_index = 0;
+                     stripe_index < metadata::Tenant::kObjectStripeCount &&
+                     evicted_count < ideal_evict_num;
+                     ++stripe_index) {
+                    (void)tenant
+                        ->VisitStripeChunk(stripe_index,
+                                           [&](const std::vector<
+                                               std::shared_ptr<ObjectEntry>>&
+                                                   objects) {
+                                               for (const auto& snapshot_entry :
+                                                    objects) {
+                                                   if (evicted_count >=
+                                                       ideal_evict_num) {
+                                                       break;
+                                                   }
+                                                   const std::string& key =
+                                                       snapshot_entry->key();
+                                                   (void)
+                                                       tenant->WithPublishedObject(
+                                                           key, [&](ObjectMetadata&
+                                                                        metadata,
+                                                                    ObjectEntry::
+                                                                        State& state) {
+                                                               // Runs under
+                                                               // this entry's
+                                                               // own lock, so
+                                                               // this is the
+                                                               // publication
+                                                               // the durable
+                                                               // cleanup below
+                                                               // belongs to.
+                                                               const auto entry =
+                                                                   tenant->Get(
+                                                                       key);
+                                                               assert(entry !=
+                                                                      nullptr);
+                                                               if (metadata
+                                                                       .IsHardPinned() ||
+                                                                   !metadata
+                                                                        .IsLeaseExpired(
+                                                                            now) ||
+                                                                   IsSoftPinActive(
+                                                                       metadata,
+                                                                       now)) {
+                                                                   return;
+                                                               }
 
-                    // Probe: any NoF replicas eligible for eviction?
-                    const bool has_evictable_nof =
-                        metadata.HasReplica(is_evictable_nof_replica);
-                    if (!has_evictable_nof) {
-                        return;
-                    }
+                                                               // Probe: any NoF
+                                                               // replicas
+                                                               // eligible for
+                                                               // eviction?
+                                                               const bool has_evictable_nof =
+                                                                   metadata.HasReplica(
+                                                                       is_evictable_nof_replica);
+                                                               if (!has_evictable_nof) {
+                                                                   return;
+                                                               }
 
-                    // HA strong consistency: persist BEFORE erasing NoF
-                    // replicas. Skip the key on persist failure.
-                    if (enable_oplog_ && ordered_oplog_writer_) {
-                        auto remaining = BuildRemainingReplicaDescriptors(
-                            metadata, is_evictable_nof_replica);
-                        if (enable_oplog_) {
-                            auto reservation = ReserveBatchOpLogSlot();
-                            if (!reservation) {
-                                LOG(WARNING)
-                                    << "NoFBatchEvict: OpLog reservation "
-                                       "failed for key="
-                                    << key << ", err="
-                                    << static_cast<int>(reservation.error())
-                                    << ", skipping eviction";
-                                return;
-                            }
-                            std::vector<ReplicaID> removed_ids;
-                            metadata.VisitReplicas(
-                                is_evictable_nof_replica,
-                                [&removed_ids](Replica& replica) {
-                                    removed_ids.push_back(replica.id());
-                                    replica.mark_removed();
-                                });
-                            const size_t removed_count = removed_ids.size();
-                            tl::expected<OpLogEntry, ErrorCode> persist_result;
-                            if (remaining.empty()) {
-                                persist_result =
-                                    AppendReservedOpLogWithDurableFinalize(
-                                        std::move(reservation.value()),
-                                        OpType::REMOVE, tenant_id.value(), key,
-                                        {},
-                                        [this, entry,
-                                         removed_ids = std::move(removed_ids)](
-                                            const OpLogEntry& durable_entry) {
-                                            FinalizeRemovedReplicasAfterDurable(
-                                                entry, durable_entry,
-                                                removed_ids,
-                                                QuotaEraseMode::kFull);
-                                        });
-                            } else {
-                                persist_result =
-                                    AppendReservedOpLogWithDurableFinalize(
-                                        std::move(reservation.value()),
-                                        OpType::PUT_END, tenant_id.value(), key,
-                                        SerializeMetadataForOpLogFromReplicaDescriptors(
-                                            metadata, remaining),
-                                        [this, entry,
-                                         removed_ids = std::move(removed_ids)](
-                                            const OpLogEntry& durable_entry) {
-                                            FinalizeRemovedReplicasAfterDurable(
-                                                entry, durable_entry,
-                                                removed_ids,
-                                                QuotaEraseMode::kFull);
-                                        });
-                            }
-                            if (!persist_result) {
-                                LOG(WARNING)
-                                    << "NoFBatchEvict: OpLog persist "
-                                       "failed for key="
-                                    << key << ", err="
-                                    << static_cast<int>(persist_result.error())
-                                    << ", skipping eviction";
-                                return;
-                            }
-                            total_freed_size += metadata.size * removed_count;
-                            evicted_count++;
-                            return;
-                        }
+                                                               // HA strong
+                                                               // consistency:
+                                                               // persist BEFORE
+                                                               // erasing NoF
+                                                               // replicas. Skip
+                                                               // the key on
+                                                               // persist
+                                                               // failure.
+                                                               if (enable_oplog_ &&
+                                                                   ordered_oplog_writer_) {
+                                                                   auto remaining =
+                                                                       BuildRemainingReplicaDescriptors(
+                                                                           metadata,
+                                                                           is_evictable_nof_replica);
+                                                                   if (enable_oplog_) {
+                                                                       auto reservation =
+                                                                           ReserveBatchOpLogSlot();
+                                                                       if (!reservation) {
+                                                                           LOG(WARNING)
+                                                                               << "NoFBatchEvict: OpLog reservation "
+                                                                                  "failed for key="
+                                                                               << key
+                                                                               << ", err="
+                                                                               << static_cast<
+                                                                                      int>(
+                                                                                      reservation
+                                                                                          .error())
+                                                                               << ", skipping eviction";
+                                                                           return;
+                                                                       }
+                                                                       std::vector<
+                                                                           ReplicaID>
+                                                                           removed_ids;
+                                                                       metadata.VisitReplicas(
+                                                                           is_evictable_nof_replica,
+                                                                           [&removed_ids](
+                                                                               Replica&
+                                                                                   replica) {
+                                                                               removed_ids
+                                                                                   .push_back(
+                                                                                       replica
+                                                                                           .id());
+                                                                               replica
+                                                                                   .mark_removed();
+                                                                           });
+                                                                       const size_t removed_count =
+                                                                           removed_ids
+                                                                               .size();
+                                                                       tl::expected<
+                                                                           OpLogEntry,
+                                                                           ErrorCode>
+                                                                           persist_result;
+                                                                       if (remaining
+                                                                               .empty()) {
+                                                                           persist_result = AppendReservedOpLogWithDurableFinalize(
+                                                                               std::move(
+                                                                                   reservation
+                                                                                       .value()),
+                                                                               OpType::
+                                                                                   REMOVE,
+                                                                               tenant_id
+                                                                                   .value(),
+                                                                               key,
+                                                                               {},
+                                                                               [this,
+                                                                                entry,
+                                                                                removed_ids =
+                                                                                    std::move(
+                                                                                        removed_ids)](
+                                                                                   const OpLogEntry&
+                                                                                       durable_entry) {
+                                                                                   FinalizeRemovedReplicasAfterDurable(
+                                                                                       entry,
+                                                                                       durable_entry,
+                                                                                       removed_ids,
+                                                                                       QuotaEraseMode::
+                                                                                           kFull);
+                                                                               });
+                                                                       } else {
+                                                                           persist_result = AppendReservedOpLogWithDurableFinalize(
+                                                                               std::move(
+                                                                                   reservation
+                                                                                       .value()),
+                                                                               OpType::
+                                                                                   PUT_END,
+                                                                               tenant_id
+                                                                                   .value(),
+                                                                               key,
+                                                                               SerializeMetadataForOpLogFromReplicaDescriptors(
+                                                                                   metadata,
+                                                                                   remaining),
+                                                                               [this,
+                                                                                entry,
+                                                                                removed_ids =
+                                                                                    std::move(
+                                                                                        removed_ids)](
+                                                                                   const OpLogEntry&
+                                                                                       durable_entry) {
+                                                                                   FinalizeRemovedReplicasAfterDurable(
+                                                                                       entry,
+                                                                                       durable_entry,
+                                                                                       removed_ids,
+                                                                                       QuotaEraseMode::
+                                                                                           kFull);
+                                                                               });
+                                                                       }
+                                                                       if (!persist_result) {
+                                                                           LOG(WARNING)
+                                                                               << "NoFBatchEvict: OpLog persist "
+                                                                                  "failed for key="
+                                                                               << key
+                                                                               << ", err="
+                                                                               << static_cast<
+                                                                                      int>(
+                                                                                      persist_result
+                                                                                          .error())
+                                                                               << ", skipping eviction";
+                                                                           return;
+                                                                       }
+                                                                       total_freed_size +=
+                                                                           metadata
+                                                                               .TotalLength() *
+                                                                           removed_count;
+                                                                       evicted_count++;
+                                                                       return;
+                                                                   }
 
-                        tl::expected<OpLogEntry, ErrorCode> persist_result;
-                        if (remaining.empty()) {
-                            persist_result = AppendOpLogWithDurableFinalize(
-                                OpType::REMOVE, tenant_id.value(), key, {},
-                                nullptr);
-                        } else {
-                            persist_result = AppendOpLogWithDurableFinalize(
-                                OpType::PUT_END, tenant_id.value(), key,
-                                SerializeMetadataForOpLogFromReplicaDescriptors(
-                                    metadata, remaining),
-                                nullptr);
-                        }
-                        if (!persist_result) {
-                            LOG(WARNING)
-                                << "NoFBatchEvict: OpLog persist failed "
-                                   "for key="
-                                << key << ", err="
-                                << static_cast<int>(persist_result.error())
-                                << ", skipping eviction";
-                            return;
-                        }
-                    }
+                                                                   tl::expected<
+                                                                       OpLogEntry,
+                                                                       ErrorCode>
+                                                                       persist_result;
+                                                                   if (remaining
+                                                                           .empty()) {
+                                                                       persist_result = AppendOpLogWithDurableFinalize(
+                                                                           OpType::
+                                                                               REMOVE,
+                                                                           tenant_id
+                                                                               .value(),
+                                                                           key,
+                                                                           {},
+                                                                           nullptr);
+                                                                   } else {
+                                                                       persist_result = AppendOpLogWithDurableFinalize(
+                                                                           OpType::
+                                                                               PUT_END,
+                                                                           tenant_id
+                                                                               .value(),
+                                                                           key,
+                                                                           SerializeMetadataForOpLogFromReplicaDescriptors(
+                                                                               metadata,
+                                                                               remaining),
+                                                                           nullptr);
+                                                                   }
+                                                                   if (!persist_result) {
+                                                                       LOG(WARNING)
+                                                                           << "NoFBatchEvict: OpLog persist failed "
+                                                                              "for key="
+                                                                           << key
+                                                                           << ", err="
+                                                                           << static_cast<
+                                                                                  int>(
+                                                                                  persist_result
+                                                                                      .error())
+                                                                           << ", skipping eviction";
+                                                                       return;
+                                                                   }
+                                                               }
 
-                    const size_t erased =
-                        metadata.EraseReplicas(is_evictable_nof_replica);
-                    if (erased == 0) {
-                        return;
-                    }
+                                                               const size_t erased =
+                                                                   metadata.EraseReplicas(
+                                                                       is_evictable_nof_replica);
+                                                               if (erased ==
+                                                                   0) {
+                                                                   return;
+                                                               }
 
-                    total_freed_size += metadata.size * erased;
-                    evicted_count++;
-                    PublishKvRemovedAfterEvict(key, erased, "disk", metadata,
-                                               tenant_id);
-                    if (!metadata.IsValid()) {
-                        // The callback runs under this entry's own lock, so
-                        // the route still publishes exactly this entry.
-                        const auto entry = tenant->Get(key);
-                        assert(entry != nullptr);
-                        (void)EraseMetadata(*tenant, entry, metadata, state,
-                                            tenant_id);
-                    }
-                });
-            }
-        });
+                                                               total_freed_size +=
+                                                                   metadata
+                                                                       .TotalLength() *
+                                                                   erased;
+                                                               evicted_count++;
+                                                               PublishKvRemovedAfterEvict(
+                                                                   key, erased,
+                                                                   "disk",
+                                                                   metadata,
+                                                                   tenant_id);
+                                                               if (!metadata
+                                                                        .IsValid()) {
+                                                                   // The
+                                                                   // callback
+                                                                   // runs under
+                                                                   // this
+                                                                   // entry's
+                                                                   // own lock,
+                                                                   // so the
+                                                                   // route
+                                                                   // still
+                                                                   // publishes
+                                                                   // exactly
+                                                                   // this
+                                                                   // entry.
+                                                                   const auto entry =
+                                                                       tenant->Get(
+                                                                           key);
+                                                                   assert(
+                                                                       entry !=
+                                                                       nullptr);
+                                                                   (void)EraseMetadata(
+                                                                       *tenant,
+                                                                       entry,
+                                                                       metadata,
+                                                                       state,
+                                                                       tenant_id);
+                                                               }
+                                                           });
+                                               }
+                                               return evicted_count <
+                                                      ideal_evict_num;
+                                           });
+                }
+            });
     }
 
     if (evicted_count > 0) {
@@ -13987,9 +14200,10 @@ MasterService::MetadataSerializer::DeserializeTenant(
         auto entry =
             std::make_shared<ObjectEntry>(std::make_unique<ObjectMetadata>(
                 metadata_ptr->client_id, metadata_ptr->put_start_time,
-                metadata_ptr->size, metadata_ptr->PopReplicas(), std::nullopt,
-                metadata_ptr->IsHardPinned(), metadata_ptr->data_type,
-                metadata_ptr->group_id, tenant_id, key));
+                metadata_ptr->TotalLength(), metadata_ptr->PopReplicas(),
+                std::nullopt, metadata_ptr->IsHardPinned(),
+                metadata_ptr->data_type, metadata_ptr->group_id, tenant_id,
+                key));
         if (!tenant->InsertObject(entry)) {
             return tl::make_unexpected(SerializationError(
                 ErrorCode::DESERIALIZE_FAIL,
@@ -13998,12 +14212,13 @@ MasterService::MetadataSerializer::DeserializeTenant(
 
         // InsertObject wires the identity and the group lease, so the fields it
         // does not carry are filled in under the entry's own lock.
-        entry->WithExclusiveAccess([&](ObjectMetadata& restored_metadata,
-                                       ObjectEntry::State&) {
-            restored_metadata.lease_->ExtendTo(
-                metadata_ptr->EvictionDeadline());
-            restored_metadata.object_checksum = metadata_ptr->object_checksum;
-        });
+        entry->WithExclusiveAccess(
+            [&](ObjectMetadata& restored_metadata, ObjectEntry::State&) {
+                restored_metadata.lease_->ExtendTo(
+                    metadata_ptr->EvictionDeadline());
+                restored_metadata.MutablePart(0).SetChecksum(
+                    metadata_ptr->GetPart(0).checksum());
+            });
     }
 
     return {};
@@ -14021,7 +14236,7 @@ MasterService::MetadataSerializer::SerializeMetadata(
                              // has_soft_pin_timeout, soft_pin_timeout,
                              // replicas_count, data_type, hard_pinned, group_id
     array_size += metadata.CountReplicas();  // One element per replica
-    if (metadata.object_checksum.has_value()) {
+    if (metadata.GetPart(0).checksum().has_value()) {
         ++array_size;
     }
     packer.pack_array(array_size);
@@ -14037,7 +14252,7 @@ MasterService::MetadataSerializer::SerializeMetadata(
     packer.pack(put_start_time);
 
     // Serialize size
-    packer.pack(static_cast<uint64_t>(metadata.size));
+    packer.pack(static_cast<uint64_t>(metadata.TotalLength()));
 
     // Serialize the authoritative lease deadline (converted to timestamp).
     auto lease_timestamp =
@@ -14068,8 +14283,8 @@ MasterService::MetadataSerializer::SerializeMetadata(
 
     packer.pack(metadata.IsHardPinned());
     packer.pack(metadata.group_id);
-    if (metadata.object_checksum.has_value()) {
-        packer.pack(*metadata.object_checksum);
+    if (metadata.GetPart(0).checksum().has_value()) {
+        packer.pack(*metadata.GetPart(0).checksum());
     }
 
     return {};
@@ -14213,7 +14428,7 @@ MasterService::MetadataSerializer::DeserializeMetadata(
             std::chrono::milliseconds(put_start_time_timestamp)),
         size, std::move(replicas), std::nullopt, is_hard_pinned, data_type,
         group_id);
-    metadata->object_checksum = object_checksum;
+    metadata->MutablePart(0).SetChecksum(object_checksum);
     metadata->lease_->ExtendTo(std::chrono::system_clock::time_point(
         std::chrono::milliseconds(lease_timestamp)));
 
@@ -15008,9 +15223,9 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
                             }
 
                             if (plans.size() < slots) {
-                                plans.push_back({tenant_id, key, source_segment,
-                                                 *target, metadata.size,
-                                                 unit_key});
+                                plans.push_back(
+                                    {tenant_id, key, source_segment, *target,
+                                     metadata.TotalLength(), unit_key});
                             }
                         }
                     });
@@ -15608,7 +15823,7 @@ std::string MasterService::SerializeMetadataForOpLog(
     const ObjectMetadata& metadata) const {
     MetadataPayload payload;
     payload.client_id = metadata.client_id;
-    payload.size = metadata.size;
+    payload.size = metadata.TotalLength();
     payload.group_id = metadata.group_id;
     payload.data_type = metadata.data_type;
     payload.hard_pinned = metadata.IsHardPinned();
@@ -15634,7 +15849,7 @@ std::string MasterService::SerializeMetadataForOpLogWithoutMemReplicas(
     const ObjectMetadata& metadata) const {
     MetadataPayload payload;
     payload.client_id = metadata.client_id;
-    payload.size = metadata.size;
+    payload.size = metadata.TotalLength();
     payload.group_id = metadata.group_id;
     payload.data_type = metadata.data_type;
     payload.hard_pinned = metadata.IsHardPinned();
@@ -15657,7 +15872,7 @@ std::string MasterService::SerializeMetadataForOpLogFromReplicaDescriptors(
     const std::vector<Replica::Descriptor>& replicas) const {
     MetadataPayload payload;
     payload.client_id = metadata.client_id;
-    payload.size = metadata.size;
+    payload.size = metadata.TotalLength();
     payload.replicas = replicas;
     payload.group_id = metadata.group_id;
     payload.data_type = metadata.data_type;

@@ -69,7 +69,7 @@ MasterStoreBackend::SnapshotWeightGroup(
                 }
                 snapshot = WeightGroupMemberSnapshot{
                     .key = key,
-                    .size = metadata.size,
+                    .size = metadata.TotalLength(),
                     .data_type = metadata.data_type,
                     .readable = master_.HasReadableReplica(metadata),
                 };

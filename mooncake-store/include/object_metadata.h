@@ -4,8 +4,10 @@
 //
 // Moved out of MasterService so the service and the per-object metadata
 // module share one definition. The envelope owns the object identity, the
-// authoritative read lease, the replica list, the soft-pin state and the
-// tenant quota ledger.
+// authoritative read lease, the soft-pin state and the tenant quota ledger.
+// The object's content and the replicas holding it live in the envelope's
+// single Part; the envelope keeps the operations over them as forwards, so the
+// call sites that used the envelope's own replica list still read the same.
 //
 // It has no ownership lock: whoever owns the envelope decides how the
 // envelope as a whole is guarded. The `lock` member below is internal and
@@ -16,7 +18,6 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
-#include <iterator>
 #include <memory>
 #include <optional>
 #include <string>
@@ -28,6 +29,7 @@
 #include "lease.h"
 #include "master_metric_manager.h"
 #include "mutex.h"
+#include "part.h"
 #include "replica.h"
 #include "tenant_id.h"
 #include "tenant_quota_ledger.h"
@@ -64,6 +66,8 @@ struct ObjectMetadata {
 
     ObjectMetadata() = delete;
 
+    // `value_length` and `reps` become the envelope's single part. The
+    // parameter list is unchanged, so a construction site keeps its shape.
     ObjectMetadata(const UUID& client_id_,
                    const std::chrono::system_clock::time_point put_start_time_,
                    size_t value_length, std::vector<Replica>&& reps,
@@ -75,14 +79,13 @@ struct ObjectMetadata {
                    std::string user_key_ = {})
         : client_id(client_id_),
           put_start_time(put_start_time_),
-          size(value_length),
           data_type(data_type_),
           group_id(std::move(group_id_)),
           tenant_id(std::move(tenant_id_)),
           user_key(std::move(user_key_)),
           soft_pin_timeout(std::move(committed_soft_pin_timeout)),
-          hard_pinned(enable_hard_pin),
-          replicas_(std::move(reps)) {
+          hard_pinned(enable_hard_pin) {
+        parts_.emplace_back(value_length, std::move(reps));
         MasterMetricManager::instance().inc_key_count(1);
         if (soft_pin_timeout) {
             MasterMetricManager::instance().inc_soft_pin_key_count(1);
@@ -99,8 +102,6 @@ struct ObjectMetadata {
     UUID client_id;
     // Updated by UpsertStart (Case B) to reset the discard timeout.
     std::chrono::system_clock::time_point put_start_time;
-    const size_t size;
-    std::optional<uint64_t> object_checksum;
     const ObjectDataType data_type{ObjectDataType::UNKNOWN};
     const std::string group_id;
     const TenantId tenant_id;
@@ -169,150 +170,105 @@ struct ObjectMetadata {
             std::max(dynamic_replication_recreate_after, deadline);
     }
 
+    // The envelope holds exactly one part. These are the seams the multi-part
+    // work replaces; until then every operation below forwards to it, so a
+    // call site keeps the meaning it had when the envelope owned the replicas.
+    const Part& GetPart(size_t index) const { return parts_.at(index); }
+
+    Part& MutablePart(size_t index) { return parts_.at(index); }
+
+    // The content length of the whole object, formerly the `size` field. The
+    // envelope holds one part today, so this is that part's length.
+    size_t TotalLength() const {
+        size_t total = 0;
+        for (const auto& part : parts_) {
+            total += part.length();
+        }
+        return total;
+    }
+
     void AddReplicas(std::vector<Replica>&& replicas) {
-        replicas_.insert(replicas_.end(), std::move_iterator(replicas.begin()),
-                         std::move_iterator(replicas.end()));
+        MutablePart(0).AddReplicas(std::move(replicas));
     }
 
     std::vector<Replica> PopReplicas(
         const std::function<bool(const Replica&)>& pred_fn) {
-        auto partition_point = std::partition(
-            replicas_.begin(), replicas_.end(),
-            [pred_fn](const Replica& replica) { return !pred_fn(replica); });
-
-        std::vector<Replica> popped_replicas;
-        if (partition_point != replicas_.end()) {
-            popped_replicas.reserve(
-                std::distance(partition_point, replicas_.end()));
-            std::move(partition_point, replicas_.end(),
-                      std::back_inserter(popped_replicas));
-            replicas_.erase(partition_point, replicas_.end());
-        }
-
-        return popped_replicas;
+        return MutablePart(0).PopReplicas(pred_fn);
     }
 
-    std::vector<Replica> PopReplicas() { return std::move(replicas_); }
+    std::vector<Replica> PopReplicas() { return MutablePart(0).PopReplicas(); }
 
     size_t EraseReplicas(const std::function<bool(const Replica&)>& pred_fn) {
-        auto erased_replicas = PopReplicas(pred_fn);
-        return erased_replicas.size();
+        return MutablePart(0).EraseReplicas(pred_fn);
     }
 
-    size_t EraseReplicas() {
-        auto erased_replicas = PopReplicas();
-        return erased_replicas.size();
-    }
+    size_t EraseReplicas() { return MutablePart(0).EraseReplicas(); }
 
     size_t VisitReplicas(const std::function<bool(const Replica&)>& pred_fn,
                          const std::function<void(Replica&)>& visit_fn) {
-        size_t num_visited = 0;
-
-        for (auto& replica : replicas_) {
-            if (pred_fn(replica)) {
-                visit_fn(replica);
-                num_visited++;
-            }
-        }
-
-        return num_visited;
+        return MutablePart(0).VisitReplicas(pred_fn, visit_fn);
     }
 
     size_t VisitReplicas(
         const std::function<bool(const Replica&)>& pred_fn,
         const std::function<void(const Replica&)>& visit_fn) const {
-        size_t num_visited = 0;
-
-        for (auto& replica : replicas_) {
-            if (pred_fn(replica)) {
-                visit_fn(replica);
-                num_visited++;
-            }
-        }
-
-        return num_visited;
+        return GetPart(0).VisitReplicas(pred_fn, visit_fn);
     }
 
     bool HasReplica(const std::function<bool(const Replica&)>& pred_fn) const {
-        return std::any_of(replicas_.begin(), replicas_.end(), pred_fn);
+        return GetPart(0).HasReplica(pred_fn);
     }
 
     bool AllReplicas(const std::function<bool(const Replica&)>& pred_fn) const {
-        return std::all_of(replicas_.begin(), replicas_.end(), pred_fn);
+        return GetPart(0).AllReplicas(pred_fn);
     }
 
     size_t CountReplicas(
         const std::function<bool(const Replica&)>& pred_fn) const {
-        return std::count_if(replicas_.begin(), replicas_.end(), pred_fn);
+        return GetPart(0).CountReplicas(pred_fn);
     }
 
-    size_t CountReplicas() const { return replicas_.size(); }
+    size_t CountReplicas() const { return GetPart(0).CountReplicas(); }
 
-    const std::vector<Replica>& GetAllReplicas() const { return replicas_; }
+    const std::vector<Replica>& GetAllReplicas() const {
+        return GetPart(0).GetAllReplicas();
+    }
 
     std::optional<ReplicaStatus> HasDiffRepStatus(ReplicaStatus status) const {
-        for (const auto& replica : replicas_) {
-            if (replica.status() != status) {
-                return replica.status();
-            }
-        }
-        return {};
+        return GetPart(0).HasDiffRepStatus(status);
     }
 
     Replica* GetFirstReplica(
         const std::function<bool(const Replica&)>& pred_fn) {
-        const auto it =
-            std::find_if(replicas_.begin(), replicas_.end(), pred_fn);
-        return it != replicas_.end() ? &(*it) : nullptr;
+        return MutablePart(0).GetFirstReplica(pred_fn);
     }
 
     Replica* GetReplicaByID(const ReplicaID& id) {
-        return GetFirstReplica(
-            [&id](const Replica& replica) { return replica.id() == id; });
+        return MutablePart(0).GetReplicaByID(id);
     }
 
     bool EraseReplicaByID(const ReplicaID& id) {
-        auto num_erased = EraseReplicas(
-            [&id](const Replica& replica) { return replica.id() == id; });
-        return num_erased > 0;
+        return MutablePart(0).EraseReplicaByID(id);
     }
 
     size_t EraseReplica(ReplicaType replica_type) {
-        return EraseReplicas([replica_type](const Replica& replica) {
-            if (replica_type == ReplicaType::ALL) {
-                return replica.is_memory_replica() ||
-                       replica.is_nof_replica() || replica.is_dfs_replica();
-            }
-            return replica.type() == replica_type;
-        });
+        return MutablePart(0).EraseReplica(replica_type);
     }
 
-    bool HasMemReplica() const {
-        return HasReplica(&Replica::fn_is_memory_replica);
-    }
+    bool HasMemReplica() const { return GetPart(0).HasMemReplica(); }
 
-    bool HasNoFReplica() const {
-        return HasReplica(&Replica::fn_is_nof_replica);
-    }
+    bool HasNoFReplica() const { return GetPart(0).HasNoFReplica(); }
 
     size_t GetMemReplicaCount() const {
-        return CountReplicas(&Replica::fn_is_memory_replica);
+        return GetPart(0).GetMemReplicaCount();
     }
 
     size_t GetNoFReplicaCount() const {
-        return CountReplicas(&Replica::fn_is_nof_replica);
+        return GetPart(0).GetNoFReplicaCount();
     }
 
     Replica* GetReplicaBySegmentName(const std::string& segment_name) {
-        return GetFirstReplica([&segment_name](const Replica& replica) {
-            auto names = replica.get_segment_names();
-            for (auto& name_opt : names) {
-                if (name_opt == segment_name) {
-                    return true;
-                }
-            }
-            return false;
-        });
+        return MutablePart(0).GetReplicaBySegmentName(segment_name);
     }
 
     // Grant a read lease at now() + ttl. Grouped objects extend the shared
@@ -471,9 +427,8 @@ struct ObjectMetadata {
             return;
         }
         const auto& eligible = pending_soft_pin_action->eligible_replica_ids;
-        const bool has_viable_replica = std::any_of(
-            replicas_.begin(), replicas_.end(),
-            [&eligible](const Replica& replica) {
+        const bool has_viable_replica =
+            HasReplica([&eligible](const Replica& replica) {
                 const bool belongs_to_write = eligible.contains(replica.id());
                 const bool valid_handle = !replica.has_invalid_mem_handle() &&
                                           !replica.has_invalid_nof_handle();
@@ -493,28 +448,21 @@ struct ObjectMetadata {
     // Valid means it has at least one valid replica and size is greater
     // than 0
     bool IsValid() const {
-        return size > 0 && HasReplica([](const Replica& replica) {
+        return GetPart(0).length() > 0 &&
+               HasReplica([](const Replica& replica) {
                    return !replica.is_memory_replica() ||
                           !replica.has_invalid_mem_handle();
                });
     }
 
     std::vector<std::string> GetReplicaSegmentNames() const {
-        std::vector<std::string> segment_names;
-        for (const auto& replica : replicas_) {
-            const auto& segment_name_options = replica.get_segment_names();
-            for (const auto& segment_name_opt : segment_name_options) {
-                if (segment_name_opt.has_value()) {
-                    segment_names.push_back(segment_name_opt.value());
-                }
-            }
-        }
-        return segment_names;
+        return GetPart(0).GetReplicaSegmentNames();
     }
 
    private:
-    // Use the accessors to visit and modify the replicas.
-    std::vector<Replica> replicas_;
+    // The object's content and the replicas holding it. Fixed at one part for
+    // now; the accessors above are the only way to reach it.
+    std::vector<Part> parts_;
 };
 
 }  // namespace mooncake

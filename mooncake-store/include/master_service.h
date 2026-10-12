@@ -1759,6 +1759,10 @@ class MasterService {
     std::condition_variable task_cleanup_cv_;
 
     class MetadataSerializer {
+        // One object's metadata in and out of the payload encoding, so a
+        // compatibility suite can name the fields the format has.
+        friend class test::MasterServiceTestPeer;
+
        public:
         MetadataSerializer(MasterService* service) : service_(service) {}
 

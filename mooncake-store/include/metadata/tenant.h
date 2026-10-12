@@ -127,7 +127,7 @@ class Tenant {
     // after it ends: resolve each key again before mutating anything, since an
     // entry can be replaced under the same key in between. Every handle of the
     // tenant is alive while the result is, so a scan that acts on each object
-    // on its own walks the stripes below instead.
+    // on its own walks the route in chunks below instead.
     [[nodiscard]] std::vector<std::shared_ptr<ObjectEntry>> SnapshotObjects()
         const {
         return object_index_.SnapshotObjects();
@@ -138,12 +138,18 @@ class Tenant {
     // population.
     static constexpr size_t kObjectStripeCount = ObjectIndex::kStripeCount;
 
-    // Strong handles to the objects of one route stripe, with the same
-    // contract as SnapshotObjects for those keys: resolve each entry again
-    // before mutating anything.
-    [[nodiscard]] std::vector<std::shared_ptr<ObjectEntry>> SnapshotStripe(
-        size_t stripe_index) const {
-        return object_index_.SnapshotStripe(stripe_index);
+    // One route stripe at a time, in chunks: see ObjectIndex::VisitStripeChunk
+    // for the contract, including the `bool` the callback returns to say
+    // whether the walk continues.
+    template <typename Fn>
+    void VisitStripeChunk(size_t stripe_index, Fn&& fn) const {
+        object_index_.VisitStripeChunk(stripe_index, std::forward<Fn>(fn));
+    }
+
+    template <typename Fn>
+    void VisitStripeChunk(size_t stripe_index, size_t limit, Fn&& fn) const {
+        object_index_.VisitStripeChunk(stripe_index, limit,
+                                       std::forward<Fn>(fn));
     }
 
     // True when the tenant holds no object and no group membership.

@@ -119,7 +119,7 @@ class DynamicReplicationTest : public ::testing::Test {
                 return Observed{
                     .version_epoch =
                         peer.DynamicReplicationVersionEpoch(metadata),
-                    .size = static_cast<uint64_t>(metadata.size)};
+                    .size = static_cast<uint64_t>(metadata.TotalLength())};
             });
         EXPECT_TRUE(observed.has_value());
         if (observed.has_value()) {

@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cassert>
 
+#include <msgpack.hpp>
+
 #include "ha/snapshot/catalog/snapshot_catalog_store.h"
 #ifdef USE_NOF
 #include "spdk/spdk_wrapper.h"
@@ -23,6 +25,37 @@ void MasterServiceTestPeer::SetBatchOpLogWriterFactoryForTesting(
     assert(factory);
     assert(!service_.ordered_oplog_writer_);
     service_.batch_oplog_writer_factory_ = std::move(factory);
+}
+
+tl::expected<std::vector<uint8_t>, SerializationError>
+MasterServiceTestPeer::SerializeObjectMetadataForTesting(
+    MasterService& service, const ObjectMetadata& metadata) {
+    MetadataSerializer serializer(&service);
+    msgpack::sbuffer buffer;
+    MsgpackPacker packer(&buffer);
+    auto result = serializer.SerializeMetadata(metadata, packer);
+    if (!result) {
+        return tl::unexpected(result.error());
+    }
+    return std::vector<uint8_t>(
+        reinterpret_cast<const uint8_t*>(buffer.data()),
+        reinterpret_cast<const uint8_t*>(buffer.data()) + buffer.size());
+}
+
+tl::expected<std::unique_ptr<ObjectMetadata>, SerializationError>
+MasterServiceTestPeer::DeserializeObjectMetadataForTesting(
+    MasterService& service, const std::vector<uint8_t>& data) {
+    MetadataSerializer serializer(&service);
+    // The handle owns the buffer the object's fields point into, so it stays
+    // alive until the deserialize returns its own copy.
+    auto handle = msgpack::unpack(reinterpret_cast<const char*>(data.data()),
+                                  data.size());
+    return serializer.DeserializeMetadata(handle.get());
+}
+
+std::string MasterServiceTestPeer::SerializeMetadataForOpLogForTesting(
+    MasterService& service, const ObjectMetadata& metadata) {
+    return service.SerializeMetadataForOpLog(metadata);
 }
 
 void MasterServiceTestPeer::RunBatchEvictForTesting(

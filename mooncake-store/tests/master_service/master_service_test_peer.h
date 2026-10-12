@@ -91,6 +91,20 @@ class MasterServiceTestPeer {
 
     uint64_t GetKvClearedSuppressedForTesting() const;
 
+    // One object's metadata in and out of the snapshot payload encoding, and
+    // the OpLog payload built from it. A field the format carries is reachable
+    // only here, so the compatibility suites name it through these.
+    static tl::expected<std::vector<uint8_t>, SerializationError>
+    SerializeObjectMetadataForTesting(MasterService& service,
+                                      const ObjectMetadata& metadata);
+
+    static tl::expected<std::unique_ptr<ObjectMetadata>, SerializationError>
+    DeserializeObjectMetadataForTesting(MasterService& service,
+                                        const std::vector<uint8_t>& data);
+
+    static std::string SerializeMetadataForOpLogForTesting(
+        MasterService& service, const ObjectMetadata& metadata);
+
     void SetNoFProbeFnForTesting(MasterService::NoFProbeFn fn);
 
     size_t GetMountedNoFSegmentCountForTesting();

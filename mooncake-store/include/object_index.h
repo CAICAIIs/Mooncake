@@ -142,10 +142,10 @@ class ObjectIndex {
     // as the keys to resolve again.
     //
     // The handles of every stripe are alive together for as long as the result
-    // is, so this is for a caller that needs the whole population at once. A
-    // caller that walks the route to act on each object on its own takes
-    // SnapshotStripe per stripe instead, which bounds what it holds by a stripe
-    // rather than by the route.
+    // is, so this is for a caller that needs the whole population at once: a
+    // restore, an admin scan, a snapshot. A caller that walks the route to act
+    // on each object on its own uses VisitStripeChunk, which holds a chunk of
+    // one stripe at a time and so does not grow with the route.
     [[nodiscard]] std::vector<std::shared_ptr<ObjectEntry>> SnapshotObjects()
         const {
         // The stripes are counted first so the handles are copied into one
@@ -167,26 +167,70 @@ class ObjectIndex {
         return entries;
     }
 
-    // Collect strong handles to the objects of one stripe, copied into one
-    // allocation sized under that stripe's own lock, which is released before
-    // the result is returned: a caller takes each entry's own mutex with no
-    // route lock held, the same as after SnapshotObjects. A stripe names the
-    // same objects a whole-route snapshot would name for those keys, and the
-    // stripe count bounds what a walk that goes one stripe at a time holds, so
-    // the population of a route does not decide the memory such a walk needs.
-    // An empty stripe yields an empty result, so a caller can walk every stripe
-    // of a sparse route without special casing.
-    [[nodiscard]] std::vector<std::shared_ptr<ObjectEntry>> SnapshotStripe(
-        size_t stripe_index) const {
+    // Walk the objects of one stripe in chunks of at most `limit` handles,
+    // calling `fn(objects)` once per chunk and stopping early when it returns
+    // false. The stripe's lock is held for the copy of a chunk and released
+    // before `fn` runs, so a caller takes each entry's own lock with no route
+    // lock held, the same as after SnapshotObjects, and what the visit holds at
+    // any time is one chunk.
+    //
+    // The chunks follow the route's own iteration order: a chunk starts at the
+    // entry after the one the previous chunk ended on. That position is the key
+    // the previous chunk stopped before, so a caller that erases what it was
+    // handed out -- an eviction does -- still leaves the visit a position to
+    // continue from. A key the route drops in the meantime ends the visit after
+    // one restart from the start of the stripe, which bounds what a route that
+    // keeps dropping that key can cost.
+    static constexpr size_t kStripeChunkObjects = 4096;
+
+    template <typename Fn>
+    void VisitStripeChunk(size_t stripe_index, Fn&& fn) const {
+        VisitStripeChunk(stripe_index, kStripeChunkObjects,
+                         std::forward<Fn>(fn));
+    }
+
+    template <typename Fn>
+    void VisitStripeChunk(size_t stripe_index, size_t limit, Fn&& fn) const {
+        if (limit == 0) {
+            return;
+        }
         assert(stripe_index < kStripeCount);
         const Stripe& stripe = stripes_[stripe_index];
-        std::shared_lock<std::shared_mutex> lock(stripe.lock);
-        std::vector<std::shared_ptr<ObjectEntry>> entries;
-        entries.reserve(stripe.route.size());
-        for (const auto& entry : stripe.route) {
-            entries.push_back(entry.second);
+        std::string resume_key;
+        bool first_chunk = true;
+        bool restarted = false;
+        while (true) {
+            std::vector<std::shared_ptr<ObjectEntry>> chunk;
+            bool has_more = false;
+            {
+                std::shared_lock<std::shared_mutex> lock(stripe.lock);
+                auto it = first_chunk ? stripe.route.begin()
+                                      : stripe.route.find(resume_key);
+                if (!first_chunk && it == stripe.route.end()) {
+                    if (restarted) {
+                        return;
+                    }
+                    restarted = true;
+                    it = stripe.route.begin();
+                }
+                chunk.reserve(std::min(limit, stripe.route.size()));
+                while (it != stripe.route.end() && chunk.size() < limit) {
+                    chunk.push_back(it->second);
+                    ++it;
+                }
+                has_more = it != stripe.route.end();
+                if (has_more) {
+                    resume_key = it->first;
+                }
+            }
+            first_chunk = false;
+            if (chunk.empty()) {
+                return;
+            }
+            if (!std::forward<Fn>(fn)(chunk) || !has_more) {
+                return;
+            }
         }
-        return entries;
     }
 
    private:
