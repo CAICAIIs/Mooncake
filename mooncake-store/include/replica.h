@@ -124,6 +124,12 @@ struct ReplicateConfig {
     // eviction treats the group as a unit (all-or-none). Object routing is
     // always hash(tenant, key) and is decoupled from groups.
     std::optional<std::vector<std::string>> group_ids{};
+    // Which part of the object this write fills, and how many parts the object
+    // has. Both are wire-compatible additions: a client that does not set them
+    // asks for part 0 of a one-part object, which is what every object written
+    // before multi-part objects existed is.
+    struct_pack::compatible<uint32_t, 1> part_index{0};
+    struct_pack::compatible<uint32_t, 2> part_count{1};
 
     ReplicateConfig ForSingleKey(size_t key_index) const {
         ReplicateConfig key_config = *this;
@@ -177,6 +183,8 @@ struct ReplicateConfig {
             }
             os << "]";
         }
+        os << ", part_index: " << config.part_index.value_or(0)
+           << ", part_count: " << config.part_count.value_or(1);
         os << " }";
         return os;
     }

@@ -68,6 +68,13 @@ namespace {
 // so every RPC that touched those keys stalled behind the sweep.
 constexpr size_t kStaleHandleCleanupBatchSize = 64;
 
+// The part scope this build can serve: every object has one part, so part 0 of
+// a one-part object. Any other scope is refused instead of being read as an
+// ordinary object. The multi-part write path widens this.
+bool IsSupportedPartScope(uint32_t part_index, uint32_t part_count) {
+    return part_index == 0 && part_count == 1;
+}
+
 // Per-cycle offload cap as a fraction of `offloading_queue_limit_`. Used only
 // when offload-on-evict mode is active. Defers memory eviction for at most
 // this fraction of the queue limit per BatchEvict cycle; beyond that, eviction
@@ -5407,6 +5414,14 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                              const ReplicateConfig& config)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
+    if (!IsSupportedPartScope(config.part_index.value_or(0),
+                              config.part_count.value_or(1))) {
+        LOG(ERROR) << "key=" << key
+                   << ", part_index=" << config.part_index.value_or(0)
+                   << ", part_count=" << config.part_count.value_or(1)
+                   << ", error=part_scope_not_supported";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     if ((config.replica_num == 0 && config.nof_replica_num == 0 &&
          config.dfs_replica_num == 0) ||
         key.empty() || slice_length == 0) {
@@ -5606,6 +5621,15 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
                            const TenantId& tenant_id, ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
     const auto& key = object_meta.key;
+    // Every object has one part, so a request that completes another part has
+    // nothing to complete. The replica ids an ordinary object's End carries are
+    // accepted and unused: with one part there is one write attempt at a time.
+    const uint32_t part_index = object_meta.part_index.value_or(0);
+    if (part_index != 0) {
+        LOG(ERROR) << "key=" << key << ", part_index=" << part_index
+                   << ", error=part_scope_not_supported";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
     MetadataAccessorRW accessor(this, object_id);

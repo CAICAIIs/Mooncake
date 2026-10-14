@@ -3520,6 +3520,54 @@ TEST_F(MasterServiceTest,
     EXPECT_FALSE(FindClientLivenessForTest(service, client_id));
 }
 
+TEST_F(MasterServiceTest, PutStartRefusesAPartScopeThisBuildCannotServe) {
+    MasterService service;
+    const auto context = PrepareSimpleSegment(service);
+    const UUID client_id = generate_uuid();
+
+    ReplicateConfig multi_part;
+    multi_part.part_count = 2;
+    EXPECT_EQ(service
+                  .PutStart(client_id, "multi_part_key", TenantId::Default(),
+                            1024, multi_part)
+                  .error(),
+              ErrorCode::INVALID_PARAMS);
+
+    ReplicateConfig other_part;
+    other_part.part_index = 1;
+    EXPECT_EQ(service
+                  .PutStart(client_id, "other_part_key", TenantId::Default(),
+                            1024, other_part)
+                  .error(),
+              ErrorCode::INVALID_PARAMS);
+
+    // The ordinary scope still goes through, so the refusal is about the part
+    // scope and not about PutStart itself.
+    EXPECT_TRUE(service
+                    .PutStart(client_id, "ordinary_key", TenantId::Default(),
+                              1024, ReplicateConfig{})
+                    .has_value());
+}
+
+TEST_F(MasterServiceTest, PutEndRefusesAPartOtherThanPartZero) {
+    MasterService service;
+    const auto context = PrepareSimpleSegment(service);
+    const UUID client_id = generate_uuid();
+    const std::string key = "end_other_part_key";
+    ASSERT_TRUE(service
+                    .PutStart(client_id, key, TenantId::Default(), 1024,
+                              ReplicateConfig{})
+                    .has_value());
+
+    ObjectMeta other_part{key, std::nullopt};
+    other_part.part_index = 1;
+    EXPECT_EQ(service
+                  .PutEnd(client_id, other_part, TenantId::Default(),
+                          ReplicaType::ALL)
+                  .error(),
+              ErrorCode::INVALID_PARAMS);
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {

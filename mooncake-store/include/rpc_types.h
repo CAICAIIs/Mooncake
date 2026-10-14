@@ -11,8 +11,13 @@ namespace mooncake {
 struct ObjectMeta {
     std::string key;
     std::optional<uint64_t> object_checksum;
+    // Which part this request completes or revokes, and the replicas the write
+    // attempt allocated. A client that does not set them completes part 0 of a
+    // one-part object, unscoped by replica id.
+    struct_pack::compatible<uint32_t, 1> part_index{0};
+    struct_pack::compatible<std::vector<ReplicaID>, 2> replica_ids{};
 };
-YLT_REFL(ObjectMeta, key, object_checksum);
+YLT_REFL(ObjectMeta, key, object_checksum, part_index, replica_ids);
 
 enum class ReplicaActionType {
     ADD = 0,
@@ -84,6 +89,10 @@ struct GetReplicaListResponse {
     // the exact scope the write path used. Empty when the master predates
     // this field.
     struct_pack::compatible<std::string, 1> resolved_tenant_id;
+    // How many parts the object has. 1 for every object written before
+    // multi-part objects existed, which is also the value an older master
+    // leaves here.
+    struct_pack::compatible<uint32_t, 2> part_count{1};
 
     GetReplicaListResponse() : lease_ttl_ms(0) {}
     GetReplicaListResponse(
@@ -95,7 +104,7 @@ struct GetReplicaListResponse {
           object_checksum(object_checksum_param) {}
 };
 YLT_REFL(GetReplicaListResponse, replicas, lease_ttl_ms, object_checksum,
-         resolved_tenant_id);
+         resolved_tenant_id, part_count);
 
 struct CachedQueryResultResponse {
     bool success;

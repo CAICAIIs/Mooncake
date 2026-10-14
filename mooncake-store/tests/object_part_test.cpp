@@ -228,4 +228,54 @@ TEST_F(OplogPayloadTest, TheOplogPayloadCarriesTheEnvelopeFields) {
     EXPECT_FALSE(payload.hard_pinned.value_or(true));
 }
 
+// The bytes a client that predates the part fields sends: the same fields in
+// the same order, without them.
+struct LegacyObjectMeta {
+    std::string key;
+    std::optional<uint64_t> object_checksum;
+};
+YLT_REFL(LegacyObjectMeta, key, object_checksum);
+
+TEST(PartWireTest, ALegacyObjectMetaLeavesThePartScopeUnset) {
+    const LegacyObjectMeta legacy{"part-wire-key", kChecksum};
+    const auto bytes = struct_pack::serialize(legacy);
+
+    ObjectMeta decoded;
+    ASSERT_EQ(struct_pack::deserialize_to(decoded, bytes),
+              struct_pack::errc::ok);
+    EXPECT_EQ(decoded.key, "part-wire-key");
+    EXPECT_EQ(decoded.object_checksum.value_or(0), kChecksum);
+    // The old layout carries no part scope, so what the reader sees is the
+    // ordinary one: part 0, unscoped by replica id.
+    EXPECT_FALSE(decoded.part_index.has_value());
+    EXPECT_EQ(decoded.part_index.value_or(0), 0u);
+    EXPECT_FALSE(decoded.replica_ids.has_value());
+}
+
+TEST(PartWireTest, AnObjectMetaCarriesItsPartScope) {
+    ObjectMeta meta{"part-wire-key", std::nullopt};
+    meta.part_index = 3;
+    meta.replica_ids = std::vector<ReplicaID>{7, 8};
+    const auto bytes = struct_pack::serialize(meta);
+
+    ObjectMeta decoded;
+    ASSERT_EQ(struct_pack::deserialize_to(decoded, bytes),
+              struct_pack::errc::ok);
+    EXPECT_EQ(decoded.part_index.value_or(0), 3u);
+    EXPECT_EQ(decoded.replica_ids, (std::vector<ReplicaID>{7, 8}));
+}
+
+TEST(PartWireTest, AReplicateConfigDefaultsToPartZeroOfOnePart) {
+    const ReplicateConfig config{};
+    EXPECT_EQ(config.part_index.value_or(99u), 0u);
+    EXPECT_EQ(config.part_count.value_or(99u), 1u);
+
+    const auto bytes = struct_pack::serialize(config);
+    ReplicateConfig decoded;
+    ASSERT_EQ(struct_pack::deserialize_to(decoded, bytes),
+              struct_pack::errc::ok);
+    EXPECT_EQ(decoded.part_index.value_or(99u), 0u);
+    EXPECT_EQ(decoded.part_count.value_or(99u), 1u);
+}
+
 }  // namespace mooncake
