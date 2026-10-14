@@ -1546,6 +1546,20 @@ class MasterService {
         bool* dfs_allocation_failed = nullptr)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
+    // Helper: allocate the replicas of one part of an object that already
+    // exists, insert the part into its slot, and return its descriptors. The
+    // object's other parts are left untouched. Shared by PutStart.
+    auto AllocateAndInsertPart(MetadataShardAccessorRW& shard,
+                               TenantState& tenant_state,
+                               ObjectMap::iterator it, const UUID& client_id,
+                               const std::string& key, uint32_t part_index,
+                               uint32_t part_count, uint64_t value_length,
+                               const ReplicateConfig& config,
+                               const std::string& writer_host_id,
+                               const std::chrono::system_clock::time_point& now,
+                               bool* dfs_allocation_failed)
+        -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
+
     /**
      * @brief Helper to discard expired processing keys.
      */
@@ -2064,6 +2078,8 @@ class MasterService {
     const bool enable_disk_eviction_;
     const uint64_t quota_bytes_;
     const bool enable_multi_tenants_;
+    // Serve objects whose content is written by several writers, one part each.
+    const bool enable_multi_part_objects_;
     TenantQuotaManager tenant_quota_manager_{
         [this] { return GetTenantQuotaAllocatableCapacityBytes(); }};
 
@@ -2374,9 +2390,18 @@ class MasterService {
     bool TryGetReadableReplicaDescriptor(const Replica& replica,
                                          Replica::Descriptor& descriptor) const;
     std::vector<Replica::Descriptor> GetReadableReplicaDescriptors(
-        const ObjectMetadata& metadata) const;
+        const ObjectPart& part) const;
     bool IsReplicaReadable(const Replica& replica) const;
-    bool HasReadableReplica(const ObjectMetadata& metadata) const;
+    // A replica of this part that a reader can use.
+    bool HasReadableReplica(const ObjectPart& part) const;
+    // Every slot holds a part, and every part has a replica a reader can use.
+    // This is what makes an object readable: ExistKey, GetReplicaList, the
+    // stored event and the reaper all ask it.
+    bool IsReadable(const ObjectMetadata& metadata) const;
+    // The part a read that names no part sees: part 0 of a one-part object.
+    // An object written in several parts has no single answer for a read that
+    // names none, so such a read is refused rather than answered with part 0.
+    const ObjectPart* LegacyReadPart(const ObjectMetadata& metadata) const;
     bool IsEvictableMemoryReplica(const Replica& replica) const;
 
     /**

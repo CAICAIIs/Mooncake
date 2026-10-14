@@ -68,11 +68,11 @@ namespace {
 // so every RPC that touched those keys stalled behind the sweep.
 constexpr size_t kStaleHandleCleanupBatchSize = 64;
 
-// The part scope this build can serve: every object has one part, so part 0 of
-// a one-part object. Any other scope is refused instead of being read as an
-// ordinary object. The multi-part write path widens this.
-bool IsSupportedPartScope(uint32_t part_index, uint32_t part_count) {
-    return part_index == 0 && part_count == 1;
+// The part scope a request asks for is usable when the index is inside the
+// count and the count stays within the bound one object may be split into.
+bool IsPartScopeValid(uint32_t part_index, uint32_t part_count) {
+    return part_count >= 1 && part_count <= MAX_PART_COUNT &&
+           part_index < part_count;
 }
 
 // Per-cycle offload cap as a fraction of `offloading_queue_limit_`. Used only
@@ -211,6 +211,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
       enable_disk_eviction_(config.enable_disk_eviction),
       quota_bytes_(config.quota_bytes),
       enable_multi_tenants_(config.enable_multi_tenants),
+      enable_multi_part_objects_(config.enable_multi_part_objects),
       segment_manager_(config.memory_allocator, config.enable_cxl),
       nof_segment_manager_(config.memory_allocator),
       memory_allocator_type_(config.memory_allocator),
@@ -1246,13 +1247,21 @@ bool MasterService::TenantHasObjects(const TenantId& tenant_id) const {
 
 uint64_t MasterService::CompletedMemoryQuotaCharge(
     const ObjectMetadata& metadata) const {
-    const auto completed_replicas =
-        metadata.CountReplicas([](const Replica& replica) {
-            return replica.is_memory_replica() && replica.is_completed();
-        });
-    const unsigned __int128 charge =
-        static_cast<unsigned __int128>(metadata.TotalLength()) *
-        completed_replicas;
+    // Quota is charged per part: a part's length times the completed memory
+    // replicas of that part.
+    unsigned __int128 charge = 0;
+    for (size_t i = 0; i < metadata.PartCount(); ++i) {
+        const ObjectPart* part = metadata.GetPart(i);
+        if (part == nullptr) {
+            continue;
+        }
+        const auto completed_replicas =
+            std::ranges::count_if(part->replicas(), [](const Replica& replica) {
+                return replica.is_memory_replica() && replica.is_completed();
+            });
+        charge += static_cast<unsigned __int128>(part->length()) *
+                  static_cast<size_t>(completed_replicas);
+    }
     return charge > std::numeric_limits<uint64_t>::max()
                ? std::numeric_limits<uint64_t>::max()
                : static_cast<uint64_t>(charge);
@@ -1572,17 +1581,38 @@ MasterService::GroupEvictionResult MasterService::EvictGroupOrObject(
 
 bool MasterService::HasCompletedMemoryCacheReplica(
     const ObjectMetadata& metadata) {
-    return metadata.HasReplica([](const Replica& replica) {
-        return replica.is_memory_replica() && replica.is_completed();
-    });
+    // The question is about the object, so it is answered over every part that
+    // has been written.
+    for (size_t i = 0; i < metadata.PartCount(); ++i) {
+        const ObjectPart* part = metadata.GetPart(i);
+        if (part == nullptr) {
+            continue;
+        }
+        if (std::ranges::any_of(part->replicas(), [](const Replica& replica) {
+                return replica.is_memory_replica() && replica.is_completed();
+            })) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool MasterService::HasCompletedDiskCacheReplica(
     const ObjectMetadata& metadata) {
-    return metadata.HasReplica([](const Replica& replica) {
-        return (replica.is_disk_replica() || replica.is_local_disk_replica()) &&
-               replica.is_completed();
-    });
+    for (size_t i = 0; i < metadata.PartCount(); ++i) {
+        const ObjectPart* part = metadata.GetPart(i);
+        if (part == nullptr) {
+            continue;
+        }
+        if (std::ranges::any_of(part->replicas(), [](const Replica& replica) {
+                return (replica.is_disk_replica() ||
+                        replica.is_local_disk_replica()) &&
+                       replica.is_completed();
+            })) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void MasterService::SyncCacheTotalAccounting(ObjectMetadata& metadata) {
@@ -3010,7 +3040,7 @@ auto MasterService::ExistKeyImpl(const std::string& key,
     }
 
     const auto& metadata = accessor.Get();
-    if (!HasReadableReplica(metadata)) {
+    if (!IsReadable(metadata)) {
         return false;
     }
 
@@ -3084,7 +3114,7 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKeyImpl(
             }
 
             const auto& metadata = it->second.metadata;
-            if (!HasReadableReplica(metadata)) {
+            if (!IsReadable(metadata)) {
                 results[i] = false;
                 continue;
             }
@@ -3110,7 +3140,7 @@ auto MasterService::GetAllKeys(const TenantId& tenant_id)
             continue;
         }
         for (const auto& item : tenant_it->second.metadata) {
-            if (!HasReadableReplica(item.second.metadata)) {
+            if (!IsReadable(item.second.metadata)) {
                 continue;
             }
             all_keys.push_back(item.second.metadata.user_key.empty()
@@ -4440,6 +4470,16 @@ auto MasterService::BatchReplicaClear(
         auto& metadata = accessor.Get();
         const auto previous_kv_media = KvMediaSnapshot(metadata);
 
+        // The ownership check below is object-level, and an object written in
+        // several parts has no single writer to match: clearing is scoped to
+        // one part's attempt, which this call cannot name.
+        if (metadata.PartCount() > 1) {
+            LOG(WARNING) << "BatchReplicaClear: tenant=" << normalized_tenant
+                         << " key=" << key << " has " << metadata.PartCount()
+                         << " parts, skipping";
+            continue;
+        }
+
         // Security check: Ensure the requesting client owns the object.
         if (metadata.ClientId() != client_id) {
             LOG(WARNING) << "BatchReplicaClear: tenant=" << normalized_tenant
@@ -4652,17 +4692,15 @@ bool MasterService::TryGetReadableReplicaDescriptor(
 }
 
 std::vector<Replica::Descriptor> MasterService::GetReadableReplicaDescriptors(
-    const ObjectMetadata& metadata) const {
+    const ObjectPart& part) const {
     std::vector<Replica::Descriptor> descriptors;
-    descriptors.reserve(metadata.CountReplicas());
-    metadata.VisitReplicas(
-        [](const Replica&) { return true; },
-        [this, &descriptors](const Replica& replica) {
-            Replica::Descriptor descriptor;
-            if (TryGetReadableReplicaDescriptor(replica, descriptor)) {
-                descriptors.push_back(std::move(descriptor));
-            }
-        });
+    descriptors.reserve(part.replicas().size());
+    for (const auto& replica : part.replicas()) {
+        Replica::Descriptor descriptor;
+        if (TryGetReadableReplicaDescriptor(replica, descriptor)) {
+            descriptors.push_back(std::move(descriptor));
+        }
+    }
     return descriptors;
 }
 
@@ -4671,9 +4709,28 @@ bool MasterService::IsReplicaReadable(const Replica& replica) const {
            !IsAwaitingRemount(replica);
 }
 
-bool MasterService::HasReadableReplica(const ObjectMetadata& metadata) const {
-    return metadata.HasReplica(
-        [this](const Replica& replica) { return IsReplicaReadable(replica); });
+bool MasterService::HasReadableReplica(const ObjectPart& part) const {
+    return std::ranges::any_of(part.replicas(), [this](const Replica& replica) {
+        return IsReplicaReadable(replica);
+    });
+}
+
+bool MasterService::IsReadable(const ObjectMetadata& metadata) const {
+    for (size_t i = 0; i < metadata.PartCount(); ++i) {
+        const ObjectPart* part = metadata.GetPart(i);
+        if (part == nullptr || !HasReadableReplica(*part)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+const ObjectPart* MasterService::LegacyReadPart(
+    const ObjectMetadata& metadata) const {
+    if (metadata.PartCount() != 1) {
+        return nullptr;
+    }
+    return metadata.GetPart(0);
 }
 
 bool MasterService::IsEvictableMemoryReplica(const Replica& replica) const {
@@ -4708,7 +4765,13 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern,
         for (const auto& [key, record] : tenant_it->second.metadata) {
             const auto& metadata = record.metadata;
             if (std::regex_search(key, pattern)) {
-                auto replica_list = GetReadableReplicaDescriptors(metadata);
+                const ObjectPart* part = LegacyReadPart(metadata);
+                if (part == nullptr) {
+                    LOG(ERROR)
+                        << "key=" << key << ", error=part_index_required";
+                    continue;
+                }
+                auto replica_list = GetReadableReplicaDescriptors(*part);
 
                 if (replica_list.empty()) {
                     LOG(WARNING)
@@ -4746,8 +4809,13 @@ auto MasterService::GetReplicaList(const std::string& key,
             return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
         }
         const auto& metadata = accessor.Get();
+        const ObjectPart* part = LegacyReadPart(metadata);
+        if (part == nullptr) {
+            LOG(ERROR) << "key=" << key << ", error=part_index_required";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
 
-        auto replica_list = GetReadableReplicaDescriptors(metadata);
+        auto replica_list = GetReadableReplicaDescriptors(*part);
         if (dfs_allocator_) {
             for (const auto& replica : replica_list) {
                 if (replica.is_dfs_replica()) {
@@ -4812,10 +4880,11 @@ auto MasterService::GetReplicaList(const std::string& key,
                 dynamic_replication_.WantsAnotherMemoryReplica(memory_replicas);
         }
 
-        const ObjectPart* part = metadata.GetPart(0);
+        const ObjectPart* checksum_part = LegacyReadPart(metadata);
         resp = GetReplicaListResponse(
             std::move(replica_list), default_kv_lease_ttl_,
-            part != nullptr ? part->checksum() : std::nullopt);
+            checksum_part != nullptr ? checksum_part->checksum()
+                                     : std::nullopt);
     }
     // RO accessor released. Safe to take a fresh RW accessor now.
     if (promotion_eligible) {
@@ -4843,17 +4912,22 @@ auto MasterService::GetReplicaListForAdmin(const std::string& key,
     }
     const auto& metadata = accessor.Get();
 
-    auto replica_list = GetReadableReplicaDescriptors(metadata);
+    const ObjectPart* part = LegacyReadPart(metadata);
+    if (part == nullptr) {
+        LOG(ERROR) << "key=" << key << ", error=part_index_required";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto replica_list = GetReadableReplicaDescriptors(*part);
 
     if (replica_list.empty()) {
         LOG(WARNING) << "key=" << key << ", error=replica_not_ready";
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
 
-    const ObjectPart* part = metadata.GetPart(0);
+    const ObjectPart* checksum_part = LegacyReadPart(metadata);
     return GetReplicaListResponse(
         std::move(replica_list), default_kv_lease_ttl_,
-        part != nullptr ? part->checksum() : std::nullopt);
+        checksum_part != nullptr ? checksum_part->checksum() : std::nullopt);
 }
 
 std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
@@ -4921,7 +4995,15 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                 }
 
                 const auto& metadata = metadata_it->second.metadata;
-                auto replica_list = GetReadableReplicaDescriptors(metadata);
+                const ObjectPart* part = LegacyReadPart(metadata);
+                if (part == nullptr) {
+                    LOG(ERROR)
+                        << "key=" << key << ", error=part_index_required";
+                    results[original_idx] =
+                        tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                    continue;
+                }
+                auto replica_list = GetReadableReplicaDescriptors(*part);
 
                 if (dfs_allocator_) {
                     for (const auto& replica : replica_list) {
@@ -4997,10 +5079,11 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                     }
                 }
 
-                const ObjectPart* part = metadata.GetPart(0);
+                const ObjectPart* checksum_part = LegacyReadPart(metadata);
                 results[original_idx] = GetReplicaListResponse(
                     std::move(replica_list), default_kv_lease_ttl_,
-                    part != nullptr ? part->checksum() : std::nullopt);
+                    checksum_part != nullptr ? checksum_part->checksum()
+                                             : std::nullopt);
             }
         }
 
@@ -5075,7 +5158,15 @@ MasterService::BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
                 }
 
                 const auto& metadata = metadata_it->second.metadata;
-                auto replica_list = GetReadableReplicaDescriptors(metadata);
+                const ObjectPart* part = LegacyReadPart(metadata);
+                if (part == nullptr) {
+                    LOG(ERROR)
+                        << "key=" << key << ", error=part_index_required";
+                    results[original_idx] =
+                        tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                    continue;
+                }
+                auto replica_list = GetReadableReplicaDescriptors(*part);
 
                 if (replica_list.empty()) {
                     results[original_idx] =
@@ -5083,10 +5174,11 @@ MasterService::BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
                     continue;
                 }
 
-                const ObjectPart* part = metadata.GetPart(0);
+                const ObjectPart* checksum_part = LegacyReadPart(metadata);
                 results[original_idx] = GetReplicaListResponse(
                     std::move(replica_list), default_kv_lease_ttl_,
-                    part != nullptr ? part->checksum() : std::nullopt);
+                    checksum_part != nullptr ? checksum_part->checksum()
+                                             : std::nullopt);
             }
         }
     }
@@ -5330,7 +5422,8 @@ auto MasterService::InsertMetadata(
         std::forward_as_tuple(client_id, now, value_length, std::move(replicas),
                               std::move(committed_soft_pin_timeout),
                               config.with_hard_pin, config.data_type, group_id,
-                              tenant_id, key));
+                              tenant_id, key, config.part_index.value_or(0),
+                              config.part_count.value_or(1)));
     if (!inserted) {
         FreeDfsReplicas(key, replicas);
         return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
@@ -5408,18 +5501,141 @@ auto MasterService::AllocateAndInsertMetadata(
     return insert_result;
 }
 
+auto MasterService::AllocateAndInsertPart(
+    MetadataShardAccessorRW& shard, TenantState& tenant_state,
+    ObjectMap::iterator it, const UUID& client_id, const std::string& key,
+    uint32_t part_index, uint32_t part_count, uint64_t value_length,
+    const ReplicateConfig& config, const std::string& writer_host_id,
+    const std::chrono::system_clock::time_point& now,
+    bool* dfs_allocation_failed)
+    -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
+    (void)shard;
+    auto& metadata = it->second.metadata;
+    if (metadata.PartCount() != part_count) {
+        LOG(ERROR) << "key=" << key << ", part_count=" << part_count
+                   << ", existing_part_count=" << metadata.PartCount()
+                   << ", error=part_count_mismatch";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    const ObjectPart* existing_part = metadata.GetPart(part_index);
+    const ObjectMetadata::PartWrite* existing_write =
+        metadata.CurrentPartWrite(part_index);
+    if (existing_part != nullptr) {
+        // The part is already written: this is the deduplication the caller
+        // treats as success.
+        if (std::ranges::any_of(existing_part->replicas(),
+                                &Replica::is_completed)) {
+            return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+        }
+        // An attempt that has not reached its discard timeout still owns the
+        // part.
+        if (existing_part->IsWriting() && existing_write != nullptr &&
+            existing_write->put_start_time + put_start_discard_timeout_sec_ >=
+                now) {
+            return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+        }
+        // The attempt timed out. Its PROCESSING replicas move to the quarantine
+        // so an in-flight write cannot land in freed memory, and the slot is
+        // rebuilt by this writer below.
+        auto discarded = metadata.MutablePart(part_index)
+                             ->PopReplicas(&Replica::fn_is_processing);
+        SyncCacheTotalAccounting(metadata);
+        if (!discarded.empty()) {
+            FreeDfsReplicas(key, discarded);
+            const auto release_at = existing_write != nullptr
+                                        ? existing_write->put_start_time +
+                                              put_start_release_timeout_sec_
+                                        : now + put_start_release_timeout_sec_;
+            std::lock_guard lock(discarded_replicas_mutex_);
+            discarded_replicas_.emplace_back(std::move(discarded), release_at);
+        }
+    }
+
+    const uint64_t pending_quota_charge =
+        RequestedMemoryQuotaCharge(value_length, config);
+    auto quota_result = ChargeTenantQuota(
+        GetBoundTenantQuotaHandle(tenant_state), pending_quota_charge);
+    if (!quota_result) {
+        return tl::make_unexpected(quota_result.error());
+    }
+
+    auto allocation_result = AllocateReplicas(
+        key, value_length, config, writer_host_id, dfs_allocation_failed);
+    if (!allocation_result) {
+        ReleaseTenantQuota(GetBoundTenantQuotaHandle(tenant_state),
+                           pending_quota_charge);
+        return tl::make_unexpected(allocation_result.error());
+    }
+
+    std::vector<Replica::Descriptor> replica_list;
+    std::unordered_set<ReplicaID> replica_ids;
+    replica_list.reserve(allocation_result->size());
+    replica_ids.reserve(allocation_result->size());
+    for (const auto& replica : allocation_result.value()) {
+        replica_list.emplace_back(replica.get_descriptor());
+        replica_ids.insert(replica.id());
+    }
+
+    metadata.BeginPart(part_index, value_length,
+                       std::move(allocation_result.value()));
+    metadata.BeginPartWrite(part_index, client_id, std::move(replica_ids), now);
+
+    if (enable_multi_tenants_) {
+        auto adopt_result = metadata.quota_ledger.AdoptPendingCharge(
+            GetBoundTenantQuotaHandle(tenant_state), pending_quota_charge);
+        if (!adopt_result) {
+            LogTenantQuotaLedgerError(adopt_result, "adopt_pending",
+                                      metadata.tenant_id, key);
+            // Nothing of this attempt survives: the part is dropped and its
+            // quota charge released, so a later writer starts clean.
+            auto failed_replicas =
+                metadata.MutablePart(part_index)->PopReplicas();
+            FreeDfsReplicas(key, failed_replicas);
+            metadata.AbortPartWrite(part_index);
+            ReleaseTenantQuota(GetBoundTenantQuotaHandle(tenant_state),
+                               pending_quota_charge);
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+    }
+
+    it->second.state.is_processing = true;
+    SyncCacheTotalAccounting(metadata);
+    return replica_list;
+}
+
 auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                              const TenantId& tenant_id,
                              const uint64_t slice_length,
                              const ReplicateConfig& config)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
-    if (!IsSupportedPartScope(config.part_index.value_or(0),
-                              config.part_count.value_or(1))) {
-        LOG(ERROR) << "key=" << key
-                   << ", part_index=" << config.part_index.value_or(0)
-                   << ", part_count=" << config.part_count.value_or(1)
-                   << ", error=part_scope_not_supported";
+    const uint32_t part_index = config.part_index.value_or(0);
+    const uint32_t part_count = config.part_count.value_or(1);
+    if (!IsPartScopeValid(part_index, part_count)) {
+        LOG(ERROR) << "key=" << key << ", part_index=" << part_index
+                   << ", part_count=" << part_count
+                   << ", error=invalid_part_scope";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (part_count > 1 && !enable_multi_part_objects_) {
+        LOG(ERROR) << "key=" << key << ", part_count=" << part_count
+                   << ", error=multi_part_objects_disabled";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (part_count > 1 &&
+        (config.nof_replica_num > 0 || config.dfs_replica_num > 0)) {
+        LOG(ERROR) << "key=" << key << ", part_count=" << part_count
+                   << ", nof_replica_num=" << config.nof_replica_num
+                   << ", dfs_replica_num=" << config.dfs_replica_num
+                   << ", error=multi_part_requires_memory_replicas";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (part_count > 1 && (enable_ha_ || enable_oplog_)) {
+        // Persistence and HA still serialize an object as one part, so they
+        // cannot record an object written in several.
+        LOG(ERROR) << "key=" << key << ", part_count=" << part_count
+                   << ", error=multi_part_not_supported_with_persistence";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     if ((config.replica_num == 0 && config.nof_replica_num == 0 &&
@@ -5549,6 +5765,14 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                     }
                 }
                 if (it != tenant_state.metadata.end()) {
+                    if (part_count > 1) {
+                        // The object exists and this write fills one of its
+                        // parts: the other parts stay as they are.
+                        return AllocateAndInsertPart(
+                            shard, tenant_state, it, client_id, key, part_index,
+                            part_count, slice_length, config, writer_host_id,
+                            now, &dfs_allocation_failed);
+                    }
                     auto& metadata = it->second.metadata;
                     if (metadata.HasReplica(&Replica::fn_is_completed) ||
                         metadata.PutStartTime() +
@@ -5621,15 +5845,13 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
                            const TenantId& tenant_id, ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
     const auto& key = object_meta.key;
-    // Every object has one part, so a request that completes another part has
-    // nothing to complete. The replica ids an ordinary object's End carries are
-    // accepted and unused: with one part there is one write attempt at a time.
     const uint32_t part_index = object_meta.part_index.value_or(0);
-    if (part_index != 0) {
-        LOG(ERROR) << "key=" << key << ", part_index=" << part_index
-                   << ", error=part_scope_not_supported";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
+    // The replicas this attempt allocated scope the completion: a late End from
+    // an attempt whose replicas were reallocated by a later PutStart must not
+    // complete the new ones. An ordinary object's End carries no scope, and
+    // there is one write attempt at a time for it.
+    const bool scope_by_replica_ids = object_meta.replica_ids.has_value() &&
+                                      !object_meta.replica_ids->empty();
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
     MetadataAccessorRW accessor(this, object_id);
@@ -5639,13 +5861,33 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
     }
 
     auto& metadata = accessor.Get();
-    if (client_id != metadata.ClientId()) {
+    if (part_index >= metadata.PartCount()) {
+        LOG(ERROR) << "key=" << key << ", part_index=" << part_index
+                   << ", part_count=" << metadata.PartCount()
+                   << ", error=part_index_out_of_range";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    ObjectPart* part = metadata.MutablePart(part_index);
+    const ObjectMetadata::PartWrite* write =
+        metadata.CurrentPartWrite(part_index);
+    if (part == nullptr || write == nullptr) {
+        LOG(ERROR) << "key=" << key << ", part_index=" << part_index
+                   << ", error=no_write_in_progress";
+        return tl::make_unexpected(ErrorCode::INVALID_WRITE);
+    }
+    if (client_id != write->client_id) {
         LOG(ERROR) << "Illegal client " << client_id << " to PutEnd key " << key
-                   << ", was PutStart-ed by " << metadata.ClientId();
+                   << " part " << part_index << ", was PutStart-ed by "
+                   << write->client_id;
         return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
     }
 
-    auto is_target_replica = [replica_type](const Replica& replica) {
+    auto is_target_replica = [&](const Replica& replica) {
+        if (scope_by_replica_ids &&
+            std::ranges::find(*object_meta.replica_ids, replica.id()) ==
+                object_meta.replica_ids->end()) {
+            return false;
+        }
         if (replica_type == ReplicaType::ALL) {
             return (replica.is_memory_replica() &&
                     !replica.has_invalid_mem_handle()) ||
@@ -5671,7 +5913,7 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
     if (!accessor.InProcessing()) {
         bool has_target_replica = false;
         bool all_target_replicas_complete = true;
-        for (const auto& replica : metadata.GetAllReplicas()) {
+        for (const auto& replica : part->replicas()) {
             if (!is_target_replica(replica)) {
                 continue;
             }
@@ -5691,13 +5933,11 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
     if (bucket_allocator_ != nullptr && (replica_type == ReplicaType::ALL ||
                                          replica_type == ReplicaType::DFS)) {
         std::vector<DistributedFSDescriptor> pending_descriptors;
-        metadata.VisitReplicas(
-            [](const Replica& replica) {
-                return replica.is_dfs_replica() && replica.is_processing();
-            },
-            [&pending_descriptors](const Replica& replica) {
+        for (const auto& replica : part->replicas()) {
+            if (replica.is_dfs_replica() && replica.is_processing()) {
                 pending_descriptors.push_back(replica.get_dfs_descriptor());
-            });
+            }
+        }
         for (const auto& descriptor : pending_descriptors) {
             if (!bucket_allocator_->MarkCommitted(key, descriptor)) {
                 LOG(ERROR) << "key=" << key
@@ -5708,27 +5948,40 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         }
     }
 
+    const bool was_readable = IsReadable(metadata);
     const bool had_completed_replica =
-        metadata.HasReplica(&Replica::fn_is_completed);
+        std::ranges::any_of(part->replicas(), &Replica::fn_is_completed);
     bool completed_pending_replica = false;
-    metadata.VisitReplicas(
-        [&is_target_replica](const Replica& replica) {
-            return replica.is_processing() && is_target_replica(replica);
-        },
-        [this, &key, &metadata, &completed_pending_replica](Replica& replica) {
-            if (replica.is_processing() &&
-                metadata.PendingSoftPinOwnsReplica(replica.id())) {
-                completed_pending_replica = true;
-            }
-            replica.mark_complete();
-            if (replica.is_dfs_replica() && dfs_allocator_) {
-                const auto& desc = replica.get_dfs_descriptor();
-                dfs_allocator_->UpdateAccess(key, desc);
-            }
-        });
+    size_t matched_replicas = 0;
+    for (auto& replica : part->replicas()) {
+        if (!is_target_replica(replica)) {
+            continue;
+        }
+        ++matched_replicas;
+        if (!replica.is_processing()) {
+            continue;
+        }
+        if (metadata.PendingSoftPinOwnsReplica(replica.id())) {
+            completed_pending_replica = true;
+        }
+        replica.mark_complete();
+        if (replica.is_dfs_replica() && dfs_allocator_) {
+            const auto& desc = replica.get_dfs_descriptor();
+            dfs_allocator_->UpdateAccess(key, desc);
+        }
+    }
+
+    // The request named replicas this attempt did not allocate, so it belongs
+    // to a write whose replicas were reallocated: completing anything here
+    // would publish the new writer's buffers.
+    if (scope_by_replica_ids && matched_replicas == 0) {
+        LOG(ERROR) << "key=" << key << ", part_index=" << part_index
+                   << ", error=replica_scope_mismatch";
+        return tl::make_unexpected(ErrorCode::INVALID_WRITE);
+    }
 
     if (!had_completed_replica && completed_pending_replica &&
-        metadata.HasReplica(&Replica::fn_is_completed)) {
+        std::ranges::any_of(part->replicas(), &Replica::fn_is_completed)) {
         const auto soft_pin_result =
             metadata.CommitPendingSoftPin(std::chrono::system_clock::now());
         ApplySoftPinEvaluation(metadata, soft_pin_result);
@@ -5738,10 +5991,12 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         replica_type == ReplicaType::ALL ||
         replica_type == ReplicaType::MEMORY ||
         replica_type == ReplicaType::NOF_SSD) {
-        if (ObjectPart* part = metadata.MutablePart(0); part != nullptr) {
-            part->SetChecksum(object_meta.object_checksum);
-        }
+        part->SetChecksum(object_meta.object_checksum);
     }
+
+    // The write attempt is over: the part keeps its writer and start time, and
+    // drops the replica scope this End was matched against.
+    metadata.FinishPartWrite(part_index);
 
     auto settle_result =
         SettlePrimaryWriteQuotaIfReady(accessor.GetTenantState(), metadata);
@@ -5749,8 +6004,11 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         return tl::make_unexpected(settle_result.error());
     }
 
+    // Offload mirrors an ordinary object's content into one file, so an object
+    // written in several parts is left to the memory replicas it has.
     if (replica_type != ReplicaType::DFS && enable_offload_ &&
-        !offload_on_evict_ && !metadata.HasReplica([](const Replica& replica) {
+        !offload_on_evict_ && metadata.PartCount() == 1 &&
+        !metadata.HasReplica([](const Replica& replica) {
             return replica.is_dfs_replica() && replica.is_processing();
         })) {
         auto& state = accessor.GetState();
@@ -5777,16 +6035,26 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         }
     }
 
-    // If the object is completed, remove it from the processing set.
-    if (metadata.AllReplicas(&Replica::fn_is_completed) &&
-        accessor.InProcessing()) {
+    // The object is no longer being written when no part has work left. An
+    // ordinary object's replicas are the whole object, so its own condition
+    // keeps saying when the write is over.
+    const bool write_finished =
+        metadata.PartCount() == 1
+            ? metadata.AllReplicas(&Replica::fn_is_completed)
+            : !metadata.HasWriteInFlight();
+    if (write_finished && accessor.InProcessing()) {
         accessor.EraseFromProcessing();
     }
 
     SyncCacheTotalAccounting(metadata);
     // TODO: add inc_nof_cache_nums() (ranhaojia)
     metadata.GrantReadLease(std::chrono::milliseconds::zero());
-    PublishKvStored(key, metadata, object_id.tenant_id);
+    // The stored event marks the object becoming readable, which for an object
+    // written in several parts is the part that completes it, not the first one
+    // to arrive.
+    if (!was_readable && IsReadable(metadata)) {
+        PublishKvStored(key, metadata, object_id.tenant_id);
+    }
 
     if (enable_oplog_ && ordered_oplog_writer_) {
         std::string payload = SerializeMetadataForOpLog(metadata);
@@ -5946,6 +6214,14 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
 
     auto& metadata = accessor.Get();
     const auto previous_kv_media = KvMediaSnapshot(metadata);
+    // This call revokes through the object's own writer. An object written in
+    // several parts has one writer per part, so the request is refused rather
+    // than read as part 0's.
+    if (metadata.PartCount() > 1) {
+        LOG(ERROR) << "key=" << key << ", part_count=" << metadata.PartCount()
+                   << ", error=part_index_required";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     if (client_id != metadata.ClientId()) {
         LOG(ERROR) << "Illegal client " << client_id << " to PutRevoke key "
                    << key << ", was PutStart-ed by " << metadata.ClientId();
@@ -6115,6 +6391,16 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                                 const ReplicateConfig& config)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
+    // Upsert updates one object in place, which has no meaning for an object
+    // written in several parts: each part has its own writer.
+    if (config.part_count.value_or(1) > 1 ||
+        config.part_index.value_or(0) != 0) {
+        LOG(ERROR) << "key=" << key
+                   << ", part_index=" << config.part_index.value_or(0)
+                   << ", part_count=" << config.part_count.value_or(1)
+                   << ", error=upsert_requires_one_part";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     // --- Parameter validation (same as PutStart) ---
     if ((config.replica_num == 0 && config.nof_replica_num == 0 &&
          config.dfs_replica_num == 0) ||
@@ -10408,6 +10694,41 @@ void MasterService::DiscardExpiredProcessingReplicas(
             }
 
             auto& metadata = it->second.metadata;
+            // An object written in several parts has one attempt per part, each
+            // with its own start time, so the release timeout is applied part
+            // by part: a part whose writer stopped gives up the replicas that
+            // attempt allocated and goes back to empty, while the parts that
+            // were finished keep theirs.
+            if (metadata.PartCount() > 1) {
+                for (size_t part_index = 0; part_index < metadata.PartCount();
+                     ++part_index) {
+                    ObjectPart* part = metadata.MutablePart(part_index);
+                    const ObjectMetadata::PartWrite* write =
+                        metadata.CurrentPartWrite(part_index);
+                    if (part == nullptr || write == nullptr ||
+                        !part->IsWriting() ||
+                        write->put_start_time +
+                                put_start_release_timeout_sec_ >=
+                            now) {
+                        continue;
+                    }
+                    const auto ttl =
+                        write->put_start_time + put_start_release_timeout_sec_;
+                    auto replicas =
+                        part->PopReplicas(&Replica::fn_is_processing);
+                    metadata.AbortPartWrite(part_index);
+                    SyncCacheTotalAccounting(metadata);
+                    if (!replicas.empty()) {
+                        MasterMetricManager::instance()
+                            .inc_part_quarantined_replicas(
+                                static_cast<int64_t>(replicas.size()));
+                        FreeDfsReplicas(it->first, replicas);
+                        discarded_replicas.emplace_back(std::move(replicas),
+                                                        ttl);
+                    }
+                }
+                continue;
+            }
             if (!metadata.IsValid() ||
                 metadata.AllReplicas(&Replica::fn_is_completed)) {
                 metadata.ClearPendingSoftPinIfNoViableReplica();

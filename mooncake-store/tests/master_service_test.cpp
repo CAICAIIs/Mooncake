@@ -3568,6 +3568,196 @@ TEST_F(MasterServiceTest, PutEndRefusesAPartOtherThanPartZero) {
               ErrorCode::INVALID_PARAMS);
 }
 
+namespace {
+
+MasterServiceConfig MultiPartConfig() {
+    MasterServiceConfig config;
+    config.enable_multi_part_objects = true;
+    return config;
+}
+
+ObjectMeta PartEndMeta(const std::string& key, uint32_t part_index,
+                       std::vector<ReplicaID> replica_ids = {}) {
+    ObjectMeta meta{key, std::nullopt};
+    meta.part_index = part_index;
+    meta.replica_ids = std::move(replica_ids);
+    return meta;
+}
+
+ReplicateConfig PartConfig(uint32_t part_index, uint32_t part_count) {
+    ReplicateConfig config;
+    config.part_index = part_index;
+    config.part_count = part_count;
+    return config;
+}
+
+}  // namespace
+
+TEST_F(MasterServiceTest, MultiPartObjectTakesOnePartPerWriter) {
+    MasterService service{MultiPartConfig()};
+    const auto context = PrepareSimpleSegment(service);
+    const UUID first_writer = generate_uuid();
+    const UUID second_writer = generate_uuid();
+    const std::string key = "two_part_key";
+    constexpr uint64_t kPartLength = 512;
+
+    auto first_start = service.PutStart(first_writer, key, TenantId::Default(),
+                                        kPartLength, PartConfig(0, 2));
+    ASSERT_TRUE(first_start.has_value());
+    ASSERT_EQ(first_start->size(), 1u);
+    auto second_start = service.PutStart(
+        second_writer, key, TenantId::Default(), kPartLength, PartConfig(1, 2));
+    ASSERT_TRUE(second_start.has_value());
+
+    {
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            &service,
+            MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
+        ASSERT_TRUE(accessor.Exists());
+        const ObjectMetadata& metadata = accessor.Get();
+        EXPECT_EQ(metadata.PartCount(), 2u);
+        EXPECT_EQ(metadata.TotalLength(), 2 * kPartLength);
+        ASSERT_NE(metadata.GetPart(0), nullptr);
+        ASSERT_NE(metadata.GetPart(1), nullptr);
+        EXPECT_EQ(metadata.GetPart(1)->length(), kPartLength);
+        // Each writer is recorded against its own part.
+        ASSERT_NE(metadata.CurrentPartWrite(0), nullptr);
+        ASSERT_NE(metadata.CurrentPartWrite(1), nullptr);
+        EXPECT_EQ(metadata.CurrentPartWrite(0)->client_id, first_writer);
+        EXPECT_EQ(metadata.CurrentPartWrite(1)->client_id, second_writer);
+    }
+
+    // A different part_count is a different object shape.
+    EXPECT_EQ(service
+                  .PutStart(first_writer, key, TenantId::Default(), kPartLength,
+                            PartConfig(0, 3))
+                  .error(),
+              ErrorCode::INVALID_PARAMS);
+
+    // First come, first served within a part.
+    EXPECT_EQ(service
+                  .PutStart(second_writer, key, TenantId::Default(),
+                            kPartLength, PartConfig(0, 2))
+                  .error(),
+              ErrorCode::OBJECT_ALREADY_EXISTS);
+
+    // An End that names replicas this attempt did not allocate cannot complete
+    // the part.
+    std::vector<ReplicaID> first_ids;
+    for (const auto& descriptor : first_start.value()) {
+        first_ids.push_back(descriptor.id);
+    }
+    ASSERT_FALSE(first_ids.empty());
+    EXPECT_EQ(service
+                  .PutEnd(first_writer,
+                          PartEndMeta(key, 0, {first_ids.front() + 1000}),
+                          TenantId::Default(), ReplicaType::ALL)
+                  .error(),
+              ErrorCode::INVALID_WRITE);
+
+    // The attempt's own replicas complete its own part, and only it.
+    EXPECT_TRUE(service
+                    .PutEnd(first_writer, PartEndMeta(key, 0, first_ids),
+                            TenantId::Default(), ReplicaType::ALL)
+                    .has_value());
+    {
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            &service,
+            MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
+        ASSERT_TRUE(accessor.Exists());
+        const ObjectMetadata& metadata = accessor.Get();
+        ASSERT_NE(metadata.GetPart(0), nullptr);
+        ASSERT_NE(metadata.GetPart(1), nullptr);
+        EXPECT_TRUE(std::ranges::all_of(metadata.GetPart(0)->replicas(),
+                                        &Replica::fn_is_completed));
+        EXPECT_TRUE(metadata.GetPart(1)->IsWriting());
+        EXPECT_TRUE(metadata.HasWriteInFlight());
+    }
+
+    // A retry of the same End is a no-op, and the other part still completes
+    // on its own.
+    EXPECT_TRUE(service
+                    .PutEnd(first_writer, PartEndMeta(key, 0, first_ids),
+                            TenantId::Default(), ReplicaType::ALL)
+                    .has_value());
+    std::vector<ReplicaID> second_ids;
+    for (const auto& descriptor : second_start.value()) {
+        second_ids.push_back(descriptor.id);
+    }
+    EXPECT_TRUE(service
+                    .PutEnd(second_writer, PartEndMeta(key, 1, second_ids),
+                            TenantId::Default(), ReplicaType::ALL)
+                    .has_value());
+}
+
+TEST_F(MasterServiceTest, MultiPartWritesAreRefusedWithoutTheFlag) {
+    MasterService service;
+    const auto context = PrepareSimpleSegment(service);
+    const UUID client_id = generate_uuid();
+
+    EXPECT_EQ(service
+                  .PutStart(client_id, "flagged_off_key", TenantId::Default(),
+                            512, PartConfig(0, 2))
+                  .error(),
+              ErrorCode::INVALID_PARAMS);
+}
+
+TEST_F(MasterServiceTest, UpsertRefusesAPartScope) {
+    MasterService service{MultiPartConfig()};
+    const auto context = PrepareSimpleSegment(service);
+    const UUID client_id = generate_uuid();
+
+    EXPECT_EQ(service
+                  .UpsertStart(client_id, "upsert_part_key",
+                               TenantId::Default(), 512, PartConfig(0, 2))
+                  .error(),
+              ErrorCode::INVALID_PARAMS);
+}
+
+TEST_F(MasterServiceTest,
+       MultiPartObjectIsReadableOnlyWhenEveryPartIsComplete) {
+    MasterService service{MultiPartConfig()};
+    const auto context = PrepareSimpleSegment(service);
+    const UUID first_writer = generate_uuid();
+    const UUID second_writer = generate_uuid();
+    const std::string key = "readable_two_part_key";
+    constexpr uint64_t kPartLength = 512;
+
+    auto first_start = service.PutStart(first_writer, key, TenantId::Default(),
+                                        kPartLength, PartConfig(0, 2));
+    ASSERT_TRUE(first_start.has_value());
+    auto second_start = service.PutStart(
+        second_writer, key, TenantId::Default(), kPartLength, PartConfig(1, 2));
+    ASSERT_TRUE(second_start.has_value());
+
+    std::vector<ReplicaID> first_ids;
+    for (const auto& descriptor : first_start.value()) {
+        first_ids.push_back(descriptor.id);
+    }
+    std::vector<ReplicaID> second_ids;
+    for (const auto& descriptor : second_start.value()) {
+        second_ids.push_back(descriptor.id);
+    }
+
+    // One part written does not make a readable object.
+    ASSERT_TRUE(service
+                    .PutEnd(first_writer, PartEndMeta(key, 0, first_ids),
+                            TenantId::Default(), ReplicaType::ALL)
+                    .has_value());
+    EXPECT_FALSE(service.ExistKey(key, TenantId::Default()).value_or(true));
+
+    // A read that names no part cannot say which slice it means, so it is
+    // refused rather than answered with part 0.
+    EXPECT_EQ(service.GetReplicaList(key, TenantId::Default()).error(),
+              ErrorCode::INVALID_PARAMS);
+
+    ASSERT_TRUE(service
+                    .PutEnd(second_writer, PartEndMeta(key, 1, second_ids),
+                            TenantId::Default(), ReplicaType::ALL)
+                    .has_value());
+    EXPECT_TRUE(service.ExistKey(key, TenantId::Default()).value_or(false));
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {

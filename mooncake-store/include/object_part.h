@@ -39,6 +39,16 @@ class ObjectPart {
         checksum_ = std::move(checksum);
     }
 
+    // True when the part holds no replica at all.
+    bool IsEmpty() const { return replicas_.empty(); }
+
+    // True when every replica of the part is still being written. A part with a
+    // replica a reader can use is not writing, even if another one is.
+    bool IsWriting() const {
+        return !replicas_.empty() &&
+               std::ranges::all_of(replicas_, &Replica::is_processing);
+    }
+
     // Elements may be modified; adding or removing goes through the calls
     // below.
     std::span<Replica> replicas() { return replicas_; }

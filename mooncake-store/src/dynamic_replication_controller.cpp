@@ -674,6 +674,12 @@ size_t DynamicReplicationController::RecordReplicaRemoval(
 
 uint64_t DynamicReplicationController::VersionEpoch(
     const ObjectMetadata& metadata) {
+    // The epoch is the start time of the object's one write. An object written
+    // in several parts has no single writer, and the controller leaves those
+    // to the memory replicas they have.
+    if (metadata.PartCount() != 1) {
+        return 0;
+    }
     return static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
             metadata.PutStartTime().time_since_epoch())

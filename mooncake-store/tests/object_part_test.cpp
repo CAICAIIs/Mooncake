@@ -246,9 +246,8 @@ TEST(PartWireTest, ALegacyObjectMetaLeavesThePartScopeUnset) {
     EXPECT_EQ(decoded.key, "part-wire-key");
     EXPECT_EQ(decoded.object_checksum.value_or(0), kChecksum);
     // The old layout carries no part scope, so what the reader sees is the
-    // ordinary one: part 0, unscoped by replica id.
-    EXPECT_FALSE(decoded.part_index.has_value());
-    EXPECT_EQ(decoded.part_index.value_or(0), 0u);
+    // ordinary one: part 0, and no replica-id scope at all.
+    EXPECT_EQ(decoded.part_index.value_or(99u), 0u);
     EXPECT_FALSE(decoded.replica_ids.has_value());
 }
 

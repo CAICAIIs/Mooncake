@@ -158,6 +158,9 @@ struct MasterConfig {
     bool enable_disk_eviction;
     uint64_t quota_bytes;
     bool enable_multi_tenants = false;
+    // Serve objects whose content is written by several writers, one part each.
+    // Off by default.
+    bool enable_multi_part_objects = false;
     std::string tenant_quota_connector_type = "file";
     std::string tenant_quota_connector_uri;
 
@@ -275,6 +278,7 @@ class MasterServiceSupervisorConfig {
     bool enable_disk_eviction = true;
     uint64_t quota_bytes = 0;
     bool enable_multi_tenants = false;
+    bool enable_multi_part_objects = false;
     std::string tenant_quota_connector_type = "file";
     std::string tenant_quota_connector_uri;
     uint32_t max_total_finished_tasks = DEFAULT_MAX_TOTAL_FINISHED_TASKS;
@@ -439,6 +443,7 @@ class MasterServiceSupervisorConfig {
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
         enable_multi_tenants = config.enable_multi_tenants;
+        enable_multi_part_objects = config.enable_multi_part_objects;
         tenant_quota_connector_type = config.tenant_quota_connector_type;
         tenant_quota_connector_uri = config.tenant_quota_connector_uri;
 
@@ -592,6 +597,7 @@ class WrappedMasterServiceConfig {
     bool enable_disk_eviction = true;
     uint64_t quota_bytes = 0;
     bool enable_multi_tenants = false;
+    bool enable_multi_part_objects = false;
     std::string tenant_quota_connector_type = "file";
     std::string tenant_quota_connector_uri;
 
@@ -684,6 +690,7 @@ class WrappedMasterServiceConfig {
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
         enable_multi_tenants = config.enable_multi_tenants;
+        enable_multi_part_objects = config.enable_multi_part_objects;
         tenant_quota_connector_type = config.tenant_quota_connector_type;
         tenant_quota_connector_uri = config.tenant_quota_connector_uri;
 
@@ -811,6 +818,7 @@ class WrappedMasterServiceConfig {
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
         enable_multi_tenants = config.enable_multi_tenants;
+        enable_multi_part_objects = config.enable_multi_part_objects;
         tenant_quota_connector_type = config.tenant_quota_connector_type;
         tenant_quota_connector_uri = config.tenant_quota_connector_uri;
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
@@ -881,6 +889,7 @@ class MasterServiceConfigBuilder {
     bool enable_disk_eviction_ = true;
     uint64_t quota_bytes_ = 0;
     bool enable_multi_tenants_ = false;
+    bool enable_multi_part_objects_ = false;
     std::string tenant_quota_connector_type_ = "file";
     std::string tenant_quota_connector_uri_;
     uint64_t put_start_discard_timeout_sec_ = DEFAULT_PUT_START_DISCARD_TIMEOUT;
@@ -1082,6 +1091,11 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
+    MasterServiceConfigBuilder& set_enable_multi_part_objects(bool enable) {
+        enable_multi_part_objects_ = enable;
+        return *this;
+    }
+
     MasterServiceConfigBuilder& set_tenant_quota_connector_type(
         const std::string& type) {
         tenant_quota_connector_type_ = type;
@@ -1253,6 +1267,7 @@ class MasterServiceConfig {
     bool enable_disk_eviction = true;
     uint64_t quota_bytes = 0;
     bool enable_multi_tenants = false;
+    bool enable_multi_part_objects = false;
     std::string tenant_quota_connector_type = "file";
     std::string tenant_quota_connector_uri;
 
@@ -1342,6 +1357,7 @@ class MasterServiceConfig {
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
         enable_multi_tenants = config.enable_multi_tenants;
+        enable_multi_part_objects = config.enable_multi_part_objects;
         tenant_quota_connector_type = config.tenant_quota_connector_type;
         tenant_quota_connector_uri = config.tenant_quota_connector_uri;
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
@@ -1420,6 +1436,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.enable_disk_eviction = enable_disk_eviction_;
     config.quota_bytes = quota_bytes_;
     config.enable_multi_tenants = enable_multi_tenants_;
+    config.enable_multi_part_objects = enable_multi_part_objects_;
     config.tenant_quota_connector_type = tenant_quota_connector_type_;
     config.tenant_quota_connector_uri = tenant_quota_connector_uri_;
     config.snapshot_interval_seconds = snapshot_interval_seconds_;
@@ -1461,6 +1478,7 @@ struct InProcMasterConfig {
     std::optional<bool> enable_disk_eviction;
     std::optional<uint64_t> quota_bytes;
     std::optional<bool> enable_multi_tenants;
+    std::optional<bool> enable_multi_part_objects;
     std::optional<std::string> tenant_quota_connector_uri;
 };
 
@@ -1480,6 +1498,7 @@ class InProcMasterConfigBuilder {
     std::optional<bool> enable_disk_eviction_ = std::nullopt;
     std::optional<uint64_t> quota_bytes_ = std::nullopt;
     std::optional<bool> enable_multi_tenants_ = std::nullopt;
+    std::optional<bool> enable_multi_part_objects_ = std::nullopt;
     std::optional<std::string> tenant_quota_connector_uri_ = std::nullopt;
 
    public:
@@ -1554,6 +1573,11 @@ class InProcMasterConfigBuilder {
         return *this;
     }
 
+    InProcMasterConfigBuilder& set_enable_multi_part_objects(bool enable) {
+        enable_multi_part_objects_ = enable;
+        return *this;
+    }
+
     InProcMasterConfigBuilder& set_tenant_quota_connector_uri(
         const std::string& uri) {
         tenant_quota_connector_uri_ = uri;
@@ -1579,6 +1603,7 @@ inline InProcMasterConfig InProcMasterConfigBuilder::build() const {
     config.enable_disk_eviction = enable_disk_eviction_;
     config.quota_bytes = quota_bytes_;
     config.enable_multi_tenants = enable_multi_tenants_;
+    config.enable_multi_part_objects = enable_multi_part_objects_;
     config.tenant_quota_connector_uri = tenant_quota_connector_uri_;
     return config;
 }

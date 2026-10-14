@@ -89,6 +89,9 @@ struct ObjectMetadata {
 
     ObjectMetadata() = delete;
 
+    // `part_count` slots are created; the part this writer allocated goes into
+    // `part_index`, which is the only part the object has for an ordinary
+    // object.
     ObjectMetadata(const UUID& client_id_,
                    const std::chrono::system_clock::time_point put_start_time_,
                    size_t value_length, std::vector<Replica>&& reps,
@@ -97,18 +100,17 @@ struct ObjectMetadata {
                    bool enable_hard_pin = false,
                    ObjectDataType data_type_ = ObjectDataType::UNKNOWN,
                    std::string group_id_ = "", TenantId tenant_id_ = TenantId(),
-                   std::string user_key_ = {})
+                   std::string user_key_ = {}, uint32_t part_index = 0,
+                   uint32_t part_count = 1)
         : data_type(data_type_),
           group_id(std::move(group_id_)),
           tenant_id(std::move(tenant_id_)),
           user_key(std::move(user_key_)),
           soft_pin_timeout(std::move(committed_soft_pin_timeout)),
           hard_pinned(enable_hard_pin) {
-        // The object this constructor builds has one part, written by one
-        // client.
-        slots_.emplace_back();
-        slots_.back().part.emplace(value_length, std::move(reps));
-        BeginPartWrite(0, client_id_, {}, put_start_time_);
+        slots_.resize(part_count);
+        BeginPart(part_index, value_length, std::move(reps));
+        BeginPartWrite(part_index, client_id_, {}, put_start_time_);
         MasterMetricManager::instance().inc_key_count(1);
         if (soft_pin_timeout) {
             MasterMetricManager::instance().inc_soft_pin_key_count(1);
@@ -216,6 +218,32 @@ struct ObjectMetadata {
         return slot.part.has_value() ? &slot.part.value() : nullptr;
     }
 
+    // The part's write record: engaged from the part's first PutStart on.
+    // nullptr when no PutStart for this part has arrived yet.
+    const PartWrite* CurrentPartWrite(size_t index) const {
+        const PartSlot& slot = slots_.at(index);
+        return slot.write.has_value() ? &slot.write.value() : nullptr;
+    }
+
+    // True while some part has an attempt that PutEnd has not completed.
+    bool HasWriteInFlight() const {
+        for (const auto& slot : slots_) {
+            if (slot.write.has_value() && slot.part.has_value() &&
+                slot.part->IsWriting()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Engages the slot with a part built from the length its own writer
+    // reports. A slot that held a part whose write timed out is empty again by
+    // then, so the part is built fresh instead of being resized.
+    void BeginPart(size_t index, size_t length,
+                   std::vector<Replica>&& replicas) {
+        slots_.at(index).part.emplace(length, std::move(replicas));
+    }
+
     // Opens a write attempt on the part, replacing any record of an earlier
     // one held there.
     void BeginPartWrite(size_t index, const UUID& client_id,
@@ -223,6 +251,20 @@ struct ObjectMetadata {
                         std::chrono::system_clock::time_point now) {
         slots_.at(index).write.emplace(
             PartWrite{client_id, std::move(replica_ids), now});
+    }
+
+    // The write ended successfully: keep the writer and the start time, drop
+    // the attempt's replica scope.
+    void FinishPartWrite(size_t index) {
+        slots_.at(index).write->replica_ids.clear();
+    }
+
+    // The attempt did not survive: the slot goes back to empty, so a later
+    // writer starts fresh instead of inheriting it.
+    void AbortPartWrite(size_t index) {
+        PartSlot& slot = slots_.at(index);
+        slot.write.reset();
+        slot.part.reset();
     }
 
     size_t TotalLength() const {
