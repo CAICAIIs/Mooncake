@@ -378,6 +378,10 @@ class MasterServiceTestPeer {
         service_.DiscardExpiredProcessingReplicas(shard, now);
     }
 
+    bool HasEvictableReplicas(const ObjectMetadata& metadata) const {
+        return service_.HasEvictableReplicas(metadata);
+    }
+
     uint32_t DynamicReplicationAdmissionMinHits() const {
         return service_.dynamic_replication_.AdmissionMinHits();
     }

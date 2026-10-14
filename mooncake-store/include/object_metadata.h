@@ -325,21 +325,53 @@ struct ObjectMetadata {
         return num_visited;
     }
 
+    // The queries below answer over every part the object has written: they are
+    // asked about the object, and an object written in several parts has more
+    // than one replica list. The paths that mean one part read that part
+    // directly. `GetAllReplicas` is the exception: a view of the object's
+    // replicas needs storage the envelope does not have, so callers that want
+    // every part walk the slots.
     bool HasReplica(const std::function<bool(const Replica&)>& pred_fn) const {
-        return std::ranges::any_of(part0().replicas(), pred_fn);
+        for (const auto& slot : slots_) {
+            if (slot.part.has_value() &&
+                std::ranges::any_of(slot.part->replicas(), pred_fn)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     bool AllReplicas(const std::function<bool(const Replica&)>& pred_fn) const {
-        return std::ranges::all_of(part0().replicas(), pred_fn);
+        for (const auto& slot : slots_) {
+            if (slot.part.has_value() &&
+                !std::ranges::all_of(slot.part->replicas(), pred_fn)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     size_t CountReplicas(
         const std::function<bool(const Replica&)>& pred_fn) const {
-        return static_cast<size_t>(
-            std::ranges::count_if(part0().replicas(), pred_fn));
+        size_t count = 0;
+        for (const auto& slot : slots_) {
+            if (slot.part.has_value()) {
+                count += static_cast<size_t>(
+                    std::ranges::count_if(slot.part->replicas(), pred_fn));
+            }
+        }
+        return count;
     }
 
-    size_t CountReplicas() const { return part0().replicas().size(); }
+    size_t CountReplicas() const {
+        size_t count = 0;
+        for (const auto& slot : slots_) {
+            if (slot.part.has_value()) {
+                count += slot.part->replicas().size();
+            }
+        }
+        return count;
+    }
 
     std::span<const Replica> GetAllReplicas() const {
         return part0().replicas();
@@ -347,9 +379,17 @@ struct ObjectMetadata {
 
     Replica* GetFirstReplica(
         const std::function<bool(const Replica&)>& pred_fn) {
-        auto replicas = part0().replicas();
-        const auto it = std::ranges::find_if(replicas, pred_fn);
-        return it != replicas.end() ? &(*it) : nullptr;
+        for (auto& slot : slots_) {
+            if (!slot.part.has_value()) {
+                continue;
+            }
+            auto replicas = slot.part->replicas();
+            const auto it = std::ranges::find_if(replicas, pred_fn);
+            if (it != replicas.end()) {
+                return &(*it);
+            }
+        }
+        return nullptr;
     }
 
     Replica* GetReplicaByID(const ReplicaID& id) {
@@ -537,7 +577,7 @@ struct ObjectMetadata {
     // Valid means it has at least one valid replica and size is greater
     // than 0
     bool IsValid() const {
-        return part0().length() > 0 && HasReplica([](const Replica& replica) {
+        return TotalLength() > 0 && HasReplica([](const Replica& replica) {
                    return !replica.is_memory_replica() ||
                           !replica.has_invalid_mem_handle();
                });

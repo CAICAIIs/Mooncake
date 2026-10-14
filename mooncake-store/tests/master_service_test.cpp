@@ -3758,6 +3758,58 @@ TEST_F(MasterServiceTest,
     EXPECT_TRUE(service.ExistKey(key, TenantId::Default()).value_or(false));
 }
 
+TEST_F(MasterServiceTest, IncompleteMultiPartObjectIsNotAnEvictionCandidate) {
+    MasterService service{MultiPartConfig()};
+    const auto context = PrepareSimpleSegment(service);
+    const UUID writer = generate_uuid();
+    const std::string key = "unevictable_part_key";
+    constexpr uint64_t kPartLength = 512;
+    const TenantId tenant = TenantId::Default();
+
+    auto start =
+        service.PutStart(writer, key, tenant, kPartLength, PartConfig(0, 2));
+    ASSERT_TRUE(start.has_value());
+    std::vector<ReplicaID> ids;
+    for (const auto& descriptor : start.value()) {
+        ids.push_back(descriptor.id);
+    }
+    ASSERT_TRUE(
+        service
+            .PutEnd(writer, PartEndMeta(key, 0, ids), tenant, ReplicaType::ALL)
+            .has_value());
+
+    MasterServiceTestPeer peer(service);
+    {
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            &service,
+            MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
+        ASSERT_TRUE(accessor.Exists());
+        // Part 0 holds a readable, unreferenced memory replica, which eviction
+        // would take for an ordinary object; the missing part keeps it out.
+        EXPECT_FALSE(peer.HasEvictableReplicas(accessor.Get()));
+    }
+
+    auto second =
+        service.PutStart(writer, key, tenant, kPartLength, PartConfig(1, 2));
+    ASSERT_TRUE(second.has_value());
+    std::vector<ReplicaID> second_ids;
+    for (const auto& descriptor : second.value()) {
+        second_ids.push_back(descriptor.id);
+    }
+    ASSERT_TRUE(service
+                    .PutEnd(writer, PartEndMeta(key, 1, second_ids), tenant,
+                            ReplicaType::ALL)
+                    .has_value());
+
+    {
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            &service,
+            MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
+        ASSERT_TRUE(accessor.Exists());
+        EXPECT_TRUE(peer.HasEvictableReplicas(accessor.Get()));
+    }
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {

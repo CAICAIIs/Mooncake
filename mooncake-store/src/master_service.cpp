@@ -2118,8 +2118,16 @@ MasterService::ObjectMap::iterator MasterService::EraseMetadata(
     // hold its slot toward the candidate limit until the retry loop reached it.
     promotion_candidates_.EraseLocked(tenant_id, key, state);
 
-    ReleaseLocalDiskUsage(metadata.GetAllReplicas());
-    FreeDfsReplicas(key, metadata.GetAllReplicas());
+    // Every part's replicas go with the object, not only part 0's.
+    for (size_t part_index = 0; part_index < metadata.PartCount();
+         ++part_index) {
+        const ObjectPart* part = metadata.GetPart(part_index);
+        if (part == nullptr) {
+            continue;
+        }
+        ReleaseLocalDiskUsage(part->replicas());
+        FreeDfsReplicas(key, part->replicas());
+    }
     AccountCacheTotalRemoval(metadata);
     if (metadata.GetCommittedSoftPinTimeout()) {
         soft_pin_deadline_index_.Remove(tenant_id.MakeScopedKey(key));
@@ -4736,6 +4744,26 @@ const ObjectPart* MasterService::LegacyReadPart(
 bool MasterService::IsEvictableMemoryReplica(const Replica& replica) const {
     return replica.is_memory_replica() && IsReplicaReadable(replica) &&
            replica.get_refcnt() == 0;
+}
+
+bool MasterService::HasEvictableReplicas(const ObjectMetadata& metadata) const {
+    // An object whose parts have not all arrived is not a candidate: eviction
+    // takes whole objects, and freeing one a writer is still filling would
+    // publish nothing while costing the parts that did arrive.
+    if (!IsReadable(metadata)) {
+        return false;
+    }
+    for (size_t part_index = 0; part_index < metadata.PartCount();
+         ++part_index) {
+        const ObjectPart* part = metadata.GetPart(part_index);
+        if (part != nullptr &&
+            std::ranges::any_of(part->replicas(), [this](const Replica& r) {
+                return IsEvictableMemoryReplica(r);
+            })) {
+            return true;
+        }
+    }
+    return false;
 }
 
 auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern,
@@ -11043,9 +11071,6 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
     auto is_evictable_memory_replica = [this](const Replica& replica) {
         return IsEvictableMemoryReplica(replica);
     };
-    auto can_evict_replicas = [&](const ObjectMetadata& metadata) {
-        return metadata.HasReplica(is_evictable_memory_replica);
-    };
     auto has_local_disk_replica = [](const ObjectMetadata& metadata) {
         return metadata.HasReplica(&Replica::fn_is_local_disk_replica);
     };
@@ -11165,7 +11190,7 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
             // evict them.
             if (now < metadata.EvictionDeadline() ||
                 (!allow_soft_pinned && IsSoftPinActive(metadata, now)) ||
-                !can_evict_replicas(metadata)) {
+                !HasEvictableReplicas(metadata)) {
                 return {};
             }
             if (!metadata.IsGrouped()) {
@@ -11274,7 +11299,7 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
                         !metadata.IsLeaseExpired(now) ||
                         (!allow_soft_pinned &&
                          IsSoftPinActive(metadata, now)) ||
-                        !can_evict_replicas(metadata)) {
+                        !HasEvictableReplicas(metadata)) {
                         continue;
                     }
                     candidate_keys.push_back(k);
@@ -11344,10 +11369,6 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
     auto is_evictable_memory_replica = [this](const Replica& replica) {
         return IsEvictableMemoryReplica(replica);
-    };
-
-    auto can_evict_replicas = [&](const ObjectMetadata& metadata) {
-        return metadata.HasReplica(is_evictable_memory_replica);
     };
 
     auto evict_replicas =
@@ -11577,7 +11598,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
             // are only a blocker when this pass is not allowed to evict them.
             if (now < metadata.EvictionDeadline() ||
                 (!allow_soft_pinned && IsSoftPinActive(metadata, now)) ||
-                !can_evict_replicas(metadata)) {
+                !HasEvictableReplicas(metadata)) {
                 return {.revalidation_skipped = true};
             }
 
@@ -11733,7 +11754,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                          it != tenant_state.metadata.end(); ++it) {
                         if (it->second.metadata.IsHardPinned()) continue;
                         bool has_evictable =
-                            can_evict_replicas(it->second.metadata);
+                            HasEvictableReplicas(it->second.metadata);
                         if (has_evictable) shard_evictable_count++;
                         // Grouped objects are evicted all-or-none, so rank them
                         // by the shared group TTL (consistent across members)
@@ -11842,7 +11863,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                             const auto& metadata = record.metadata;
                             if (metadata.IsHardPinned() ||
                                 IsSoftPinActive(metadata, now) ||
-                                !can_evict_replicas(metadata)) {
+                                !HasEvictableReplicas(metadata)) {
                                 continue;
                             }
                             // Group-aware eviction deadline (shared group TTL
@@ -12036,7 +12057,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                         target_timeout &&
                                     !IsSoftPinActive(it->second.metadata,
                                                      now) &&
-                                    can_evict_replicas(it->second.metadata)) {
+                                    HasEvictableReplicas(it->second.metadata)) {
                                     to_evict.emplace_back(tenant_it->first,
                                                           it->first);
                                 }
@@ -12088,7 +12109,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                 if (it->second.metadata.IsHardPinned() ||
                                     now < it->second.metadata
                                               .EvictionDeadline() ||
-                                    !can_evict_replicas(it->second.metadata)) {
+                                    !HasEvictableReplicas(
+                                        it->second.metadata)) {
                                     continue;
                                 }
                                 if (!IsSoftPinActive(it->second.metadata,

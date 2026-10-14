@@ -2403,6 +2403,11 @@ class MasterService {
     // names none, so such a read is refused rather than answered with part 0.
     const ObjectPart* LegacyReadPart(const ObjectMetadata& metadata) const;
     bool IsEvictableMemoryReplica(const Replica& replica) const;
+    // Whether an eviction pass may free this object: every part has arrived,
+    // and at least one of its memory replicas is readable and unreferenced. An
+    // object a writer is still filling is bounded by the incompleteness timeout
+    // instead of being evicted.
+    bool HasEvictableReplicas(const ObjectMetadata& metadata) const;
 
     /**
      * Segment lifecycle persist helper. Tries to durably persist the
