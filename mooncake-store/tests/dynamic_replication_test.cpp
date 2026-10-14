@@ -179,7 +179,12 @@ class DynamicReplicationTest : public ::testing::Test {
             &service,
             MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
         ASSERT_TRUE(accessor.Exists());
-        accessor.Get().put_start_time += std::chrono::milliseconds(1);
+        // The version epoch is derived from the write's start time, so moving
+        // it forward is what a newer write looks like.
+        ObjectMetadata& metadata = accessor.Get();
+        metadata.BeginPartWrite(
+            0, metadata.ClientId(), {},
+            metadata.PutStartTime() + std::chrono::milliseconds(1));
     }
 
     // True when the object still carries dynamic-replication state: its own

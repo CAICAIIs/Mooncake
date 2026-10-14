@@ -676,7 +676,7 @@ uint64_t DynamicReplicationController::VersionEpoch(
     const ObjectMetadata& metadata) {
     return static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
-            metadata.put_start_time.time_since_epoch())
+            metadata.PutStartTime().time_since_epoch())
             .count());
 }
 

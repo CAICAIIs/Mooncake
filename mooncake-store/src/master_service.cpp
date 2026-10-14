@@ -4434,10 +4434,10 @@ auto MasterService::BatchReplicaClear(
         const auto previous_kv_media = KvMediaSnapshot(metadata);
 
         // Security check: Ensure the requesting client owns the object.
-        if (metadata.client_id != client_id) {
+        if (metadata.ClientId() != client_id) {
             LOG(WARNING) << "BatchReplicaClear: tenant=" << normalized_tenant
                          << " key=" << key << " belongs to different client_id="
-                         << metadata.client_id << ", expected=" << client_id
+                         << metadata.ClientId() << ", expected=" << client_id
                          << ", skipping";
             continue;
         }
@@ -4805,9 +4805,10 @@ auto MasterService::GetReplicaList(const std::string& key,
                 dynamic_replication_.WantsAnotherMemoryReplica(memory_replicas);
         }
 
-        resp = GetReplicaListResponse(std::move(replica_list),
-                                      default_kv_lease_ttl_,
-                                      metadata.GetPart(0).checksum());
+        const ObjectPart* part = metadata.GetPart(0);
+        resp = GetReplicaListResponse(
+            std::move(replica_list), default_kv_lease_ttl_,
+            part != nullptr ? part->checksum() : std::nullopt);
     }
     // RO accessor released. Safe to take a fresh RW accessor now.
     if (promotion_eligible) {
@@ -4842,9 +4843,10 @@ auto MasterService::GetReplicaListForAdmin(const std::string& key,
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
 
-    return GetReplicaListResponse(std::move(replica_list),
-                                  default_kv_lease_ttl_,
-                                  metadata.GetPart(0).checksum());
+    const ObjectPart* part = metadata.GetPart(0);
+    return GetReplicaListResponse(
+        std::move(replica_list), default_kv_lease_ttl_,
+        part != nullptr ? part->checksum() : std::nullopt);
 }
 
 std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
@@ -4988,9 +4990,10 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                     }
                 }
 
+                const ObjectPart* part = metadata.GetPart(0);
                 results[original_idx] = GetReplicaListResponse(
                     std::move(replica_list), default_kv_lease_ttl_,
-                    metadata.GetPart(0).checksum());
+                    part != nullptr ? part->checksum() : std::nullopt);
             }
         }
 
@@ -5073,9 +5076,10 @@ MasterService::BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
                     continue;
                 }
 
+                const ObjectPart* part = metadata.GetPart(0);
                 results[original_idx] = GetReplicaListResponse(
                     std::move(replica_list), default_kv_lease_ttl_,
-                    metadata.GetPart(0).checksum());
+                    part != nullptr ? part->checksum() : std::nullopt);
             }
         }
     }
@@ -5532,7 +5536,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                 if (it != tenant_state.metadata.end()) {
                     auto& metadata = it->second.metadata;
                     if (metadata.HasReplica(&Replica::fn_is_completed) ||
-                        metadata.put_start_time +
+                        metadata.PutStartTime() +
                                 put_start_discard_timeout_sec_ >=
                             now) {
                         return tl::make_unexpected(
@@ -5553,7 +5557,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                         std::lock_guard lock(discarded_replicas_mutex_);
                         discarded_replicas_.emplace_back(
                             std::move(replicas),
-                            metadata.put_start_time +
+                            metadata.PutStartTime() +
                                 put_start_release_timeout_sec_);
                     }
                     EraseMetadata(tenant_state, it, object_id.tenant_id,
@@ -5611,9 +5615,9 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
     }
 
     auto& metadata = accessor.Get();
-    if (client_id != metadata.client_id) {
+    if (client_id != metadata.ClientId()) {
         LOG(ERROR) << "Illegal client " << client_id << " to PutEnd key " << key
-                   << ", was PutStart-ed by " << metadata.client_id;
+                   << ", was PutStart-ed by " << metadata.ClientId();
         return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
     }
 
@@ -5710,7 +5714,9 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         replica_type == ReplicaType::ALL ||
         replica_type == ReplicaType::MEMORY ||
         replica_type == ReplicaType::NOF_SSD) {
-        metadata.MutablePart(0).SetChecksum(object_meta.object_checksum);
+        if (ObjectPart* part = metadata.MutablePart(0); part != nullptr) {
+            part->SetChecksum(object_meta.object_checksum);
+        }
     }
 
     auto settle_result =
@@ -5916,9 +5922,9 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
 
     auto& metadata = accessor.Get();
     const auto previous_kv_media = KvMediaSnapshot(metadata);
-    if (client_id != metadata.client_id) {
+    if (client_id != metadata.ClientId()) {
         LOG(ERROR) << "Illegal client " << client_id << " to PutRevoke key "
-                   << key << ", was PutStart-ed by " << metadata.client_id;
+                   << key << ", was PutStart-ed by " << metadata.ClientId();
         return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
     }
 
@@ -6402,8 +6408,9 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     metadata.HasReplica(&Replica::fn_is_dfs_replica);
                 if (metadata.TotalLength() == slice_length && !has_read_lease &&
                     !has_bucket_dfs_replica && !restore_missing_bucket_dfs) {
-                    metadata.client_id = client_id;
-                    metadata.put_start_time = now;
+                    // The new writer takes over part 0's write record: the
+                    // ownership check and the discard timeout follow it.
+                    metadata.BeginPartWrite(0, client_id, {}, now);
 
                     const auto previous_kv_media = KvMediaSnapshot(metadata);
 
@@ -10395,7 +10402,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
             }
 
             const auto ttl =
-                metadata.put_start_time + put_start_release_timeout_sec_;
+                metadata.PutStartTime() + put_start_release_timeout_sec_;
             if (ttl < now) {
                 const bool had_complete_replica =
                     metadata.HasReplica(&Replica::fn_is_completed);
@@ -13555,7 +13562,7 @@ void MasterService::HttpMetadataCleanupThreadFunc() {
 std::string MasterService::SerializeMetadataForOpLog(
     const ObjectMetadata& metadata) const {
     MetadataPayload payload;
-    payload.client_id = metadata.client_id;
+    payload.client_id = metadata.ClientId();
     payload.size = metadata.TotalLength();
     payload.group_id = metadata.group_id;
     payload.data_type = metadata.data_type;
@@ -13581,7 +13588,7 @@ std::string MasterService::SerializeMetadataForOpLog(
 std::string MasterService::SerializeMetadataForOpLogWithoutMemReplicas(
     const ObjectMetadata& metadata) const {
     MetadataPayload payload;
-    payload.client_id = metadata.client_id;
+    payload.client_id = metadata.ClientId();
     payload.size = metadata.TotalLength();
     payload.group_id = metadata.group_id;
     payload.data_type = metadata.data_type;
@@ -13604,7 +13611,7 @@ std::string MasterService::SerializeMetadataForOpLogFromReplicaDescriptors(
     const ObjectMetadata& metadata,
     const std::vector<Replica::Descriptor>& replicas) const {
     MetadataPayload payload;
-    payload.client_id = metadata.client_id;
+    payload.client_id = metadata.ClientId();
     payload.size = metadata.TotalLength();
     payload.replicas = replicas;
     payload.group_id = metadata.group_id;

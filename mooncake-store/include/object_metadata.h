@@ -57,6 +57,28 @@ struct ObjectMetadata {
         std::unordered_set<ReplicaID> eligible_replica_ids;
     };
 
+    // The write that created a part, and the part's most recent PutStart. The
+    // attempt's replica scope is dropped when the write ends; the writer and
+    // the start time stay, because the ownership check and the oplog payload
+    // read them afterwards.
+    struct PartWrite {
+        UUID client_id;
+        // The replicas this attempt allocated. PutEnd and PutRevoke are scoped
+        // by them, so a late End from an attempt whose replicas were already
+        // reallocated cannot complete the new ones. Empty on ordinary objects,
+        // where those calls are not scoped by replica id.
+        std::unordered_set<ReplicaID> replica_ids;
+        std::chrono::system_clock::time_point put_start_time;
+    };
+
+    // One part and the write that fills it. The slot count is the object's
+    // part_count, fixed when the object is created; a slot is engaged when its
+    // part's own PutStart arrives.
+    struct PartSlot {
+        std::optional<ObjectPart> part;
+        std::optional<PartWrite> write;
+    };
+
     // RAII-style metric management
     ~ObjectMetadata() {
         MasterMetricManager::instance().dec_key_count(1);
@@ -76,15 +98,17 @@ struct ObjectMetadata {
                    ObjectDataType data_type_ = ObjectDataType::UNKNOWN,
                    std::string group_id_ = "", TenantId tenant_id_ = TenantId(),
                    std::string user_key_ = {})
-        : client_id(client_id_),
-          put_start_time(put_start_time_),
-          data_type(data_type_),
+        : data_type(data_type_),
           group_id(std::move(group_id_)),
           tenant_id(std::move(tenant_id_)),
           user_key(std::move(user_key_)),
           soft_pin_timeout(std::move(committed_soft_pin_timeout)),
           hard_pinned(enable_hard_pin) {
-        parts_.emplace_back(value_length, std::move(reps));
+        // The object this constructor builds has one part, written by one
+        // client.
+        slots_.emplace_back();
+        slots_.back().part.emplace(value_length, std::move(reps));
+        BeginPartWrite(0, client_id_, {}, put_start_time_);
         MasterMetricManager::instance().inc_key_count(1);
         if (soft_pin_timeout) {
             MasterMetricManager::instance().inc_soft_pin_key_count(1);
@@ -97,10 +121,15 @@ struct ObjectMetadata {
     ObjectMetadata(ObjectMetadata&&) = delete;
     ObjectMetadata& operator=(ObjectMetadata&&) = delete;
 
-    // Updated by UpsertStart (Case B) to reflect the new writer.
-    UUID client_id;
-    // Updated by UpsertStart (Case B) to reset the discard timeout.
-    std::chrono::system_clock::time_point put_start_time;
+    // The writer of part 0 and the time its current write started. Updated by
+    // UpsertStart (Case B) to reflect the new writer and to reset the discard
+    // timeout.
+    const UUID& ClientId() const { return part0Slot().write->client_id; }
+
+    std::chrono::system_clock::time_point PutStartTime() const {
+        return part0Slot().write->put_start_time;
+    }
+
     const ObjectDataType data_type{ObjectDataType::UNKNOWN};
     const std::string group_id;
     const TenantId tenant_id;
@@ -169,16 +198,39 @@ struct ObjectMetadata {
             std::max(dynamic_replication_recreate_after, deadline);
     }
 
-    // Read under the owner's shared lock, change under its exclusive lock. A
-    // replica pointer taken from a part is invalidated by any add or pop on it.
-    const ObjectPart& GetPart(size_t index) const { return parts_.at(index); }
+    // The object's parts, one slot per part. The slot count is the object's
+    // part_count, fixed at creation, and a slot is engaged when that part's own
+    // PutStart arrives. Every object has one part today.
+    size_t PartCount() const { return slots_.size(); }
 
-    ObjectPart& MutablePart(size_t index) { return parts_.at(index); }
+    // nullptr when the slot holds no part yet. Read under the owner's shared
+    // lock, change under its exclusive lock; a replica pointer taken from a
+    // part is invalidated by any add or pop on it.
+    const ObjectPart* GetPart(size_t index) const {
+        const PartSlot& slot = slots_.at(index);
+        return slot.part.has_value() ? &slot.part.value() : nullptr;
+    }
+
+    ObjectPart* MutablePart(size_t index) {
+        PartSlot& slot = slots_.at(index);
+        return slot.part.has_value() ? &slot.part.value() : nullptr;
+    }
+
+    // Opens a write attempt on the part, replacing any record of an earlier
+    // one held there.
+    void BeginPartWrite(size_t index, const UUID& client_id,
+                        std::unordered_set<ReplicaID> replica_ids,
+                        std::chrono::system_clock::time_point now) {
+        slots_.at(index).write.emplace(
+            PartWrite{client_id, std::move(replica_ids), now});
+    }
 
     size_t TotalLength() const {
         size_t total = 0;
-        for (const auto& part : parts_) {
-            total += part.length();
+        for (const auto& slot : slots_) {
+            if (slot.part.has_value()) {
+                total += slot.part->length();
+            }
         }
         return total;
     }
@@ -187,18 +239,18 @@ struct ObjectMetadata {
     // with `parts()` and a flattened `replicas()` view, so each call site says
     // which it means.
     void AddReplicas(std::vector<Replica>&& replicas) {
-        MutablePart(0).AddReplicas(std::move(replicas));
+        part0().AddReplicas(std::move(replicas));
     }
 
     std::vector<Replica> PopReplicas(
         const std::function<bool(const Replica&)>& pred_fn) {
-        return MutablePart(0).PopReplicas(pred_fn);
+        return part0().PopReplicas(pred_fn);
     }
 
-    std::vector<Replica> PopReplicas() { return MutablePart(0).PopReplicas(); }
+    std::vector<Replica> PopReplicas() { return part0().PopReplicas(); }
 
     size_t EraseReplicas(const std::function<bool(const Replica&)>& pred_fn) {
-        return MutablePart(0).PopReplicas(pred_fn).size();
+        return part0().PopReplicas(pred_fn).size();
     }
 
     // visit_fn may modify the replica but must not add or pop replicas.
@@ -206,7 +258,7 @@ struct ObjectMetadata {
                          const std::function<void(Replica&)>& visit_fn) {
         size_t num_visited = 0;
 
-        for (auto& replica : MutablePart(0).replicas()) {
+        for (auto& replica : part0().replicas()) {
             if (pred_fn(replica)) {
                 visit_fn(replica);
                 num_visited++;
@@ -221,7 +273,7 @@ struct ObjectMetadata {
         const std::function<void(const Replica&)>& visit_fn) const {
         size_t num_visited = 0;
 
-        for (const auto& replica : GetPart(0).replicas()) {
+        for (const auto& replica : part0().replicas()) {
             if (pred_fn(replica)) {
                 visit_fn(replica);
                 num_visited++;
@@ -232,28 +284,28 @@ struct ObjectMetadata {
     }
 
     bool HasReplica(const std::function<bool(const Replica&)>& pred_fn) const {
-        return std::ranges::any_of(GetPart(0).replicas(), pred_fn);
+        return std::ranges::any_of(part0().replicas(), pred_fn);
     }
 
     bool AllReplicas(const std::function<bool(const Replica&)>& pred_fn) const {
-        return std::ranges::all_of(GetPart(0).replicas(), pred_fn);
+        return std::ranges::all_of(part0().replicas(), pred_fn);
     }
 
     size_t CountReplicas(
         const std::function<bool(const Replica&)>& pred_fn) const {
         return static_cast<size_t>(
-            std::ranges::count_if(GetPart(0).replicas(), pred_fn));
+            std::ranges::count_if(part0().replicas(), pred_fn));
     }
 
-    size_t CountReplicas() const { return GetPart(0).replicas().size(); }
+    size_t CountReplicas() const { return part0().replicas().size(); }
 
     std::span<const Replica> GetAllReplicas() const {
-        return GetPart(0).replicas();
+        return part0().replicas();
     }
 
     Replica* GetFirstReplica(
         const std::function<bool(const Replica&)>& pred_fn) {
-        auto replicas = MutablePart(0).replicas();
+        auto replicas = part0().replicas();
         const auto it = std::ranges::find_if(replicas, pred_fn);
         return it != replicas.end() ? &(*it) : nullptr;
     }
@@ -443,8 +495,7 @@ struct ObjectMetadata {
     // Valid means it has at least one valid replica and size is greater
     // than 0
     bool IsValid() const {
-        return GetPart(0).length() > 0 &&
-               HasReplica([](const Replica& replica) {
+        return part0().length() > 0 && HasReplica([](const Replica& replica) {
                    return !replica.is_memory_replica() ||
                           !replica.has_invalid_mem_handle();
                });
@@ -452,7 +503,7 @@ struct ObjectMetadata {
 
     std::vector<std::string> GetReplicaSegmentNames() const {
         std::vector<std::string> segment_names;
-        for (const auto& replica : GetPart(0).replicas()) {
+        for (const auto& replica : part0().replicas()) {
             const auto& segment_name_options = replica.get_segment_names();
             for (const auto& segment_name_opt : segment_name_options) {
                 if (segment_name_opt.has_value()) {
@@ -464,7 +515,18 @@ struct ObjectMetadata {
     }
 
    private:
-    std::vector<ObjectPart> parts_;
+    // Part 0, which every object built so far has. Slots are engaged as their
+    // writers arrive, so the paths that still work on one part use these and
+    // the multi-part work moves each of them to the slot it means.
+    const PartSlot& part0Slot() const { return slots_.at(0); }
+
+    PartSlot& part0Slot() { return slots_.at(0); }
+
+    const ObjectPart& part0() const { return part0Slot().part.value(); }
+
+    ObjectPart& part0() { return part0Slot().part.value(); }
+
+    std::vector<PartSlot> slots_;
 };
 
 }  // namespace mooncake

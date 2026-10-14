@@ -19,13 +19,15 @@ TEST(ObjectEntryTest, OwnsMetadataEnvelopeFromConstruction) {
     entry->WithExclusiveAccess([&](ObjectMetadata& m, ObjectEntry::State&) {
         EXPECT_EQ(&m, raw);
         EXPECT_EQ(m.TotalLength(), 128u);
-        m.MutablePart(0).SetChecksum(42);
+        ASSERT_NE(m.MutablePart(0), nullptr);
+        m.MutablePart(0)->SetChecksum(42);
     });
 
     entry->WithSharedAccess(
         [&](const ObjectMetadata& m, const ObjectEntry::State& state) {
-            ASSERT_TRUE(m.GetPart(0).checksum().has_value());
-            EXPECT_EQ(*m.GetPart(0).checksum(), 42u);
+            ASSERT_NE(m.GetPart(0), nullptr);
+            ASSERT_TRUE(m.GetPart(0)->checksum().has_value());
+            EXPECT_EQ(*m.GetPart(0)->checksum(), 42u);
             EXPECT_FALSE(state.is_processing);
             EXPECT_FALSE(state.is_torn_down);
         });

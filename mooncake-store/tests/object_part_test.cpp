@@ -148,18 +148,21 @@ TEST(ObjectPartTest, PopsOnlyTheMatchingReplicas) {
 TEST(EnvelopePartTest, TheEnvelopeReadsAndWritesItsSinglePart) {
     auto metadata = MakeEnvelope(kObjectLength,
                                  MakeDiskReplicas({ReplicaStatus::COMPLETE}));
-    metadata->MutablePart(0).SetChecksum(kChecksum);
+    ASSERT_NE(metadata->MutablePart(0), nullptr);
+    metadata->MutablePart(0)->SetChecksum(kChecksum);
 
     // The read accessor and the write accessor name the same part, and the
     // envelope's own operations answer with what that part holds.
-    const ObjectPart& part = metadata->GetPart(0);
-    EXPECT_EQ(&metadata->MutablePart(0), &part);
-    EXPECT_EQ(part.length(), kObjectLength);
-    EXPECT_EQ(*part.checksum(), kChecksum);
-    EXPECT_EQ(metadata->TotalLength(), part.length());
-    EXPECT_EQ(metadata->CountReplicas(), part.replicas().size());
-    EXPECT_EQ(metadata->GetAllReplicas().data(), part.replicas().data());
-    EXPECT_EQ(metadata->GetAllReplicas().size(), part.replicas().size());
+    const ObjectPart* part = metadata->GetPart(0);
+    ASSERT_NE(part, nullptr);
+    EXPECT_EQ(metadata->MutablePart(0), part);
+    EXPECT_EQ(metadata->PartCount(), 1u);
+    EXPECT_EQ(part->length(), kObjectLength);
+    EXPECT_EQ(*part->checksum(), kChecksum);
+    EXPECT_EQ(metadata->TotalLength(), part->length());
+    EXPECT_EQ(metadata->CountReplicas(), part->replicas().size());
+    EXPECT_EQ(metadata->GetAllReplicas().data(), part->replicas().data());
+    EXPECT_EQ(metadata->GetAllReplicas().size(), part->replicas().size());
     EXPECT_TRUE(metadata->HasReplica(&Replica::fn_is_completed));
 }
 
