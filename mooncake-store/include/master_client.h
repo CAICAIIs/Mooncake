@@ -207,6 +207,19 @@ class MasterClient {
     GetReplicaList(const std::string& object_key, const std::string& tenant_id);
 
     /**
+     * @brief Gets one part's replica list: which slice of an object written in
+     * several parts this caller means.
+     * @param object_key Key to query
+     * @param part_index Part to read, in [0, part_count)
+     * @return ErrorCode indicating success/failure
+     */
+    [[nodiscard]] tl::expected<GetReplicaListResponse, ErrorCode>
+    GetReplicaListForPart(const std::string& object_key, uint32_t part_index);
+    [[nodiscard]] tl::expected<GetReplicaListResponse, ErrorCode>
+    GetReplicaListForPart(const std::string& object_key, uint32_t part_index,
+                          const std::string& tenant_id);
+
+    /**
      * @brief Retrieves replica lists for object keys that match a regex
      * pattern.
      * @param str The regular expression string to match against object keys.
@@ -283,6 +296,20 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<void, ErrorCode> PutRevoke(
         const std::string& key, ReplicaType replica_type);
+
+    /**
+     * @brief Revokes one part's write attempt
+     * @param key Object key
+     * @param part_index Part whose write is abandoned
+     * @param replica_ids Replicas that attempt allocated; empty revokes every
+     * PROCESSING replica of the part
+     * @param replica_type Type of replica (memory or disk)
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> PutRevokeForPart(
+        const std::string& key, uint32_t part_index,
+        const std::vector<ReplicaID>& replica_ids,
+        ReplicaType replica_type = ReplicaType::ALL);
 
     /**
      * @brief Revokes a put operation for a batch of objects

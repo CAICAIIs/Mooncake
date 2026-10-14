@@ -390,6 +390,35 @@ WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
     return results;
 }
 
+tl::expected<GetReplicaListResponse, ErrorCode>
+WrappedMasterService::GetReplicaListForPart(const std::string& key,
+                                            uint32_t part_index,
+                                            const std::string& tenant_id) {
+    return execute_rpc(
+        "GetReplicaListForPart",
+        [&] {
+            return WithRequestTenant(
+                master_service_.IsTenantQuotaEnabled()
+                    ? std::string_view(tenant_id)
+                    : TenantId::kDefaultValue,
+                [&](const TenantId& resolved_tenant_id) {
+                    auto result = master_service_.GetReplicaListForPart(
+                        key, resolved_tenant_id, part_index);
+                    if (result) {
+                        result->resolved_tenant_id = resolved_tenant_id.value();
+                    }
+                    return result;
+                });
+        },
+        [&](auto& timer) {
+            timer.LogRequest("key=", key, ", part_index=", part_index);
+        },
+        [] { MasterMetricManager::instance().inc_get_replica_list_requests(); },
+        [] {
+            MasterMetricManager::instance().inc_get_replica_list_failures();
+        });
+}
+
 std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
 WrappedMasterService::BatchGetReplicaListForAdmin(
     const std::vector<std::string>& keys, const std::string& tenant_id) {
@@ -488,6 +517,32 @@ tl::expected<void, ErrorCode> WrappedMasterService::PutRevoke(
         },
         [&](auto& timer) {
             timer.LogRequest("client_id=", client_id, ", key=", key,
+                             ", replica_type=", replica_type);
+        },
+        [] { MasterMetricManager::instance().inc_put_revoke_requests(); },
+        [] { MasterMetricManager::instance().inc_put_revoke_failures(); });
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::PutRevokeForPart(
+    const UUID& client_id, const std::string& key, uint32_t part_index,
+    const std::vector<ReplicaID>& replica_ids, ReplicaType replica_type,
+    const std::string& tenant_id) {
+    return execute_rpc(
+        "PutRevokeForPart",
+        [&] {
+            return WithRequestTenant(
+                master_service_.IsTenantQuotaEnabled()
+                    ? std::string_view(tenant_id)
+                    : TenantId::kDefaultValue,
+                [&](const TenantId& resolved_tenant_id) {
+                    return master_service_.PutRevokeForPart(
+                        client_id, key, resolved_tenant_id, part_index,
+                        replica_ids, replica_type);
+                });
+        },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id, ", key=", key,
+                             ", part_index=", part_index,
                              ", replica_type=", replica_type);
         },
         [] { MasterMetricManager::instance().inc_put_revoke_requests(); },
@@ -1876,11 +1931,16 @@ void RegisterRpcService(
     server
         .register_handler<&mooncake::WrappedMasterService::BatchGetReplicaList>(
             &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::GetReplicaListForPart>(
+        &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::PutStart>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::PutEnd>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::PutRevoke>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::PutRevokeForPart>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::BatchPutStart>(
         &wrapped_master_service);

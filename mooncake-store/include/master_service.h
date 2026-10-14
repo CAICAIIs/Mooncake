@@ -405,6 +405,24 @@ class MasterService {
         -> tl::expected<GetReplicaListResponse, ErrorCode>;
 
     /**
+     * @brief Get the replica list of one part of an object.
+     * @param part_index Part to read, in [0, part_count)
+     * @return ErrorCode::OK on success, ErrorCode::REPLICA_IS_NOT_READY if the
+     * part is not readable, ErrorCode::INVALID_PARAMS if the object has no such
+     * part
+     */
+    auto GetReplicaListForPart(const std::string& key,
+                               const TenantId& tenant_id, uint32_t part_index)
+        -> tl::expected<GetReplicaListResponse, ErrorCode>;
+
+    // Shared body of the read paths: `part_index` set means the caller named a
+    // part, and unset means a legacy read, which only an ordinary object
+    // answers.
+    auto GetReplicaListImpl(const std::string& key, const TenantId& tenant_id,
+                            std::optional<uint32_t> part_index)
+        -> tl::expected<GetReplicaListResponse, ErrorCode>;
+
+    /**
      * @brief Read-only single-key replica list query for admin use.
      * Unlike GetReplicaList, this does not grant leases, trigger
      * promotion, or update cache-hit metrics.
@@ -471,6 +489,20 @@ class MasterService {
      */
     auto PutRevoke(const UUID& client_id, const std::string& key,
                    const TenantId& tenant_id, ReplicaType replica_type)
+        -> tl::expected<void, ErrorCode>;
+
+    /**
+     * @brief Revoke one part's write attempt.
+     * @param part_index Part whose write is abandoned
+     * @param replica_ids Replicas that attempt allocated; empty revokes every
+     * PROCESSING replica of the part
+     * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
+     * found, ErrorCode::INVALID_WRITE if the part has no write in progress
+     */
+    auto PutRevokeForPart(const UUID& client_id, const std::string& key,
+                          const TenantId& tenant_id, uint32_t part_index,
+                          const std::vector<ReplicaID>& replica_ids,
+                          ReplicaType replica_type)
         -> tl::expected<void, ErrorCode>;
 
     /**

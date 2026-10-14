@@ -267,6 +267,12 @@ struct ObjectMetadata {
         slot.part.reset();
     }
 
+    // No slot holds a part: the envelope can be dropped.
+    bool IsEmpty() const {
+        return std::ranges::none_of(
+            slots_, [](const PartSlot& slot) { return slot.part.has_value(); });
+    }
+
     size_t TotalLength() const {
         size_t total = 0;
         for (const auto& slot : slots_) {

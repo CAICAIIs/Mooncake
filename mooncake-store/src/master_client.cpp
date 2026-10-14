@@ -48,6 +48,11 @@ struct RpcNameTraits<&WrappedMasterService::GetReplicaList> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::GetReplicaListForPart> {
+    static constexpr const char* value = "GetReplicaListForPart";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::CalcCacheStats> {
     static constexpr const char* value = "CalcCacheStats";
 };
@@ -95,6 +100,11 @@ struct RpcNameTraits<&WrappedMasterService::BatchPutEnd> {
 template <>
 struct RpcNameTraits<&WrappedMasterService::PutRevoke> {
     static constexpr const char* value = "PutRevoke";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::PutRevokeForPart> {
+    static constexpr const char* value = "PutRevokeForPart";
 };
 
 template <>
@@ -643,6 +653,27 @@ tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
     return result;
 }
 
+tl::expected<GetReplicaListResponse, ErrorCode>
+MasterClient::GetReplicaListForPart(const std::string& object_key,
+                                    uint32_t part_index) {
+    return GetReplicaListForPart(object_key, part_index, tenant_id_.value());
+}
+
+tl::expected<GetReplicaListResponse, ErrorCode>
+MasterClient::GetReplicaListForPart(const std::string& object_key,
+                                    uint32_t part_index,
+                                    const std::string& tenant_id) {
+    ScopedVLogTimer timer(1, "MasterClient::GetReplicaListForPart");
+    timer.LogRequest("object_key=", object_key, ", part_index=", part_index,
+                     ", tenant_id=", tenant_id);
+
+    auto result =
+        invoke_rpc<&WrappedMasterService::GetReplicaListForPart,
+                   GetReplicaListResponse>(object_key, part_index, tenant_id);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
 MasterClient::BatchGetReplicaList(const std::vector<std::string>& object_keys) {
     return BatchGetReplicaList(object_keys, tenant_id_.value());
@@ -749,6 +780,19 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutRevoke(
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchPutRevoke, void>(
         keys.size(), client_id_, keys, replica_type, tenant_id_.value());
     timer.LogResponse("result=", result.size(), " operations");
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::PutRevokeForPart(
+    const std::string& key, uint32_t part_index,
+    const std::vector<ReplicaID>& replica_ids, ReplicaType replica_type) {
+    ScopedVLogTimer timer(1, "MasterClient::PutRevokeForPart");
+    timer.LogRequest("key=", key, ", part_index=", part_index);
+
+    auto result = invoke_rpc<&WrappedMasterService::PutRevokeForPart, void>(
+        client_id_, key, part_index, replica_ids, replica_type,
+        tenant_id_.value());
+    timer.LogResponseExpected(result);
     return result;
 }
 

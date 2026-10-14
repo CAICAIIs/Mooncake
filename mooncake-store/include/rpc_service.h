@@ -76,6 +76,12 @@ class WrappedMasterService {
     tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaList(
         const std::string& key, const std::string& tenant_id = "default");
 
+    // The part-scoped read: which slice of an object written in several parts
+    // this caller means. A read without it only answers an ordinary object.
+    tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaListForPart(
+        const std::string& key, uint32_t part_index,
+        const std::string& tenant_id = "default");
+
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaList(const std::vector<std::string>& keys,
                         const std::string& tenant_id = "default");
@@ -101,6 +107,14 @@ class WrappedMasterService {
 
     tl::expected<void, ErrorCode> PutRevoke(
         const UUID& client_id, const std::string& key,
+        ReplicaType replica_type = ReplicaType::ALL,
+        const std::string& tenant_id = "default");
+
+    // The part-scoped revoke: the part whose attempt is abandoned, and the
+    // replicas that attempt allocated.
+    tl::expected<void, ErrorCode> PutRevokeForPart(
+        const UUID& client_id, const std::string& key, uint32_t part_index,
+        const std::vector<ReplicaID>& replica_ids,
         ReplicaType replica_type = ReplicaType::ALL,
         const std::string& tenant_id = "default");
 
