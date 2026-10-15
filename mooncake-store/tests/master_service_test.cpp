@@ -3621,10 +3621,10 @@ TEST_F(MasterServiceTest, MultiPartObjectTakesOnePartPerWriter) {
         ASSERT_NE(metadata.GetPart(1), nullptr);
         EXPECT_EQ(metadata.GetPart(1)->length(), kPartLength);
         // Each writer is recorded against its own part.
-        ASSERT_NE(metadata.CurrentPartWrite(0), nullptr);
-        ASSERT_NE(metadata.CurrentPartWrite(1), nullptr);
-        EXPECT_EQ(metadata.CurrentPartWrite(0)->client_id, first_writer);
-        EXPECT_EQ(metadata.CurrentPartWrite(1)->client_id, second_writer);
+        ASSERT_NE(metadata.WriteRecordOf(0), nullptr);
+        ASSERT_NE(metadata.WriteRecordOf(1), nullptr);
+        EXPECT_EQ(metadata.WriteRecordOf(0)->client_id, first_writer);
+        EXPECT_EQ(metadata.WriteRecordOf(1)->client_id, second_writer);
     }
 
     // A different part_count is a different object shape.

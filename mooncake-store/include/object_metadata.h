@@ -57,16 +57,17 @@ struct ObjectMetadata {
         std::unordered_set<ReplicaID> eligible_replica_ids;
     };
 
-    // The write that created a part, and the part's most recent PutStart. The
-    // attempt's replica scope is dropped when the write ends; the writer and
-    // the start time stay, because the ownership check and the oplog payload
-    // read them afterwards.
-    struct PartWrite {
+    // The most recent write attempt accepted for a part: its writer, the
+    // replicas it allocated, and when it started. The record outlives the
+    // attempt, so a retried PutEnd and a late PutRevoke are matched against the
+    // attempt they belong to; the ownership check and the oplog payload also
+    // read it after the write ended.
+    struct PartWriteRecord {
         UUID client_id;
-        // The replicas this attempt allocated. PutEnd and PutRevoke are scoped
-        // by them, so a late End from an attempt whose replicas were already
-        // reallocated cannot complete the new ones. Empty on ordinary objects,
-        // where those calls are not scoped by replica id.
+        // The replicas this attempt allocated. PutEnd and PutRevoke act on the
+        // part only when the request names exactly these, so a late call from
+        // an attempt whose replicas were reallocated changes nothing. Empty on
+        // ordinary objects, where those calls are not scoped by replica id.
         std::unordered_set<ReplicaID> replica_ids;
         std::chrono::system_clock::time_point put_start_time;
     };
@@ -76,7 +77,7 @@ struct ObjectMetadata {
     // part's own PutStart arrives.
     struct PartSlot {
         std::optional<ObjectPart> part;
-        std::optional<PartWrite> write;
+        std::optional<PartWriteRecord> write;
     };
 
     // RAII-style metric management
@@ -202,7 +203,7 @@ struct ObjectMetadata {
 
     // The object's parts, one slot per part. The slot count is the object's
     // part_count, fixed at creation, and a slot is engaged when that part's own
-    // PutStart arrives. Every object has one part today.
+    // PutStart arrives.
     size_t PartCount() const { return slots_.size(); }
 
     // nullptr when the slot holds no part yet. Read under the owner's shared
@@ -218,14 +219,16 @@ struct ObjectMetadata {
         return slot.part.has_value() ? &slot.part.value() : nullptr;
     }
 
-    // The part's write record: engaged from the part's first PutStart on.
-    // nullptr when no PutStart for this part has arrived yet.
-    const PartWrite* CurrentPartWrite(size_t index) const {
+    // The record of the write attempt this part holds: engaged from the part's
+    // first accepted PutStart on, and kept after the attempt ends. nullptr when
+    // no PutStart for this part has arrived yet.
+    const PartWriteRecord* WriteRecordOf(size_t index) const {
         const PartSlot& slot = slots_.at(index);
         return slot.write.has_value() ? &slot.write.value() : nullptr;
     }
 
-    // True while some part has an attempt that PutEnd has not completed.
+    // True while some part holds an attempt that PutEnd has not completed:
+    // every replica of the part is still PROCESSING.
     bool HasWriteInFlight() const {
         for (const auto& slot : slots_) {
             if (slot.write.has_value() && slot.part.has_value() &&
@@ -250,13 +253,7 @@ struct ObjectMetadata {
                         std::unordered_set<ReplicaID> replica_ids,
                         std::chrono::system_clock::time_point now) {
         slots_.at(index).write.emplace(
-            PartWrite{client_id, std::move(replica_ids), now});
-    }
-
-    // The write ended successfully: keep the writer and the start time, drop
-    // the attempt's replica scope.
-    void FinishPartWrite(size_t index) {
-        slots_.at(index).write->replica_ids.clear();
+            PartWriteRecord{client_id, std::move(replica_ids), now});
     }
 
     // The attempt did not survive: the slot goes back to empty, so a later
@@ -283,10 +280,11 @@ struct ObjectMetadata {
         return total;
     }
 
-    // Temporary: these operate on part 0, and on an object whose part 0 has not
-    // arrived yet they do nothing. The multi-part work replaces them with
-    // `parts()` and a flattened `replicas()` view, so each call site says which
-    // it means.
+    // The object's part-0 forwards below answer for part 0 alone, and for an
+    // object whose part 0 has not arrived they answer with nothing. A call that
+    // means one part reads that part directly; a call that means the object
+    // walks the parts. `AddReplicas` has no answer for a missing part 0 and is
+    // only used on an object that has one.
     void AddReplicas(std::vector<Replica>&& replicas) {
         part0().AddReplicas(std::move(replicas));
     }
@@ -623,9 +621,9 @@ struct ObjectMetadata {
     }
 
    private:
-    // Part 0, which every object built so far has. Slots are engaged as their
-    // writers arrive, so the paths that still work on one part use these and
-    // the multi-part work moves each of them to the slot it means.
+    // Part 0, which an object has only once a writer has taken it: any rank may
+    // be the first to write, and it may take any part. The paths that still
+    // work on one part use these.
     const PartSlot& part0Slot() const { return slots_.at(0); }
 
     PartSlot& part0Slot() { return slots_.at(0); }

@@ -408,8 +408,8 @@ class MasterService {
      * @brief Get the replica list of one part of an object.
      * @param part_index Part to read, in [0, part_count)
      * @return ErrorCode::OK on success, ErrorCode::REPLICA_IS_NOT_READY if the
-     * part is not readable, ErrorCode::INVALID_PARAMS if the object has no such
-     * part
+     * object is not readable, which includes the part not having been written
+     * yet, ErrorCode::INVALID_PARAMS if the object has no such part
      */
     auto GetReplicaListForPart(const std::string& key,
                                const TenantId& tenant_id, uint32_t part_index)
@@ -1581,8 +1581,7 @@ class MasterService {
     // Helper: allocate the replicas of one part of an object that already
     // exists, insert the part into its slot, and return its descriptors. The
     // object's other parts are left untouched. Shared by PutStart.
-    auto AllocateAndInsertPart(MetadataShardAccessorRW& shard,
-                               TenantState& tenant_state,
+    auto AllocateAndInsertPart(TenantState& tenant_state,
                                ObjectMap::iterator it, const UUID& client_id,
                                const std::string& key, uint32_t part_index,
                                uint32_t part_count, uint64_t value_length,
@@ -2435,11 +2434,11 @@ class MasterService {
     // names none, so such a read is refused rather than answered with part 0.
     const ObjectPart* LegacyReadPart(const ObjectMetadata& metadata) const;
     bool IsEvictableMemoryReplica(const Replica& replica) const;
-    // Whether an eviction pass may free this object: every part has arrived,
-    // and at least one of its memory replicas is readable and unreferenced. An
-    // object a writer is still filling is kept: eviction takes whole objects,
-    // so freeing it would publish nothing while costing the parts that did
-    // arrive.
+    // Whether this object holds memory replicas an eviction pass could free:
+    // every part has arrived and at least one of the object's memory replicas
+    // is readable and unreferenced. The lease, hard pin and soft pin checks
+    // stay with the caller, and an object a writer is still filling is kept,
+    // because eviction takes whole objects.
     bool HasEvictableReplicas(const ObjectMetadata& metadata) const;
 
     /**

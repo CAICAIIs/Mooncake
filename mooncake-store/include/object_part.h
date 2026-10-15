@@ -3,8 +3,7 @@
 // ObjectPart: one byte range of an object's content, written independently.
 // An object's content is an ordered sequence of parts; a part's position is its
 // index in the owner's container, and the part owns the replicas of that range.
-// Each part carries its own length and checksum. Every object has one part
-// today.
+// Each part carries its own length and checksum.
 
 #include <algorithm>
 #include <cstddef>
