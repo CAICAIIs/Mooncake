@@ -378,6 +378,12 @@ class MasterServiceTestPeer {
         service_.DiscardExpiredProcessingReplicas(shard, now);
     }
 
+    size_t SweepMultiPartObjects(
+        MetadataShardAccessorRW& shard,
+        const std::chrono::system_clock::time_point& now) {
+        return service_.SweepMultiPartObjects(shard, now);
+    }
+
     bool HasEvictableReplicas(const ObjectMetadata& metadata) const {
         return service_.HasEvictableReplicas(metadata);
     }

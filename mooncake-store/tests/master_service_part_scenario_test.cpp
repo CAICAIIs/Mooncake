@@ -3,8 +3,8 @@
 // The scenarios RFC #4366 puts on the part layer, driven through MasterService
 // directly with the feature flag on: parts that arrive out of order, a part
 // read that answers only for its own slice, a late PutEnd arriving after its
-// writer lost the part, one part revoked while another keeps its replicas, and
-// one part lost while another is leased.
+// writer lost the part, one part lost while another is leased, and what the
+// incompleteness sweep reports and reclaims.
 
 #include "master_service.h"
 #include "master_service/master_service_test_peer.h"
@@ -69,6 +69,20 @@ template <typename T>
 ErrorCode ErrorOf(const tl::expected<T, ErrorCode>& result) {
     EXPECT_FALSE(result.has_value());
     return result.has_value() ? ErrorCode::OK : result.error();
+}
+
+size_t SweepMultiPartObjectsNow(MasterService& service) {
+    const auto now = std::chrono::system_clock::now();
+    MasterServiceTestPeer peer(service);
+    size_t incomplete = 0;
+    for (size_t shard_index = 0;
+         shard_index < MasterServiceTestPeer::MetadataShards(service).size();
+         ++shard_index) {
+        MasterServiceTestPeer::MetadataShardAccessorRW shard(&service,
+                                                             shard_index);
+        incomplete += peer.SweepMultiPartObjects(shard, now);
+    }
+    return incomplete;
 }
 
 }  // namespace
@@ -356,6 +370,47 @@ TEST_F(MasterServicePartScenarioTest,
         EXPECT_GT(metadata.EvictionDeadline(),
                   std::chrono::system_clock::now());
     }
+
+    // While the lease the read granted still holds, the incompleteness sweep
+    // leaves the object and the replica it protects alone: the object is older
+    // than the release timeout on its parts, so only the lease keeps it.
+    {
+        MasterServiceTestPeer::MetadataAccessorRW accessor(
+            service_.get(), MasterServiceTestPeer::ObjectIdentity{tenant, key});
+        ASSERT_TRUE(accessor.Exists());
+        accessor.Get().BeginPartWrite(
+            0, first_writer, {},
+            std::chrono::system_clock::now() -
+                std::chrono::seconds(DEFAULT_PUT_START_RELEASE_TIMEOUT + 60));
+    }
+    SweepMultiPartObjectsNow(*service_);
+    {
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            service_.get(), MasterServiceTestPeer::ObjectIdentity{tenant, key});
+        EXPECT_TRUE(accessor.Exists());
+    }
+}
+
+TEST_F(MasterServicePartScenarioTest, TheSweepReportsIncompleteObjects) {
+    const TenantId tenant = TenantId::Default();
+    const UUID writer = generate_uuid();
+
+    for (const std::string& key : {"incomplete_a", "incomplete_b"}) {
+        ASSERT_TRUE(
+            service_
+                ->PutStart(writer, key, tenant, kPartLength, PartConfig(0, 2))
+                .has_value());
+    }
+    // An ordinary object is not one of them.
+    ASSERT_TRUE(service_
+                    ->PutStart(writer, "one_part_object", tenant, kPartLength,
+                               ReplicateConfig{})
+                    .has_value());
+
+    // Two objects are written in several parts and neither has all of them.
+    // The gauge the reaper publishes is not asserted here: it is set from the
+    // eviction thread, not by this sweep.
+    EXPECT_EQ(SweepMultiPartObjectsNow(*service_), 2u);
 }
 
 TEST_F(MasterServicePartScenarioTest,

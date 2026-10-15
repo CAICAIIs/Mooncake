@@ -10918,6 +10918,7 @@ void MasterService::EvictionThreadFunc() {
     VLOG(1) << "action=eviction_thread_started";
 
     auto last_discard_time = std::chrono::system_clock::now();
+    auto last_multi_part_sweep = std::chrono::system_clock::now();
     auto next_dfs_eviction_time = std::chrono::steady_clock::now();
     auto next_tenant_eviction_time = std::chrono::steady_clock::now();
     while (eviction_running_) {
@@ -10951,6 +10952,28 @@ void MasterService::EvictionThreadFunc() {
                 ReleaseExpiredDiscardedReplicas(now);
             }
             last_discard_time = now;
+        }
+
+        // Objects whose parts stopped arriving are not eviction candidates, so
+        // they are reclaimed on their own cadence: the branch above only runs
+        // while the pool is under its watermark, and a pool that is over the
+        // watermark while holding such objects would otherwise free nothing.
+        if (enable_multi_part_objects_ &&
+            now - last_multi_part_sweep > put_start_release_timeout_sec_) {
+            {
+                std::shared_lock<std::shared_mutex> shared_lock(
+                    master_state_mutex_);
+                int64_t incomplete_objects = 0;
+                for (size_t i = 0; i < kNumShards; i++) {
+                    MetadataShardAccessorRW shard(this, i);
+                    incomplete_objects +=
+                        static_cast<int64_t>(SweepMultiPartObjects(shard, now));
+                }
+                MasterMetricManager::instance().update_incomplete_object_count(
+                    incomplete_objects);
+                ReleaseExpiredDiscardedReplicas(now);
+            }
+            last_multi_part_sweep = now;
         }
 
         // Tenant-scoped watermark. Intentionally outside the branch above:
@@ -11368,6 +11391,110 @@ void MasterService::DiscardExpiredProcessingReplicas(
         discarded_replicas_.splice(discarded_replicas_.end(),
                                    std::move(discarded_replicas));
     }
+}
+
+// Reclaims an object whose parts stopped arriving. Such an object is not an
+// eviction candidate, and the release timeout only covers the attempts that are
+// still open: an object that never became readable and has no writer left is
+// dropped whole once nothing is reading it. Returns how many objects written in
+// several parts are still missing parts.
+size_t MasterService::SweepMultiPartObjects(
+    MetadataShardAccessorRW& shard,
+    const std::chrono::system_clock::time_point& now) {
+    std::list<DiscardedReplicas> discarded_replicas;
+    size_t incomplete_objects = 0;
+
+    for (auto tenant_it = shard->tenants.begin();
+         tenant_it != shard->tenants.end();) {
+        auto& tenant_state = tenant_it->second;
+        auto& objects = tenant_state.metadata;
+
+        for (auto it = objects.begin(); it != objects.end();) {
+            auto& metadata = it->second.metadata;
+            if (metadata.PartCount() <= 1) {
+                ++it;
+                continue;
+            }
+
+            const bool stopped_arriving =
+                metadata.LastPutStartTime() + put_start_release_timeout_sec_ <
+                now;
+            if (IsReadable(metadata) || !stopped_arriving ||
+                !CanReclaimIncompleteObject(metadata, now)) {
+                if (!IsReadable(metadata)) {
+                    ++incomplete_objects;
+                }
+                ++it;
+                continue;
+            }
+
+            // Nothing readable is left and no writer is coming. COMPLETE
+            // replicas are released with the object; PROCESSING ones wait out
+            // a writer that may still be writing into them.
+            std::vector<Replica> processing;
+            for (size_t part_index = 0; part_index < metadata.PartCount();
+                 ++part_index) {
+                ObjectPart* part = metadata.MutablePart(part_index);
+                if (part == nullptr) {
+                    continue;
+                }
+                auto replicas = part->PopReplicas();
+                for (auto& replica : replicas) {
+                    if (replica.is_processing()) {
+                        processing.push_back(std::move(replica));
+                    }
+                }
+            }
+            SyncCacheTotalAccounting(metadata);
+            if (!processing.empty()) {
+                MasterMetricManager::instance().inc_part_quarantined_replicas(
+                    static_cast<int64_t>(processing.size()));
+                FreeDfsReplicas(it->first, processing);
+                discarded_replicas.emplace_back(
+                    std::move(processing),
+                    now + put_start_release_timeout_sec_);
+            }
+            it = EraseMetadata(tenant_state, it, tenant_it->first,
+                               QuotaEraseMode::kFull, &shard);
+        }
+
+        if (tenant_state.Empty()) {
+            tenant_it = shard->tenants.erase(tenant_it);
+        } else {
+            ++tenant_it;
+        }
+    }
+
+    if (!discarded_replicas.empty()) {
+        std::lock_guard lock(discarded_replicas_mutex_);
+        discarded_replicas_.splice(discarded_replicas_.end(),
+                                   std::move(discarded_replicas));
+    }
+    return incomplete_objects;
+}
+
+// The checks the incompleteness timeout applies before it drops an object that
+// was never readable: the lease is over, no replica is being read, and the
+// object is not hard pinned.
+bool MasterService::CanReclaimIncompleteObject(
+    const ObjectMetadata& metadata,
+    const std::chrono::system_clock::time_point& now) const {
+    if (now < metadata.EvictionDeadline() || metadata.IsHardPinned()) {
+        return false;
+    }
+    for (size_t part_index = 0; part_index < metadata.PartCount();
+         ++part_index) {
+        const ObjectPart* part = metadata.GetPart(part_index);
+        if (part == nullptr) {
+            continue;
+        }
+        if (std::ranges::any_of(part->replicas(), [](const Replica& replica) {
+                return replica.get_refcnt() != 0;
+            })) {
+            return false;
+        }
+    }
+    return true;
 }
 
 uint64_t MasterService::ReleaseExpiredDiscardedReplicas(

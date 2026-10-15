@@ -1597,6 +1597,16 @@ class MasterService {
     void DiscardExpiredProcessingReplicas(
         MetadataShardAccessorRW& shard,
         const std::chrono::system_clock::time_point& now);
+    // Reclaims what a partly written object holds: parts whose attempt passed
+    // put_start_release_timeout, and objects that never became readable and
+    // have no writer left. Returns how many objects written in several parts
+    // are still incomplete.
+    size_t SweepMultiPartObjects(
+        MetadataShardAccessorRW& shard,
+        const std::chrono::system_clock::time_point& now);
+    bool CanReclaimIncompleteObject(
+        const ObjectMetadata& metadata,
+        const std::chrono::system_clock::time_point& now) const;
     void FreeDfsReplicas(const std::string& key,
                          std::span<const Replica> replicas);
     void RunDfsEviction();
@@ -2437,8 +2447,9 @@ class MasterService {
     // Whether this object holds memory replicas an eviction pass could free:
     // every part has arrived and at least one of the object's memory replicas
     // is readable and unreferenced. The lease, hard pin and soft pin checks
-    // stay with the caller, and an object a writer is still filling is kept,
-    // because eviction takes whole objects.
+    // stay with the caller. An object a writer is still filling is kept, because
+    // eviction takes whole objects, and the incompleteness timeout is what
+    // bounds it.
     bool HasEvictableReplicas(const ObjectMetadata& metadata) const;
 
     /**

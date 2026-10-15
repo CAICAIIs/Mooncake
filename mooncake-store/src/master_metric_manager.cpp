@@ -65,6 +65,9 @@ MasterMetricManager::MasterMetricManager()
       soft_pin_key_count_(
           "master_soft_pin_key_count",
           "Total number of soft-pinned keys managed by the master"),
+      incomplete_object_count_(
+          "master_incomplete_object_count",
+          "Objects written in several parts whose parts have not all arrived"),
       // Initialize Histogram (4KB, 64KB, 256KB, 1MB, 4MB, 16MB, 64MB)
       value_size_distribution_(
           "master_value_size_bytes", "Distribution of object value sizes",
@@ -575,6 +578,7 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     dfs_file_count_.update(0);
     key_count_.update(0);
     soft_pin_key_count_.update(0);
+    incomplete_object_count_.update(0);
     active_clients_.update(0);
     client_liveness_active_clients_.update(0);
     client_liveness_suspected_clients_.update(0);
@@ -975,6 +979,14 @@ void MasterMetricManager::inc_soft_pin_key_count(int64_t val) {
 }
 void MasterMetricManager::dec_soft_pin_key_count(int64_t val) {
     soft_pin_key_count_.dec(val);
+}
+
+void MasterMetricManager::update_incomplete_object_count(int64_t count) {
+    incomplete_object_count_.update(count);
+}
+
+int64_t MasterMetricManager::get_incomplete_object_count() {
+    return incomplete_object_count_.value();
 }
 
 void MasterMetricManager::observe_value_size(int64_t size) {

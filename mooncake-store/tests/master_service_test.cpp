@@ -3784,6 +3784,60 @@ TEST_F(MasterServiceTest, MultiPartPartWriteIsDiscardedAfterItsReleaseTimeout) {
             .has_value());
 }
 
+void SweepMultiPartObjectsForTest(MasterService& service) {
+    const auto now = std::chrono::system_clock::now();
+    MasterServiceTestPeer peer(service);
+    for (size_t shard_index = 0;
+         shard_index < MasterServiceTestPeer::MetadataShards(service).size();
+         ++shard_index) {
+        MasterServiceTestPeer::MetadataShardAccessorRW shard(&service,
+                                                             shard_index);
+        peer.SweepMultiPartObjects(shard, now);
+    }
+}
+
+TEST_F(MasterServiceTest,
+       IncompleteMultiPartObjectIsReclaimedAfterItsReleaseTimeout) {
+    MasterService service{MultiPartConfig()};
+    const auto context = PrepareSimpleSegment(service);
+    const UUID writer = generate_uuid();
+    const std::string key = "reclaimed_part_key";
+    constexpr uint64_t kPartLength = 512;
+    const TenantId tenant = TenantId::Default();
+
+    auto start =
+        service.PutStart(writer, key, tenant, kPartLength, PartConfig(0, 2));
+    ASSERT_TRUE(start.has_value());
+    std::vector<ReplicaID> ids;
+    for (const auto& descriptor : start.value()) {
+        ids.push_back(descriptor.id);
+    }
+    ASSERT_TRUE(
+        service
+            .PutEnd(writer, PartEndMeta(key, 0, ids), tenant, ReplicaType::ALL)
+            .has_value());
+    // Part 1 never arrives, and part 0's attempt is long past its release
+    // timeout with nobody reading the object.
+    const auto stale =
+        std::chrono::system_clock::now() -
+        std::chrono::seconds(DEFAULT_PUT_START_RELEASE_TIMEOUT + 60);
+    {
+        MasterServiceTestPeer::MetadataAccessorRW accessor(
+            &service,
+            MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
+        ASSERT_TRUE(accessor.Exists());
+        accessor.Get().BeginPartWrite(0, writer, {}, stale);
+    }
+
+    SweepMultiPartObjectsForTest(service);
+
+    MasterServiceTestPeer::MetadataAccessorRO accessor(
+        &service,
+        MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
+    EXPECT_FALSE(accessor.Exists());
+    EXPECT_FALSE(service.ExistKey(key, tenant).value_or(true));
+}
+
 TEST_F(MasterServiceTest, IncompleteMultiPartObjectIsNotAnEvictionCandidate) {
     MasterService service{MultiPartConfig()};
     const auto context = PrepareSimpleSegment(service);

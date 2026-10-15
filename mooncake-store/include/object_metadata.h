@@ -60,8 +60,8 @@ struct ObjectMetadata {
     // The most recent write attempt accepted for a part: its writer, the
     // replicas it allocated, and when it started. The record outlives the
     // attempt, so a retried PutEnd and a late PutRevoke are matched against the
-    // attempt they belong to; the ownership check and the oplog payload also
-    // read it after the write ended.
+    // attempt they belong to; the ownership check, the oplog payload and the
+    // object's incompleteness timeout also read it after the write ended.
     struct PartWriteRecord {
         UUID client_id;
         // The replicas this attempt allocated. PutEnd and PutRevoke act on the
@@ -237,6 +237,18 @@ struct ObjectMetadata {
             }
         }
         return false;
+    }
+
+    // The latest PutStart this object received, over its parts: the anchor of
+    // the object-level incompleteness timeout.
+    std::chrono::system_clock::time_point LastPutStartTime() const {
+        std::chrono::system_clock::time_point latest{};
+        for (const auto& slot : slots_) {
+            if (slot.write.has_value() && slot.write->put_start_time > latest) {
+                latest = slot.write->put_start_time;
+            }
+        }
+        return latest;
     }
 
     // Engages the slot with a part built from the length its own writer

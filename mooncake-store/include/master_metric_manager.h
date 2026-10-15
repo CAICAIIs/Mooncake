@@ -140,6 +140,11 @@ class MasterMetricManager {
     void dec_key_count(int64_t val = 1);
     void inc_soft_pin_key_count(int64_t val = 1);
     void dec_soft_pin_key_count(int64_t val = 1);
+    // Objects written in several parts whose parts have not all arrived. The
+    // sweep that reclaims them sets this, so the value is at most one sweep
+    // interval old.
+    void update_incomplete_object_count(int64_t count);
+    int64_t get_incomplete_object_count();
     void observe_value_size(int64_t size);
     int64_t get_key_count();
     int64_t get_soft_pin_key_count();
@@ -621,6 +626,7 @@ class MasterMetricManager {
     // Key/Value Metrics
     ylt::metric::gauge_t key_count_;
     ylt::metric::gauge_t soft_pin_key_count_;
+    ylt::metric::gauge_t incomplete_object_count_;
     ylt::metric::histogram_t value_size_distribution_;
 
     // Cluster Metrics
