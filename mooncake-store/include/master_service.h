@@ -2437,8 +2437,9 @@ class MasterService {
     bool IsEvictableMemoryReplica(const Replica& replica) const;
     // Whether an eviction pass may free this object: every part has arrived,
     // and at least one of its memory replicas is readable and unreferenced. An
-    // object a writer is still filling is bounded by the incompleteness timeout
-    // instead of being evicted.
+    // object a writer is still filling is kept: eviction takes whole objects,
+    // so freeing it would publish nothing while costing the parts that did
+    // arrive.
     bool HasEvictableReplicas(const ObjectMetadata& metadata) const;
 
     /**

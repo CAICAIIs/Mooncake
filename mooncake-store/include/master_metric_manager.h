@@ -170,6 +170,14 @@ class MasterMetricManager {
     void inc_put_end_failures(int64_t val = 1);
     void inc_put_revoke_requests(int64_t val = 1);
     void inc_put_revoke_failures(int64_t val = 1);
+    // Part-scoped write counters: a part of an object written in several parts
+    // opened, completed, or given up to the quarantine.
+    void inc_part_put_start_requests(int64_t val = 1);
+    void inc_part_put_end_requests(int64_t val = 1);
+    void inc_part_quarantined_replicas(int64_t val = 1);
+    int64_t get_part_put_start_requests();
+    int64_t get_part_put_end_requests();
+    int64_t get_part_quarantined_replicas();
     void inc_get_replica_list_by_regex_requests(int64_t val = 1);
     void inc_get_replica_list_by_regex_failures(int64_t val = 1);
     void inc_get_replica_list_requests(int64_t val = 1);
@@ -638,6 +646,9 @@ class MasterMetricManager {
     ylt::metric::counter_t put_end_failures_;
     ylt::metric::counter_t put_revoke_requests_;
     ylt::metric::counter_t put_revoke_failures_;
+    ylt::metric::counter_t part_put_start_requests_;
+    ylt::metric::counter_t part_put_end_requests_;
+    ylt::metric::counter_t part_quarantined_replicas_;
     ylt::metric::counter_t get_replica_list_requests_;
     ylt::metric::counter_t get_replica_list_failures_;
     ylt::metric::counter_t get_replica_list_by_regex_requests_;

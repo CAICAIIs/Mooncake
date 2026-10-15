@@ -1663,16 +1663,38 @@ void MasterService::RebuildCacheTotalAccounting() {
 std::vector<Replica> MasterService::PopReplicasWithCacheTotalAccounting(
     ObjectMetadata& metadata,
     const std::function<bool(const Replica&)>& pred_fn) {
-    auto replicas = metadata.PopReplicas(pred_fn);
+    // Every part's matching replicas, not only part 0's: the callers ask this
+    // about the object. A caller that means one part reads that part directly.
+    std::vector<Replica> popped;
+    for (size_t part_index = 0; part_index < metadata.PartCount();
+         ++part_index) {
+        ObjectPart* part = metadata.MutablePart(part_index);
+        if (part == nullptr) {
+            continue;
+        }
+        auto replicas = part->PopReplicas(pred_fn);
+        popped.insert(popped.end(), std::make_move_iterator(replicas.begin()),
+                      std::make_move_iterator(replicas.end()));
+    }
     SyncCacheTotalAccounting(metadata);
-    return replicas;
+    return popped;
 }
 
 std::vector<Replica> MasterService::PopReplicasWithCacheTotalAccounting(
     ObjectMetadata& metadata) {
-    auto replicas = metadata.PopReplicas();
+    std::vector<Replica> popped;
+    for (size_t part_index = 0; part_index < metadata.PartCount();
+         ++part_index) {
+        ObjectPart* part = metadata.MutablePart(part_index);
+        if (part == nullptr) {
+            continue;
+        }
+        auto replicas = part->PopReplicas();
+        popped.insert(popped.end(), std::make_move_iterator(replicas.begin()),
+                      std::make_move_iterator(replicas.end()));
+    }
     SyncCacheTotalAccounting(metadata);
-    return replicas;
+    return popped;
 }
 
 size_t MasterService::EraseReplicasWithCacheTotalAccounting(
@@ -1981,16 +2003,26 @@ MasterService::BuildStaleHandleCleanupPlan(
     const std::function<bool(const Replica&)>& is_stale) const {
     StaleHandleCleanupPlan plan;
     bool has_valid_after_cleanup = false;
-    for (const auto& replica : metadata.GetAllReplicas()) {
-        if (is_stale(replica)) {
-            plan.removed_ids.push_back(replica.id());
+    // The plan is about the object, so it is built from every part that has
+    // been written.
+    for (size_t part_index = 0; part_index < metadata.PartCount();
+         ++part_index) {
+        const ObjectPart* part = metadata.GetPart(part_index);
+        if (part == nullptr) {
             continue;
         }
-        if (replica.status() == ReplicaStatus::COMPLETE) {
-            plan.remaining.push_back(replica.get_descriptor());
-        }
-        if (!replica.is_memory_replica() || !replica.has_invalid_mem_handle()) {
-            has_valid_after_cleanup = true;
+        for (const auto& replica : part->replicas()) {
+            if (is_stale(replica)) {
+                plan.removed_ids.push_back(replica.id());
+                continue;
+            }
+            if (replica.status() == ReplicaStatus::COMPLETE) {
+                plan.remaining.push_back(replica.get_descriptor());
+            }
+            if (!replica.is_memory_replica() ||
+                !replica.has_invalid_mem_handle()) {
+                has_valid_after_cleanup = true;
+            }
         }
     }
     plan.would_invalidate =
@@ -5604,6 +5636,8 @@ auto MasterService::AllocateAndInsertPart(
                              ->PopReplicas(&Replica::fn_is_processing);
         SyncCacheTotalAccounting(metadata);
         if (!discarded.empty()) {
+            MasterMetricManager::instance().inc_part_quarantined_replicas(
+                static_cast<int64_t>(discarded.size()));
             FreeDfsReplicas(key, discarded);
             const auto release_at = existing_write != nullptr
                                         ? existing_write->put_start_time +
@@ -5642,6 +5676,7 @@ auto MasterService::AllocateAndInsertPart(
     metadata.BeginPart(part_index, value_length,
                        std::move(allocation_result.value()));
     metadata.BeginPartWrite(part_index, client_id, std::move(replica_ids), now);
+    MasterMetricManager::instance().inc_part_put_start_requests();
 
     if (enable_multi_tenants_) {
         auto adopt_result = metadata.quota_ledger.AdoptPendingCharge(
@@ -6059,6 +6094,9 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
     // The write attempt is over: the part keeps its writer and start time, and
     // drops the replica scope this End was matched against.
     metadata.FinishPartWrite(part_index);
+    if (metadata.PartCount() > 1) {
+        MasterMetricManager::instance().inc_part_put_end_requests();
+    }
 
     auto settle_result =
         SettlePrimaryWriteQuotaIfReady(accessor.GetTenantState(), metadata);

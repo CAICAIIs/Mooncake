@@ -283,22 +283,29 @@ struct ObjectMetadata {
         return total;
     }
 
-    // Temporary: these operate on part 0. The multi-part work replaces them
-    // with `parts()` and a flattened `replicas()` view, so each call site says
-    // which it means.
+    // Temporary: these operate on part 0, and on an object whose part 0 has not
+    // arrived yet they do nothing. The multi-part work replaces them with
+    // `parts()` and a flattened `replicas()` view, so each call site says which
+    // it means.
     void AddReplicas(std::vector<Replica>&& replicas) {
         part0().AddReplicas(std::move(replicas));
     }
 
     std::vector<Replica> PopReplicas(
         const std::function<bool(const Replica&)>& pred_fn) {
-        return part0().PopReplicas(pred_fn);
+        ObjectPart* part = MutablePart(0);
+        return part != nullptr ? part->PopReplicas(pred_fn)
+                               : std::vector<Replica>{};
     }
 
-    std::vector<Replica> PopReplicas() { return part0().PopReplicas(); }
+    std::vector<Replica> PopReplicas() {
+        ObjectPart* part = MutablePart(0);
+        return part != nullptr ? part->PopReplicas() : std::vector<Replica>{};
+    }
 
     size_t EraseReplicas(const std::function<bool(const Replica&)>& pred_fn) {
-        return part0().PopReplicas(pred_fn).size();
+        ObjectPart* part = MutablePart(0);
+        return part != nullptr ? part->PopReplicas(pred_fn).size() : 0;
     }
 
     // visit_fn may modify the replica but must not add or pop replicas.
@@ -306,7 +313,11 @@ struct ObjectMetadata {
                          const std::function<void(Replica&)>& visit_fn) {
         size_t num_visited = 0;
 
-        for (auto& replica : part0().replicas()) {
+        ObjectPart* part = MutablePart(0);
+        if (part == nullptr) {
+            return num_visited;
+        }
+        for (auto& replica : part->replicas()) {
             if (pred_fn(replica)) {
                 visit_fn(replica);
                 num_visited++;
@@ -321,7 +332,11 @@ struct ObjectMetadata {
         const std::function<void(const Replica&)>& visit_fn) const {
         size_t num_visited = 0;
 
-        for (const auto& replica : part0().replicas()) {
+        const ObjectPart* part = GetPart(0);
+        if (part == nullptr) {
+            return num_visited;
+        }
+        for (const auto& replica : part->replicas()) {
             if (pred_fn(replica)) {
                 visit_fn(replica);
                 num_visited++;
@@ -380,7 +395,8 @@ struct ObjectMetadata {
     }
 
     std::span<const Replica> GetAllReplicas() const {
-        return part0().replicas();
+        const ObjectPart* part = GetPart(0);
+        return part != nullptr ? part->replicas() : std::span<const Replica>{};
     }
 
     Replica* GetFirstReplica(
@@ -591,7 +607,11 @@ struct ObjectMetadata {
 
     std::vector<std::string> GetReplicaSegmentNames() const {
         std::vector<std::string> segment_names;
-        for (const auto& replica : part0().replicas()) {
+        const ObjectPart* part = GetPart(0);
+        if (part == nullptr) {
+            return segment_names;
+        }
+        for (const auto& replica : part->replicas()) {
             const auto& segment_name_options = replica.get_segment_names();
             for (const auto& segment_name_opt : segment_name_options) {
                 if (segment_name_opt.has_value()) {

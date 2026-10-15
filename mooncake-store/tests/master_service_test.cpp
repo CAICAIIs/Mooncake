@@ -3714,48 +3714,74 @@ TEST_F(MasterServiceTest, UpsertRefusesAPartScope) {
               ErrorCode::INVALID_PARAMS);
 }
 
-TEST_F(MasterServiceTest,
-       MultiPartObjectIsReadableOnlyWhenEveryPartIsComplete) {
+void DiscardExpiredProcessingReplicasForTest(MasterService& service) {
+    const auto now = std::chrono::system_clock::now();
+    MasterServiceTestPeer peer(service);
+    for (size_t shard_index = 0;
+         shard_index < MasterServiceTestPeer::MetadataShards(service).size();
+         ++shard_index) {
+        MasterServiceTestPeer::MetadataShardAccessorRW shard(&service,
+                                                             shard_index);
+        peer.DiscardExpiredProcessingReplicas(shard, now);
+    }
+}
+
+TEST_F(MasterServiceTest, MultiPartPartWriteIsDiscardedAfterItsReleaseTimeout) {
     MasterService service{MultiPartConfig()};
     const auto context = PrepareSimpleSegment(service);
-    const UUID first_writer = generate_uuid();
-    const UUID second_writer = generate_uuid();
-    const std::string key = "readable_two_part_key";
+    const UUID writer = generate_uuid();
+    const std::string key = "discarded_part_key";
     constexpr uint64_t kPartLength = 512;
+    const TenantId tenant = TenantId::Default();
 
-    auto first_start = service.PutStart(first_writer, key, TenantId::Default(),
-                                        kPartLength, PartConfig(0, 2));
-    ASSERT_TRUE(first_start.has_value());
-    auto second_start = service.PutStart(
-        second_writer, key, TenantId::Default(), kPartLength, PartConfig(1, 2));
-    ASSERT_TRUE(second_start.has_value());
-
+    // Part 0 is written and complete, so its replicas are not the ones the
+    // release timeout takes: only part 1's attempt is reclaimed.
+    auto first =
+        service.PutStart(writer, key, tenant, kPartLength, PartConfig(0, 2));
+    ASSERT_TRUE(first.has_value());
     std::vector<ReplicaID> first_ids;
-    for (const auto& descriptor : first_start.value()) {
+    for (const auto& descriptor : first.value()) {
         first_ids.push_back(descriptor.id);
     }
-    std::vector<ReplicaID> second_ids;
-    for (const auto& descriptor : second_start.value()) {
-        second_ids.push_back(descriptor.id);
+    ASSERT_TRUE(service
+                    .PutEnd(writer, PartEndMeta(key, 0, first_ids), tenant,
+                            ReplicaType::ALL)
+                    .has_value());
+
+    ASSERT_TRUE(
+        service.PutStart(writer, key, tenant, kPartLength, PartConfig(1, 2))
+            .has_value());
+    // Part 1's attempt stopped making progress long enough ago that the pass
+    // reclaims it.
+    const auto stale =
+        std::chrono::system_clock::now() -
+        std::chrono::seconds(DEFAULT_PUT_START_RELEASE_TIMEOUT + 60);
+    {
+        MasterServiceTestPeer::MetadataAccessorRW accessor(
+            &service,
+            MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
+        ASSERT_TRUE(accessor.Exists());
+        accessor.Get().BeginPartWrite(1, writer, {}, stale);
     }
 
-    // One part written does not make a readable object.
-    ASSERT_TRUE(service
-                    .PutEnd(first_writer, PartEndMeta(key, 0, first_ids),
-                            TenantId::Default(), ReplicaType::ALL)
-                    .has_value());
-    EXPECT_FALSE(service.ExistKey(key, TenantId::Default()).value_or(true));
+    DiscardExpiredProcessingReplicasForTest(service);
 
-    // A read that names no part cannot say which slice it means, so it is
-    // refused rather than answered with part 0.
-    EXPECT_EQ(service.GetReplicaList(key, TenantId::Default()).error(),
-              ErrorCode::INVALID_PARAMS);
-
-    ASSERT_TRUE(service
-                    .PutEnd(second_writer, PartEndMeta(key, 1, second_ids),
-                            TenantId::Default(), ReplicaType::ALL)
-                    .has_value());
-    EXPECT_TRUE(service.ExistKey(key, TenantId::Default()).value_or(false));
+    {
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            &service,
+            MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
+        ASSERT_TRUE(accessor.Exists());
+        // Part 1 went back to empty; part 0 and the slot count are untouched.
+        EXPECT_EQ(accessor.Get().GetPart(1), nullptr);
+        ASSERT_NE(accessor.Get().GetPart(0), nullptr);
+        EXPECT_TRUE(std::ranges::all_of(accessor.Get().GetPart(0)->replicas(),
+                                        &Replica::fn_is_completed));
+        EXPECT_EQ(accessor.Get().PartCount(), 2u);
+    }
+    // The part can be written again from scratch.
+    EXPECT_TRUE(
+        service.PutStart(writer, key, tenant, kPartLength, PartConfig(1, 2))
+            .has_value());
 }
 
 TEST_F(MasterServiceTest, IncompleteMultiPartObjectIsNotAnEvictionCandidate) {

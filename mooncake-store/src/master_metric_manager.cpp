@@ -128,6 +128,16 @@ MasterMetricManager::MasterMetricManager()
                            "Total number of PutRevoke requests received"),
       put_revoke_failures_("master_put_revoke_failures_total",
                            "Total number of failed PutRevoke requests"),
+      part_put_start_requests_(
+          "master_part_put_start_requests_total",
+          "Total number of PutStart requests that opened a part"),
+      part_put_end_requests_("master_part_put_end_requests_total",
+                             "Total number of PutEnd requests that completed "
+                             "a part"),
+      part_quarantined_replicas_(
+          "master_part_quarantined_replicas_total",
+          "Total number of replicas of a timed-out part moved to the "
+          "quarantine"),
       get_replica_list_requests_(
           "master_get_replica_list_requests_total",
           "Total number of GetReplicaList requests received"),
@@ -606,6 +616,9 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     put_end_failures_.inc(0);
     put_revoke_requests_.inc(0);
     put_revoke_failures_.inc(0);
+    part_put_start_requests_.inc(0);
+    part_put_end_requests_.inc(0);
+    part_quarantined_replicas_.inc(0);
     get_replica_list_requests_.inc(0);
     get_replica_list_failures_.inc(0);
     get_replica_list_by_regex_requests_.inc(0);
@@ -1141,6 +1154,24 @@ void MasterMetricManager::inc_put_revoke_requests(int64_t val) {
 }
 void MasterMetricManager::inc_put_revoke_failures(int64_t val) {
     put_revoke_failures_.inc(val);
+}
+void MasterMetricManager::inc_part_put_start_requests(int64_t val) {
+    part_put_start_requests_.inc(val);
+}
+int64_t MasterMetricManager::get_part_put_start_requests() {
+    return part_put_start_requests_.value();
+}
+void MasterMetricManager::inc_part_put_end_requests(int64_t val) {
+    part_put_end_requests_.inc(val);
+}
+int64_t MasterMetricManager::get_part_put_end_requests() {
+    return part_put_end_requests_.value();
+}
+void MasterMetricManager::inc_part_quarantined_replicas(int64_t val) {
+    part_quarantined_replicas_.inc(val);
+}
+int64_t MasterMetricManager::get_part_quarantined_replicas() {
+    return part_quarantined_replicas_.value();
 }
 void MasterMetricManager::inc_get_replica_list_requests(int64_t val) {
     get_replica_list_requests_.inc(val);
