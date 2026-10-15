@@ -4901,14 +4901,6 @@ auto MasterService::GetReplicaListImpl(const std::string& key,
             }
         }
 
-        // A part is served only once the object it belongs to is readable:
-        // there is no partial hit, so a reader that names one slice of an
-        // object whose other parts are still being written has nothing to read.
-        if (!IsReadable(metadata)) {
-            LOG(WARNING) << "key=" << key << ", error=replica_not_ready";
-            return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
-        }
-
         auto replica_list = GetReadableReplicaDescriptors(*part);
         if (dfs_allocator_) {
             for (const auto& replica : replica_list) {
@@ -4925,6 +4917,14 @@ auto MasterService::GetReplicaListImpl(const std::string& key,
                 })) {
                 return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
             }
+            LOG(WARNING) << "key=" << key << ", error=replica_not_ready";
+            return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+        }
+
+        // The part is there, but the object it belongs to is not readable yet:
+        // there is no partial hit, so a reader that asks for one slice of an
+        // object whose other parts are still being written has nothing to read.
+        if (!IsReadable(metadata)) {
             LOG(WARNING) << "key=" << key << ", error=replica_not_ready";
             return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
         }

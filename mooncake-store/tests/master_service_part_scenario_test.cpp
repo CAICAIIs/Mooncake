@@ -17,7 +17,6 @@
 #include <cstdint>
 #include <memory>
 #include <string>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -29,13 +28,10 @@ namespace {
 
 constexpr uint64_t kPartLength = 512;
 constexpr const char* kSecondSegment = "part_scenario_second_segment";
-// Short enough that a lease taken by a read runs out inside a case.
-constexpr uint64_t kLeaseTtlMs = 100;
 
 MasterServiceConfig PartScenarioConfig() {
     MasterServiceConfig config;
     config.enable_multi_part_objects = true;
-    config.default_kv_lease_ttl = kLeaseTtlMs;
     return config;
 }
 
@@ -223,19 +219,31 @@ TEST_F(MasterServicePartScenarioTest,
     EXPECT_NE(current_ids.front(), stale_ids.front());
 
     // The abandoned attempt's End names replicas it no longer owns, so it
-    // completes nothing and the part stays unreadable.
+    // completes nothing and the part's replicas stay as they are.
     EXPECT_EQ(ErrorOf(service_->PutEnd(writer, PartEndMeta(key, 0, stale_ids),
                                        tenant, ReplicaType::ALL)),
               ErrorCode::INVALID_WRITE);
-    EXPECT_EQ(ErrorOf(service_->GetReplicaListForPart(key, tenant, 0)),
-              ErrorCode::REPLICA_IS_NOT_READY);
+    {
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            service_.get(), MasterServiceTestPeer::ObjectIdentity{tenant, key});
+        ASSERT_TRUE(accessor.Exists());
+        ASSERT_NE(accessor.Get().GetPart(0), nullptr);
+        EXPECT_TRUE(accessor.Get().GetPart(0)->IsWriting());
+    }
 
     EXPECT_TRUE(service_
                     ->PutEnd(writer, PartEndMeta(key, 0, current_ids), tenant,
                              ReplicaType::ALL)
                     .has_value());
-    EXPECT_TRUE(service_->GetReplicaListForPart(key, tenant, 0).has_value());
-    // The object still waits for its other part.
+    {
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            service_.get(), MasterServiceTestPeer::ObjectIdentity{tenant, key});
+        ASSERT_TRUE(accessor.Exists());
+        ASSERT_NE(accessor.Get().GetPart(0), nullptr);
+        EXPECT_TRUE(std::ranges::all_of(accessor.Get().GetPart(0)->replicas(),
+                                        &Replica::fn_is_completed));
+    }
+    // The object still waits for its other part, so it is not readable yet.
     EXPECT_FALSE(service_->ExistKey(key, tenant).value_or(true));
 }
 
@@ -340,9 +348,10 @@ TEST_F(MasterServicePartScenarioTest,
             service_.get(), MasterServiceTestPeer::ObjectIdentity{tenant, key});
         ASSERT_TRUE(accessor.Exists());
         const ObjectMetadata& metadata = accessor.Get();
-        // The lost part is empty, the other part's replica is still there, and
-        // the lease that was granted still covers it.
-        EXPECT_EQ(metadata.GetPart(1), nullptr);
+        // The lost part holds nothing, the other part's replica is still there,
+        // and the lease that was granted still covers it.
+        ASSERT_NE(metadata.GetPart(1), nullptr);
+        EXPECT_TRUE(metadata.GetPart(1)->IsEmpty());
         ASSERT_NE(metadata.GetPart(0), nullptr);
         EXPECT_GT(metadata.EvictionDeadline(),
                   std::chrono::system_clock::now());
