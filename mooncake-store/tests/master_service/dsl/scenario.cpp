@@ -1092,8 +1092,8 @@ MasterScenario& MasterScenario::When(ExpireAtAction action) {
             return false;
         }
         auto& metadata = metadata_it->second.metadata;
+        metadata.SetLeaseDeadline(action.lease_timeout);
         SpinLocker locker(&metadata.lock);
-        metadata.lease_->SetDeadline(action.lease_timeout);
         metadata.soft_pin_timeout = action.soft_pin_timeout;
         return true;
     };

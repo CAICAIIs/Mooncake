@@ -242,12 +242,11 @@ TEST(ObjectRouteTest, PublishLeavesAnUngroupedObjectOnItsOwnLease) {
     ASSERT_NE(PublishObject(route, "k1"), 0u);
     ASSERT_NE(PublishObject(route, "k2"), 0u);
 
-    // An ungrouped object joins no group and keeps the never-granted lease
-    // its envelope was constructed with: present, its own, and expired.
+    // An ungrouped object joins no group and holds no shared lease at all: it
+    // owns one inline, which starts never granted, that is, expired.
     EXPECT_TRUE(route.GroupMembers("").empty());
-    const auto lease = LeaseOf(route, "k1");
-    ASSERT_NE(lease, nullptr);
-    EXPECT_NE(lease.get(), LeaseOf(route, "k2").get());
+    EXPECT_EQ(LeaseOf(route, "k1"), nullptr);
+    EXPECT_EQ(LeaseOf(route, "k2"), nullptr);
     EXPECT_TRUE(route.Read("k1")->metadata().IsLeaseExpired());
 }
 

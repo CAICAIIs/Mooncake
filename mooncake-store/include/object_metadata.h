@@ -181,10 +181,13 @@ struct ObjectMetadata {
     }
 
     mutable SpinLock lock;
-    // Authoritative lease: ungrouped objects own one; grouped objects share
-    // the group's. Never null after construction.
-    mutable std::shared_ptr<Lease> lease_ GUARDED_BY(lock) =
-        std::make_shared<Lease>();
+    // Authoritative lease. An ungrouped object owns one inline and reads it
+    // without the lock: nothing ever replaces it, and every write to it is an
+    // atomic bump. A grouped object shares the group's instead, which is the
+    // only thing `lock` has to guard here; `lease_` stays null until the
+    // object joins a group.
+    mutable Lease own_lease_;
+    mutable std::shared_ptr<Lease> lease_ GUARDED_BY(lock);
     mutable std::optional<std::chrono::system_clock::time_point>
         soft_pin_timeout GUARDED_BY(lock);  // committed object soft-pin
                                             // deadline
@@ -544,24 +547,43 @@ struct ObjectMetadata {
     // group TTL; a zero ttl is a no-op on a live lease (PutEnd cannot
     // expire a live group).
     void GrantReadLease(std::chrono::milliseconds ttl) const {
+        if (!IsGrouped()) {
+            own_lease_.GrantReadLease(ttl);
+            return;
+        }
         SpinLocker locker(&lock);
         lease_->GrantReadLease(ttl);
     }
 
     // Whether the authoritative lease is expired.
     bool IsLeaseExpired() const {
-        SpinLocker locker(&lock);
-        return lease_->IsExpired(std::chrono::system_clock::now());
+        return IsLeaseExpiredAt(std::chrono::system_clock::now());
     }
 
     bool IsLeaseExpired(std::chrono::system_clock::time_point& now) const {
-        SpinLocker locker(&lock);
-        return lease_->IsExpired(now);
+        return IsLeaseExpiredAt(now);
     }
 
     // Lease deadline for the eviction census.
     std::chrono::system_clock::time_point EvictionDeadline() const {
+        if (!IsGrouped()) {
+            return own_lease_.ExpiresAt();
+        }
+        SpinLocker locker(&lock);
         return lease_->ExpiresAt();
+    }
+
+    // Place the authoritative lease at exactly `deadline`, which may be lower
+    // than it is now. The read path only ever extends a lease; test scaffolding
+    // uses this to line an object up with a precise expiry.
+    void SetLeaseDeadline(
+        const std::chrono::system_clock::time_point& deadline) const {
+        if (!IsGrouped()) {
+            own_lease_.SetDeadline(deadline);
+            return;
+        }
+        SpinLocker locker(&lock);
+        lease_->SetDeadline(deadline);
     }
 
     SoftPinEvaluation EvaluateSoftPin(
@@ -753,6 +775,18 @@ struct ObjectMetadata {
     }
 
    private:
+    // Whether the lease that answers for this object is expired at `now`. An
+    // ungrouped object's own lease is lock free; a group's is read under the
+    // lock that guards the pointer to it.
+    bool IsLeaseExpiredAt(
+        const std::chrono::system_clock::time_point& now) const {
+        if (!IsGrouped()) {
+            return own_lease_.IsExpired(now);
+        }
+        SpinLocker locker(&lock);
+        return lease_->IsExpired(now);
+    }
+
     std::vector<PartSlot> slots_;
     // The clients that have written a part of this object, in the order they
     // first did. A slot's `writer` indexes this, which is how "who wrote this

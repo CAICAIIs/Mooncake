@@ -2178,7 +2178,7 @@ void MasterService::RebuildGroupState() {
                     continue;
                 }
                 const auto scoped = tenant_id.MakeScopedKey(metadata.group_id);
-                const auto deadline = metadata.lease_->ExpiresAt();
+                const auto deadline = metadata.EvictionDeadline();
                 auto [it, inserted] =
                     max_deadline_by_group.try_emplace(scoped, deadline);
                 if (!inserted) {
