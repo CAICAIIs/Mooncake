@@ -179,7 +179,8 @@ class DynamicReplicationTest : public ::testing::Test {
             &service,
             MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
         ASSERT_TRUE(accessor.Exists());
-        accessor.Get().put_start_time += std::chrono::milliseconds(1);
+        accessor.Get().MutableSlot(0).last_started +=
+            std::chrono::milliseconds(1);
     }
 
     // True when the object still carries dynamic-replication state: its own

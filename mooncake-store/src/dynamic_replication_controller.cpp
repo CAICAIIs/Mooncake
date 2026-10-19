@@ -674,9 +674,16 @@ size_t DynamicReplicationController::RecordReplicaRemoval(
 
 uint64_t DynamicReplicationController::VersionEpoch(
     const ObjectMetadata& metadata) {
+    // The newest write on any part: a write that starts after a proposal was
+    // admitted is what makes that proposal stale.
+    std::chrono::system_clock::time_point newest_write{};
+    for (size_t index = 0; index < metadata.part_count; ++index) {
+        newest_write =
+            std::max(newest_write, metadata.Slot(index).last_started);
+    }
     return static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
-            metadata.put_start_time.time_since_epoch())
+            newest_write.time_since_epoch())
             .count());
 }
 

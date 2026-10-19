@@ -2378,6 +2378,10 @@ class MasterService {
         const ObjectMetadata& metadata) const;
     bool IsReplicaReadable(const Replica& replica) const;
     bool HasReadableReplica(const ObjectMetadata& metadata) const;
+    // The checksum part `index` recorded, or nothing when that part holds no
+    // content.
+    std::optional<uint64_t> ReadPartChecksum(const ObjectMetadata& metadata,
+                                             size_t index) const;
     bool IsEvictableMemoryReplica(const Replica& replica) const;
 
     /**
