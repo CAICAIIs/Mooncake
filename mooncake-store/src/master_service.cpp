@@ -1239,13 +1239,23 @@ bool MasterService::TenantHasObjects(const TenantId& tenant_id) const {
 
 uint64_t MasterService::CompletedMemoryQuotaCharge(
     const ObjectMetadata& metadata) const {
-    const auto completed_replicas =
-        metadata.CountReplicas([](const Replica& replica) {
-            return replica.is_memory_replica() && replica.is_completed();
-        });
-    const unsigned __int128 charge =
-        static_cast<unsigned __int128>(metadata.TotalLength()) *
-        completed_replicas;
+    // Each part was charged for its own length times its own copies, so the
+    // object's charge is the sum of what its parts hold rather than the
+    // object's total length times every replica it has.
+    unsigned __int128 charge = 0;
+    for (size_t part_index = 0; part_index < metadata.part_count;
+         ++part_index) {
+        const ObjectPart* part = metadata.GetPart(part_index);
+        if (part == nullptr) {
+            continue;
+        }
+        const auto completed_replicas =
+            std::ranges::count_if(part->replicas(), [](const Replica& replica) {
+                return replica.is_memory_replica() && replica.is_completed();
+            });
+        charge += static_cast<unsigned __int128>(part->length()) *
+                  static_cast<uint64_t>(completed_replicas);
+    }
     return charge > std::numeric_limits<uint64_t>::max()
                ? std::numeric_limits<uint64_t>::max()
                : static_cast<uint64_t>(charge);
@@ -5844,12 +5854,14 @@ auto MasterService::PutStartForPart(const UUID& client_id,
                             part_allocated = true;
                             if (enable_multi_tenants_) {
                                 auto adopt_result =
-                                    metadata.quota_ledger.AdoptPendingCharge(
-                                        GetBoundTenantQuotaHandle(tenant_state),
-                                        pending_quota_charge);
+                                    metadata.quota_ledger
+                                        .AdoptAdditionalPendingCharge(
+                                            GetBoundTenantQuotaHandle(
+                                                tenant_state),
+                                            pending_quota_charge);
                                 if (!adopt_result) {
                                     LogTenantQuotaLedgerError(
-                                        adopt_result, "adopt_pending",
+                                        adopt_result, "adopt_part_pending",
                                         object_id.tenant_id, key);
                                     return tl::make_unexpected(
                                         ErrorCode::INTERNAL_ERROR);

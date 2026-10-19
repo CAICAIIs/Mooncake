@@ -32,6 +32,22 @@ TenantQuotaResult TenantQuotaLedger::AdoptPendingCharge(
     return {};
 }
 
+TenantQuotaResult TenantQuotaLedger::AdoptAdditionalPendingCharge(
+    TenantQuotaHandle account, uint64_t bytes) {
+    if (account == nullptr || bytes > TenantQuotaAccount::kMaxChargedBytes) {
+        return InvalidArgument();
+    }
+    // Another part of the same object: its bytes join the ones already waiting
+    // for the object to become readable, which is when the whole of it
+    // settles.
+    if (AddOverflows(pending_bytes_, bytes) ||
+        AddOverflows(TotalChargedBytes(), bytes)) {
+        return AccountingMismatch();
+    }
+    pending_bytes_ += bytes;
+    return {};
+}
+
 TenantQuotaResult TenantQuotaLedger::SettlePrimaryWrite(
     TenantQuotaHandle account, uint64_t actual_committed_bytes) {
     if (account == nullptr ||

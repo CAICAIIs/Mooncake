@@ -345,8 +345,8 @@ DecodeBatchOpLogSnapshotManifest(std::string_view value) {
     if (!DecodeObjectDescriptor(root["segments"], decoded.segments, &reason)) {
         return tl::make_unexpected(std::move(reason));
     }
-    if (decoded.schema_version == kBatchOpLogWeightSnapshotSchemaVersion ||
-        decoded.schema_version >= kBatchOpLogSnapshotMinReaderVersion) {
+    if (decoded.schema_version == kBatchOpLogWeightSnapshotSchemaVersion) {
+        // v2 exists for the weight state, so a v2 manifest must carry it.
         BatchOpLogSnapshotObjectDescriptor weights;
         if (!root.isMember("weight_metadata") ||
             !DecodeObjectDescriptor(root["weight_metadata"], weights,
@@ -356,8 +356,18 @@ DecodeBatchOpLogSnapshotManifest(std::string_view value) {
         }
         decoded.weight_metadata = std::move(weights);
     } else if (root.isMember("weight_metadata")) {
-        return tl::make_unexpected(
-            std::string("Weight metadata requires snapshot v2"));
+        // A snapshot that carries parts may also carry weights.
+        if (decoded.schema_version < kBatchOpLogSnapshotMinReaderVersion) {
+            return tl::make_unexpected(
+                std::string("Weight metadata requires snapshot v2"));
+        }
+        BatchOpLogSnapshotObjectDescriptor weights;
+        if (!DecodeObjectDescriptor(root["weight_metadata"], weights,
+                                    &reason)) {
+            return tl::make_unexpected(
+                std::string("Invalid weight_metadata descriptor: ") + reason);
+        }
+        decoded.weight_metadata = std::move(weights);
     }
     if (!root.isMember("object_chunks") || !root["object_chunks"].isArray()) {
         SetReason(&reason, "object_chunks must be a JSON array");

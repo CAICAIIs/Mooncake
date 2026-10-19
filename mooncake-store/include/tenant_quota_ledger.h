@@ -22,6 +22,12 @@ class TenantQuotaLedger {
     TenantQuotaResult AdoptPendingCharge(TenantQuotaHandle account,
                                          uint64_t bytes);
 
+    // Records bytes the caller has already charged for one more part of an
+    // object that is still being written. The parts of one object settle
+    // together, when the object becomes readable.
+    TenantQuotaResult AdoptAdditionalPendingCharge(TenantQuotaHandle account,
+                                                   uint64_t bytes);
+
     // Completes a primary Put/Upsert lifecycle. The replacement bucket is
     // always released; pending/committed bytes are reconciled to
     // actual_committed_bytes. Validation and the account release complete
