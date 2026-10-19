@@ -492,6 +492,31 @@ class MasterService {
         const UUID& client_id, const std::vector<std::string>& keys,
         const TenantId& tenant_id, ReplicaType replica_type = ReplicaType::ALL);
 
+    // The per-part protocol. `part_count` is fixed by the object's first
+    // PutStart and applies to every item of one call; `part_index` is per
+    // item. These are the one implementation of the write and read rules: the
+    // calls above build single-part items for them, so an ordinary object and
+    // a multi-part one take the same path.
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    BatchPutStartForPart(const UUID& client_id, uint32_t part_count,
+                         std::span<const PutPartItem> items,
+                         const TenantId& tenant_id,
+                         const ReplicateConfig& config);
+
+    std::vector<tl::expected<void, ErrorCode>> BatchPutEndForPart(
+        const UUID& client_id, uint32_t part_count,
+        std::span<const PutEndPartItem> items, const TenantId& tenant_id,
+        ReplicaType replica_type = ReplicaType::ALL);
+
+    std::vector<tl::expected<void, ErrorCode>> BatchPutRevokeForPart(
+        const UUID& client_id, uint32_t part_count,
+        std::span<const PutRevokePartItem> items, const TenantId& tenant_id,
+        ReplicaType replica_type = ReplicaType::ALL);
+
+    std::vector<tl::expected<GetReplicaListForPartResponse, ErrorCode>>
+    BatchGetReplicaListForPart(std::span<const GetPartItem> items,
+                               const TenantId& tenant_id);
+
     /**
      * @brief Start an upsert operation. If the key does not exist, behaves
      * like PutStart. If the key exists with the same size, performs in-place
@@ -1530,7 +1555,8 @@ class MasterService {
                         std::vector<Replica>&& replicas,
                         uint64_t pending_quota_charge,
                         std::optional<std::chrono::system_clock::time_point>
-                            committed_soft_pin_timeout = std::nullopt)
+                            committed_soft_pin_timeout = std::nullopt,
+                        uint32_t part_count = 1, uint32_t part_index = 0)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
     // Helper: allocate replicas, create ObjectMetadata, insert into shard,
@@ -1544,8 +1570,42 @@ class MasterService {
         const ResolvedSoftPinRequest& soft_pin_request,
         std::optional<std::chrono::system_clock::time_point>
             committed_soft_pin_timeout = std::nullopt,
-        bool* dfs_allocation_failed = nullptr)
+        bool* dfs_allocation_failed = nullptr, uint32_t part_count = 1,
+        uint32_t part_index = 0)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
+
+    // The one write and read logic per part. Every Put/Get entry above builds
+    // items for these.
+    auto PutStartForPart(const UUID& client_id, const std::string& key,
+                         uint32_t part_count, uint32_t part_index,
+                         uint64_t slice_length, const TenantId& tenant_id,
+                         const ReplicateConfig& config)
+        -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
+
+    auto PutEndForPart(const UUID& client_id, const std::string& key,
+                       uint32_t part_count, uint32_t part_index,
+                       const std::optional<uint64_t>& object_checksum,
+                       const std::vector<ReplicaID>& replica_ids,
+                       const TenantId& tenant_id, ReplicaType replica_type)
+        -> tl::expected<void, ErrorCode>;
+
+    auto PutRevokeForPart(const UUID& client_id, const std::string& key,
+                          uint32_t part_count, uint32_t part_index,
+                          const std::vector<ReplicaID>& replica_ids,
+                          const TenantId& tenant_id, ReplicaType replica_type)
+        -> tl::expected<void, ErrorCode>;
+
+    // Whether `replica_ids` names nothing this attempt handed out. An empty
+    // list is not a mismatch: an ordinary object's callers may omit it.
+    static bool ReplicasOutsideAttempt(
+        const std::vector<ReplicaID>& replica_ids, const WriteAttempt& attempt);
+
+    // Whether any replica this attempt handed out is still being written. One
+    // PutStart can hand out replicas on several media, and each of them is
+    // completed by its own PutEnd, so the attempt outlives the first of them.
+    static bool AttemptStillInFlight(const ObjectMetadata& metadata,
+                                     size_t part_index,
+                                     const std::vector<ReplicaID>& replica_ids);
 
     /**
      * @brief Helper to discard expired processing keys.
@@ -2376,6 +2436,12 @@ class MasterService {
                                          Replica::Descriptor& descriptor) const;
     std::vector<Replica::Descriptor> GetReadableReplicaDescriptors(
         const ObjectMetadata& metadata) const;
+    // The descriptors of one part's replicas that a reader may use right now.
+    std::vector<Replica::Descriptor> GetReadableReplicaDescriptors(
+        const ObjectMetadata& metadata, size_t part_index) const;
+    std::vector<Replica> PopPartReplicasWithCacheTotalAccounting(
+        ObjectMetadata& metadata, size_t part_index,
+        const std::function<bool(const Replica&)>& pred_fn);
     bool IsReplicaReadable(const Replica& replica) const;
     bool HasReadableReplica(const ObjectMetadata& metadata) const;
     // The checksum part `index` recorded, or nothing when that part holds no

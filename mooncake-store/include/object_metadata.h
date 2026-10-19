@@ -359,35 +359,39 @@ struct ObjectMetadata {
 
     // A part's last replica leaving also drops its length: an empty part keeps
     // no content at all, so no other slot state needs rewinding.
+    std::vector<Replica> PopReplicasOfPart(
+        size_t index, const std::function<bool(const Replica&)>& pred_fn) {
+        auto& slot = slots_.at(index);
+        if (!slot.part.has_value()) {
+            return {};
+        }
+        auto popped_replicas = slot.part->PopReplicas(pred_fn);
+        if (slot.part->replicas().empty()) {
+            slot.part.reset();
+        }
+        return popped_replicas;
+    }
+
     std::vector<Replica> PopAllReplicas(
         const std::function<bool(const Replica&)>& pred_fn) {
         std::vector<Replica> popped_replicas;
-        for (auto& slot : slots_) {
-            if (!slot.part.has_value()) {
-                continue;
-            }
-            auto from_slot = slot.part->PopReplicas(pred_fn);
+        for (size_t index = 0; index < slots_.size(); ++index) {
+            auto from_part = PopReplicasOfPart(index, pred_fn);
             popped_replicas.insert(popped_replicas.end(),
-                                   std::make_move_iterator(from_slot.begin()),
-                                   std::make_move_iterator(from_slot.end()));
-            if (slot.part->replicas().empty()) {
-                slot.part.reset();
-            }
+                                   std::make_move_iterator(from_part.begin()),
+                                   std::make_move_iterator(from_part.end()));
         }
         return popped_replicas;
     }
 
     std::vector<Replica> PopAllReplicas() {
         std::vector<Replica> popped_replicas;
-        for (auto& slot : slots_) {
-            if (!slot.part.has_value()) {
-                continue;
-            }
-            auto from_slot = slot.part->PopReplicas();
+        for (size_t index = 0; index < slots_.size(); ++index) {
+            auto from_part =
+                PopReplicasOfPart(index, [](const Replica&) { return true; });
             popped_replicas.insert(popped_replicas.end(),
-                                   std::make_move_iterator(from_slot.begin()),
-                                   std::make_move_iterator(from_slot.end()));
-            slot.part.reset();
+                                   std::make_move_iterator(from_part.begin()),
+                                   std::make_move_iterator(from_part.end()));
         }
         return popped_replicas;
     }

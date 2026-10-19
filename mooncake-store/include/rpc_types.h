@@ -97,6 +97,53 @@ struct GetReplicaListResponse {
 YLT_REFL(GetReplicaListResponse, replicas, lease_ttl_ms, object_checksum,
          resolved_tenant_id);
 
+// One item of a batch that names parts. `part_count` is a property of the
+// whole call: every item in one batch belongs to an object of that many parts,
+// and `part_index` says which of them the item is about.
+struct PutPartItem {
+    std::string key;
+    uint32_t part_index{0};
+    uint64_t length{0};
+};
+YLT_REFL(PutPartItem, key, part_index, length);
+
+// `replica_ids` are the replicas the matching PutStart handed out, so the End
+// is scoped to that write attempt.
+struct PutEndPartItem {
+    std::string key;
+    uint32_t part_index{0};
+    std::optional<uint64_t> checksum;
+    std::vector<ReplicaID> replica_ids;
+};
+YLT_REFL(PutEndPartItem, key, part_index, checksum, replica_ids);
+
+struct PutRevokePartItem {
+    std::string key;
+    uint32_t part_index{0};
+    std::vector<ReplicaID> replica_ids;
+};
+YLT_REFL(PutRevokePartItem, key, part_index, replica_ids);
+
+struct GetPartItem {
+    std::string key;
+    uint32_t part_index{0};
+};
+YLT_REFL(GetPartItem, key, part_index);
+
+// The answer for one part: what that part holds and how much of the object it
+// is, so a reader can plan a gather without a second call.
+struct GetReplicaListForPartResponse {
+    uint32_t part_index{0};
+    uint32_t part_count{1};
+    uint64_t length{0};
+    std::optional<uint64_t> checksum;
+    std::vector<Replica::Descriptor> replicas;
+    uint64_t lease_ttl_ms{0};
+    struct_pack::compatible<std::string, 1> resolved_tenant_id;
+};
+YLT_REFL(GetReplicaListForPartResponse, part_index, part_count, length,
+         checksum, replicas, lease_ttl_ms, resolved_tenant_id);
+
 struct CachedQueryResultResponse {
     bool success;
     GetReplicaListResponse value;

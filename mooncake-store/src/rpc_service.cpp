@@ -691,6 +691,173 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutRevoke(
     return results;
 }
 
+std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+WrappedMasterService::BatchPutStartForPart(
+    const UUID& client_id, uint32_t part_count,
+    const std::vector<PutPartItem>& items, const ReplicateConfig& config,
+    const std::string& tenant_id) {
+    ScopedVLogTimer timer(1, "BatchPutStartForPart");
+    timer.LogRequest("client_id=", client_id, ", part_count=", part_count,
+                     ", items_count=", items.size());
+    MasterMetricManager::instance().inc_batch_put_start_requests(items.size());
+
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+        results;
+    results.reserve(items.size());
+    auto resolved_tenant_id = ResolveTenantIdForWrite(
+        tenant_id, master_service_.IsTenantQuotaEnabled());
+    if (!resolved_tenant_id) {
+        results.assign(items.size(),
+                       tl::make_unexpected(resolved_tenant_id.error()));
+        return results;
+    }
+    if (!config.ValidSessionIds(items.size()) ||
+        (config.group_ids.has_value() &&
+         config.group_ids->size() != items.size())) {
+        results.assign(items.size(),
+                       tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+        return results;
+    }
+
+    ReplicateConfig key_config = config;
+    for (size_t i = 0; i < items.size(); ++i) {
+        key_config.SetKeyIds(config, i);
+        const std::array<PutPartItem, 1> single{items[i]};
+        auto single_result = master_service_.BatchPutStartForPart(
+            client_id, part_count, single, resolved_tenant_id.value(),
+            key_config);
+        results.emplace_back(std::move(single_result.front()));
+    }
+
+    size_t failure_count = 0;
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (!results[i].has_value()) {
+            ++failure_count;
+            LOG(ERROR) << "BatchPutStartForPart failed for item[" << i << "] '"
+                       << items[i].key
+                       << "', part_index=" << items[i].part_index << ": "
+                       << toString(results[i].error());
+        }
+    }
+    if (failure_count == items.size()) {
+        MasterMetricManager::instance().inc_batch_put_start_failures(
+            failure_count);
+    } else if (failure_count != 0) {
+        MasterMetricManager::instance().inc_batch_put_start_partial_success(
+            failure_count);
+    }
+    timer.LogResponse("total=", results.size(),
+                      ", success=", results.size() - failure_count,
+                      ", failures=", failure_count);
+    return results;
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+WrappedMasterService::BatchPutEndForPart(
+    const UUID& client_id, uint32_t part_count,
+    const std::vector<PutEndPartItem>& items, ReplicaType replica_type,
+    const std::string& tenant_id) {
+    ScopedVLogTimer timer(1, "BatchPutEndForPart");
+    timer.LogRequest("client_id=", client_id, ", part_count=", part_count,
+                     ", items_count=", items.size());
+    MasterMetricManager::instance().inc_batch_put_end_requests(items.size());
+
+    auto results = WithRequestTenantBatch(
+        master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
+                                               : TenantId::kDefaultValue,
+        items.size(), [&](const TenantId& resolved_tenant_id) {
+            return master_service_.BatchPutEndForPart(
+                client_id, part_count, items, resolved_tenant_id, replica_type);
+        });
+
+    size_t failure_count = 0;
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (!results[i].has_value()) {
+            ++failure_count;
+            LOG(ERROR) << "BatchPutEndForPart failed for item[" << i << "] '"
+                       << items[i].key
+                       << "', part_index=" << items[i].part_index << ": "
+                       << toString(results[i].error());
+        }
+    }
+    if (failure_count == items.size()) {
+        MasterMetricManager::instance().inc_batch_put_end_failures(
+            failure_count);
+    } else if (failure_count != 0) {
+        MasterMetricManager::instance().inc_batch_put_end_partial_success(
+            failure_count);
+    }
+    timer.LogResponse("total=", results.size(),
+                      ", success=", results.size() - failure_count,
+                      ", failures=", failure_count);
+    return results;
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+WrappedMasterService::BatchPutRevokeForPart(
+    const UUID& client_id, uint32_t part_count,
+    const std::vector<PutRevokePartItem>& items, ReplicaType replica_type,
+    const std::string& tenant_id) {
+    ScopedVLogTimer timer(1, "BatchPutRevokeForPart");
+    timer.LogRequest("client_id=", client_id, ", part_count=", part_count,
+                     ", items_count=", items.size());
+    MasterMetricManager::instance().inc_batch_put_revoke_requests(items.size());
+
+    auto results = WithRequestTenantBatch(
+        master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
+                                               : TenantId::kDefaultValue,
+        items.size(), [&](const TenantId& resolved_tenant_id) {
+            return master_service_.BatchPutRevokeForPart(
+                client_id, part_count, items, resolved_tenant_id, replica_type);
+        });
+
+    size_t failure_count = 0;
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (!results[i].has_value()) {
+            ++failure_count;
+            LOG(ERROR) << "BatchPutRevokeForPart failed for item[" << i << "] '"
+                       << items[i].key
+                       << "', part_index=" << items[i].part_index << ": "
+                       << toString(results[i].error());
+        }
+    }
+    if (failure_count == items.size()) {
+        MasterMetricManager::instance().inc_batch_put_revoke_failures(
+            failure_count);
+    } else if (failure_count != 0) {
+        MasterMetricManager::instance().inc_batch_put_revoke_partial_success(
+            failure_count);
+    }
+    timer.LogResponse("total=", results.size(),
+                      ", success=", results.size() - failure_count,
+                      ", failures=", failure_count);
+    return results;
+}
+
+std::vector<tl::expected<GetReplicaListForPartResponse, ErrorCode>>
+WrappedMasterService::BatchGetReplicaListForPart(
+    const std::vector<GetPartItem>& items, const std::string& tenant_id) {
+    ScopedVLogTimer timer(1, "BatchGetReplicaListForPart");
+    timer.LogRequest("items_count=", items.size());
+    MasterMetricManager::instance().inc_batch_get_replica_list_requests(
+        items.size());
+
+    auto results = WithRequestTenantBatch(
+        master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
+                                               : TenantId::kDefaultValue,
+        items.size(), [&](const TenantId& resolved_tenant_id) {
+            auto batch = master_service_.BatchGetReplicaListForPart(
+                items, resolved_tenant_id);
+            for (auto& result : batch) {
+                if (result) {
+                    result->resolved_tenant_id = resolved_tenant_id.value();
+                }
+            }
+            return batch;
+        });
+    return results;
+}
+
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
 WrappedMasterService::UpsertStart(const UUID& client_id, const std::string& key,
                                   const uint64_t slice_length,
@@ -1899,6 +2066,10 @@ void RegisterRpcService(coro_rpc::coro_rpc_server& server,
         &WrappedMasterService::PutRevoke, &WrappedMasterService::BatchPutStart,
         &WrappedMasterService::BatchPutEnd,
         &WrappedMasterService::BatchPutRevoke,
+        &WrappedMasterService::BatchPutStartForPart,
+        &WrappedMasterService::BatchPutEndForPart,
+        &WrappedMasterService::BatchPutRevokeForPart,
+        &WrappedMasterService::BatchGetReplicaListForPart,
         &WrappedMasterService::UpsertStart, &WrappedMasterService::UpsertEnd,
         &WrappedMasterService::UpsertRevoke,
         &WrappedMasterService::BatchUpsertStart,

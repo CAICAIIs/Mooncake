@@ -120,6 +120,31 @@ class WrappedMasterService {
         ReplicaType replica_type = ReplicaType::ALL,
         const std::string& tenant_id = "default");
 
+    // The per-part calls: `part_count` is the object's part count, and each
+    // item names the part it is about. A request naming several parts of one
+    // key is what a TP rank set sends.
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    BatchPutStartForPart(const UUID& client_id, uint32_t part_count,
+                         const std::vector<PutPartItem>& items,
+                         const ReplicateConfig& config,
+                         const std::string& tenant_id = "default");
+
+    std::vector<tl::expected<void, ErrorCode>> BatchPutEndForPart(
+        const UUID& client_id, uint32_t part_count,
+        const std::vector<PutEndPartItem>& items,
+        ReplicaType replica_type = ReplicaType::ALL,
+        const std::string& tenant_id = "default");
+
+    std::vector<tl::expected<void, ErrorCode>> BatchPutRevokeForPart(
+        const UUID& client_id, uint32_t part_count,
+        const std::vector<PutRevokePartItem>& items,
+        ReplicaType replica_type = ReplicaType::ALL,
+        const std::string& tenant_id = "default");
+
+    std::vector<tl::expected<GetReplicaListForPartResponse, ErrorCode>>
+    BatchGetReplicaListForPart(const std::vector<GetPartItem>& items,
+                               const std::string& tenant_id = "default");
+
     tl::expected<std::vector<Replica::Descriptor>, ErrorCode> UpsertStart(
         const UUID& client_id, const std::string& key,
         const uint64_t slice_length, const ReplicateConfig& config,
