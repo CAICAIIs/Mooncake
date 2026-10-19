@@ -256,13 +256,30 @@ bool StandbyMetadataStore::ValidateReplicaIds(ReplicaID& max_replica_id) const {
         for (const auto& [key, metadata] : objects) {
             (void)key;
             std::unordered_set<ReplicaID> object_ids;
-            for (const auto& replica : metadata.replicas) {
+            // A part object carries its replicas per part, so both shapes are
+            // walked: the id space is one sequence whichever way it is stored.
+            const auto note_replica = [&](const Replica::Descriptor& replica) {
                 if (replica.id == 0 ||
                     replica.id == std::numeric_limits<ReplicaID>::max() ||
                     !object_ids.insert(replica.id).second) {
                     return false;
                 }
                 max_replica_id = std::max(max_replica_id, replica.id);
+                return true;
+            };
+            for (const auto& replica : metadata.replicas) {
+                if (!note_replica(replica)) {
+                    return false;
+                }
+            }
+            if (metadata.parts.has_value()) {
+                for (const auto& part : *metadata.parts) {
+                    for (const auto& replica : part.replicas) {
+                        if (!note_replica(replica)) {
+                            return false;
+                        }
+                    }
+                }
             }
         }
     }

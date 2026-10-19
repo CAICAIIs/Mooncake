@@ -61,11 +61,14 @@ class KvEventPublisher {
     // Publish a successful Put/Upsert commit. Every currently available medium
     // receives a stored event. A commit is always announced, even when the
     // medium set is unchanged, because the object contents may have changed.
+    // part_count says how many parts the object holds: one key can be several
+    // independently written slices, and the subscriber reads them apart.
     void PublishCommitted(const std::string& object_key,
                           const std::vector<std::string>& current_media,
                           const std::string& tenant_id = "",
                           const std::string& group_id = "",
-                          const std::string& session_id = "");
+                          const std::string& session_id = "",
+                          uint32_t part_count = 1);
 
     // Synchronize replica availability after an internal metadata mutation.
     // previous_media is the medium set captured before the mutation; media that
@@ -101,6 +104,7 @@ class KvEventPublisher {
         std::string tenant_id;
         std::string group_id;
         std::string session_id{};
+        uint32_t part_count{1};
     };
 
     void EnqueueBatch(std::vector<PendingEvent> events);
@@ -149,7 +153,7 @@ class KvEventPublisher {
     void PublishCleared(const std::string& = "") {}
     void PublishCommitted(const std::string&, const std::vector<std::string>&,
                           const std::string& = "", const std::string& = "",
-                          const std::string& = "") {}
+                          const std::string& = "", uint32_t = 1) {}
     void SyncObjectState(const std::string&, const std::vector<std::string>&,
                          const std::string& = "", const std::string& = "",
                          const std::vector<std::string>& = {},

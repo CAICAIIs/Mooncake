@@ -8,16 +8,10 @@
 
 #include <ylt/util/tl/expected.hpp>
 
+#include "ha/snapshot/snapshot_constants.h"
 #include "types.h"
 
 namespace mooncake::ha {
-
-inline constexpr uint32_t kBatchOpLogSnapshotSchemaVersion = 1;
-inline constexpr char kBatchOpLogSnapshotFormat[] =
-    "standby-oplog-materialized/v1";
-inline constexpr uint32_t kBatchOpLogWeightSnapshotSchemaVersion = 2;
-inline constexpr char kBatchOpLogWeightSnapshotFormat[] =
-    "standby-oplog-materialized/v2";
 
 struct BatchOpLogSnapshotDescriptor {
     uint32_t schema_version{kBatchOpLogSnapshotSchemaVersion};

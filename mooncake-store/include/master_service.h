@@ -2393,9 +2393,21 @@ class MasterService {
     std::string SerializeMetadataForOpLog(const ObjectMetadata& metadata) const;
     std::string SerializeMetadataForOpLogWithoutMemReplicas(
         const ObjectMetadata& metadata) const;
+    // The payload as the object will be once the replicas `should_remove`
+    // matches are gone. This is what a part object needs: one flat descriptor
+    // list cannot say which part each replica belongs to.
+    std::string SerializeMetadataForOpLogWithoutReplicas(
+        const ObjectMetadata& metadata,
+        const std::function<bool(const Replica&)>& should_remove) const;
     std::string SerializeMetadataForOpLogFromReplicaDescriptors(
         const ObjectMetadata& metadata,
         const std::vector<Replica::Descriptor>& replicas) const;
+    // The common body of the three above. An object of one part keeps every
+    // field at the top level, so its payload is byte for byte what it was
+    // before parts existed; an object of several fills the parts instead.
+    MetadataPayload BuildMetadataPayload(
+        const ObjectMetadata& metadata,
+        const std::function<bool(const Replica&)>& should_remove) const;
     ErrorCode InitializeBatchOpLogWriter(std::shared_ptr<HaKvBackend> backend,
                                          bool require_fenced_writer);
     tl::expected<uint64_t, ErrorCode> AppendOpLogVisibleBeforeDurable(

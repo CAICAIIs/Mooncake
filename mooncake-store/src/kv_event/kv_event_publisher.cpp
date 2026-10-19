@@ -54,7 +54,8 @@ size_t ComputeEventMapSize(bool is_stored, bool is_cleared, bool emit_legacy,
         map_size += 1;  // object_key
     }
     if (is_stored) {
-        map_size += 4;  // base_block_idx, parent_hash, token_ids, session_id
+        // base_block_idx, parent_hash, token_ids, session_id, part_count
+        map_size += 5;
         if (emit_legacy) {
             map_size += 1;  // parent_block_hash
         }
@@ -222,7 +223,8 @@ void KvEventPublisher::PublishCleared(const std::string& tenant_id) {
 void KvEventPublisher::PublishCommitted(
     const std::string& object_key,
     const std::vector<std::string>& current_media, const std::string& tenant_id,
-    const std::string& group_id, const std::string& session_id) {
+    const std::string& group_id, const std::string& session_id,
+    uint32_t part_count) {
     if (!config_.enabled) {
         return;
     }
@@ -234,7 +236,8 @@ void KvEventPublisher::PublishCommitted(
     // the previous contents.
     for (const auto& medium : SortedMedia(NormalizeMedia(current_media))) {
         events.push_back(PendingEvent{EventKind::kStored, object_key, medium,
-                                      normalized_tenant, group_id, session_id});
+                                      normalized_tenant, group_id, session_id,
+                                      part_count});
     }
     EnqueueBatch(std::move(events));
 }
@@ -451,6 +454,8 @@ void KvEventPublisher::PublishBatch(const std::vector<PendingEvent>& batch) {
         if (is_stored) {
             packer.pack("session_id");
             PackOptionalString(packer, item.pending.session_id);
+            packer.pack("part_count");
+            packer.pack(item.pending.part_count);
             packer.pack("base_block_idx");
             packer.pack_nil();
             packer.pack("parent_hash");

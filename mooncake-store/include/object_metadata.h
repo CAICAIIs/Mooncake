@@ -332,6 +332,17 @@ struct ObjectMetadata {
         return false;
     }
 
+    // Whether any part still carries a write at all, whatever its age. A part
+    // whose WriteAttempt is gone has been ended or revoked.
+    bool HasRecordedWrite() const {
+        for (const auto& slot : slots_) {
+            if (slot.attempt != nullptr) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     size_t TotalLength() const {
         size_t total = 0;
         for (const auto& slot : slots_) {

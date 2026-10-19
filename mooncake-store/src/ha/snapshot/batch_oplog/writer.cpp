@@ -149,6 +149,7 @@ tl::expected<std::string, std::string> BatchOpLogSnapshotWriter::Write(
     }
 
     uint64_t chunk_index = 0;
+    bool has_multi_part_objects = false;
     while (!capture.done()) {
         std::vector<StandbyObjectEntry> objects;
         if (!standby.CopyNextBatchOpLogSnapshotChunk(chunk_object_count,
@@ -160,6 +161,14 @@ tl::expected<std::string, std::string> BatchOpLogSnapshotWriter::Write(
         }
 
         const size_t object_count = objects.size();
+        // A snapshot that holds an object of several parts needs a reader that
+        // understands parts, so its identity is raised once one appears.
+        for (const auto& object : objects) {
+            if (object.metadata.parts.has_value() &&
+                !object.metadata.parts->empty()) {
+                has_multi_part_objects = true;
+            }
+        }
         auto encoded = EncodeBatchOpLogSnapshotObjectChunk(chunk_index,
                                                            std::move(objects));
         const std::string key = ha::BuildBatchOpLogSnapshotObjectChunkKey(
@@ -180,6 +189,13 @@ tl::expected<std::string, std::string> BatchOpLogSnapshotWriter::Write(
         ++chunk_index;
     }
     end_capture();
+
+    if (has_multi_part_objects) {
+        // Every object is encoded by now, so the identity the manifest and the
+        // descriptor are written with is decided last.
+        manifest.schema_version = ha::kBatchOpLogSnapshotMinReaderVersion;
+        manifest.snapshot_format = ha::kBatchOpLogPartSnapshotFormat;
+    }
 
     auto verify =
         VerifyObject(object_store_, manifest.segments.key,

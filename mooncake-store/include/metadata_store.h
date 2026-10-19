@@ -19,6 +19,24 @@ inline std::string NormalizeTenantId(std::string_view tenant_id) {
 }
 
 /**
+ * @brief One part of an object as it travels through a snapshot or an OpLog.
+ *
+ * An object with one part keeps its fields at the top level, so its payload is
+ * byte for byte what it was before parts existed. An object of several parts
+ * fills these instead and leaves the top-level replica list empty, so a reader
+ * that does not know parts sees an object it cannot use rather than several
+ * interchangeable replicas.
+ */
+struct PartPayload {
+    uint32_t part_index{0};
+    uint64_t length{0};
+    std::optional<uint64_t> checksum;
+    std::vector<Replica::Descriptor> replicas;
+
+    YLT_REFL(PartPayload, part_index, length, checksum, replicas);
+};
+
+/**
  * @brief Metadata structure for Standby to store and restore object information
  *
  * This structure contains all essential metadata information needed by Standby
@@ -41,13 +59,24 @@ struct StandbyObjectMetadata {
 
     struct_pack::compatible<std::string, 2> session_id;
 
+    // Present only for an object of more than one part.
+    struct_pack::compatible<std::vector<PartPayload>, 3> parts;
+
     StandbyObjectMetadata() = default;
 
     YLT_REFL(StandbyObjectMetadata, client_id, size, replicas, group_id,
-             data_type, hard_pinned, session_id);
+             data_type, hard_pinned, session_id, parts);
 
     // Check if this metadata has valid replicas
     bool HasReplicas() const { return !replicas.empty(); }
+
+    // The number of parts the object holds: what `parts` carries when it holds
+    // more than one, and one otherwise.
+    uint32_t PartCount() const {
+        return parts.has_value() && !parts->empty()
+                   ? static_cast<uint32_t>(parts->size())
+                   : 1u;
+    }
 };
 
 /**
@@ -110,8 +139,13 @@ struct MetadataPayload {
 
     struct_pack::compatible<std::string, 2> session_id;
 
+    // Present only for an object of more than one part, where it replaces the
+    // top-level replica list. Absent for an object of one part, which keeps
+    // this payload byte for byte what it was before parts existed.
+    struct_pack::compatible<std::vector<PartPayload>, 3> parts;
+
     YLT_REFL(MetadataPayload, client_id, size, replicas, group_id, data_type,
-             hard_pinned, session_id);
+             hard_pinned, session_id, parts);
 
     // Convert to StandbyObjectMetadata
     StandbyObjectMetadata ToStandbyMetadata() const {
@@ -123,6 +157,7 @@ struct MetadataPayload {
         meta.session_id = session_id.value_or("");
         meta.data_type = data_type.value_or(ObjectDataType::UNKNOWN);
         meta.hard_pinned = hard_pinned.value_or(false);
+        meta.parts = parts;
         return meta;
     }
 };

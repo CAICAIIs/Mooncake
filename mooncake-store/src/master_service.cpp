@@ -1676,9 +1676,10 @@ tl::expected<void, ErrorCode> MasterService::SettlePrimaryWriteQuotaIfReady(
                    << ", key=" << metadata.user_key;
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
-    if (metadata.HasReplica([](const Replica& replica) {
-            return replica.is_memory_replica() && replica.is_processing();
-        })) {
+    // Each PutStart charges the length of the part it writes; the object
+    // settles once when it becomes readable, because until then the bytes hold
+    // content no reader can use.
+    if (!HasReadableReplica(metadata)) {
         return {};
     }
 
@@ -3290,11 +3291,56 @@ std::pair<TenantId, std::string> ResolveStandbyObject(
 }  // namespace
 
 struct PreparedObject {
+    // One entry per part of the object, in part_index order, holding that
+    // part's length and the replicas this restore could rebuild for it. An
+    // object written before parts existed has exactly one, holding its whole
+    // replica list.
+    struct PreparedPart {
+        uint32_t part_index;
+        uint64_t length;
+        std::optional<uint64_t> checksum;
+        std::vector<Replica> replicas;
+    };
+
     const StandbyObjectEntry* entry;
     TenantId tenant_id;
     std::string user_key;
-    std::vector<Replica> replicas;
+    std::vector<PreparedPart> parts;
 };
+
+namespace {
+
+// One part of a restored object as its payload describes it. A single-part
+// object answers one view holding its whole replica list and its size, so both
+// shapes take one path from here on.
+struct StandbyPartView {
+    uint32_t part_index;
+    uint64_t length;
+    std::optional<uint64_t> checksum;
+    const std::vector<Replica::Descriptor>* replicas;
+};
+
+std::vector<StandbyPartView> StandbyPartViews(
+    const StandbyObjectMetadata& metadata) {
+    std::vector<StandbyPartView> views;
+    if (metadata.parts.has_value() && !metadata.parts->empty()) {
+        views.reserve(metadata.parts->size());
+        for (const auto& part : *metadata.parts) {
+            views.push_back(
+                {part.part_index, part.length, part.checksum, &part.replicas});
+        }
+        std::sort(
+            views.begin(), views.end(),
+            [](const StandbyPartView& left, const StandbyPartView& right) {
+                return left.part_index < right.part_index;
+            });
+        return views;
+    }
+    views.push_back({0, metadata.size, std::nullopt, &metadata.replicas});
+    return views;
+}
+
+}  // namespace
 
 // Shared state for the tolerant legacy-snapshot restore (#3760): one bad
 // entry or descriptor must not cost the whole index. Validation runs in
@@ -3620,9 +3666,15 @@ tl::expected<void, ErrorCode> MasterService::ConstructLegacyStandbyReplicas(
         for (const auto& [segment_name, bytes] : object_bytes) {
             ctx.accounted_bytes[segment_name] += bytes;
         }
+        // A legacy snapshot predates parts, so its object is one part holding
+        // the replicas this restore rebuilt.
+        std::vector<PreparedObject::PreparedPart> legacy_parts;
+        legacy_parts.push_back(PreparedObject::PreparedPart{
+            /*part_index=*/0, accepted_entry.entry->metadata.size, std::nullopt,
+            std::move(replicas)});
         ctx.objects_by_shard[accepted_entry.shard_idx].push_back(
             {accepted_entry.entry, std::move(accepted_entry.tenant_id),
-             std::move(accepted_entry.user_key), std::move(replicas)});
+             std::move(accepted_entry.user_key), std::move(legacy_parts)});
     }
 
     return {};
@@ -3669,12 +3721,13 @@ tl::expected<size_t, ErrorCode> MasterService::InstallLegacyStandbyObjects(
                 std::piecewise_construct,
                 std::forward_as_tuple(object.user_key),
                 std::forward_as_tuple(
-                    standby_meta.client_id, now, standby_meta.size,
-                    std::move(object.replicas), std::nullopt,
+                    standby_meta.client_id, now, object.parts.front().length,
+                    std::move(object.parts.front().replicas), std::nullopt,
                     standby_meta.hard_pinned.value_or(false),
                     standby_meta.data_type, standby_meta.group_id,
                     object.tenant_id, object.user_key));
             (void)inserted;
+            it->second.metadata.ForgetWriteAttempts();
             it->second.metadata.session_id =
                 standby_meta.session_id.value_or("");
             if (!standby_meta.group_id.empty()) {
@@ -3946,149 +3999,170 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
                 }
             }
             const auto& standby_meta = entry.metadata;
-            std::vector<Replica> replicas;
-            replicas.reserve(standby_meta.replicas.size());
+            std::vector<PreparedObject::PreparedPart> parts;
+            const auto part_views = StandbyPartViews(standby_meta);
+            parts.reserve(part_views.size());
             bool dropped_stale_replica = false;
 
-            for (const auto& desc : standby_meta.replicas) {
-                if (desc.is_memory_replica()) {
-                    const auto& buffer =
-                        desc.get_memory_descriptor().buffer_descriptor;
-                    auto segment_it = memory_segments_by_alias.find(
-                        buffer.transport_endpoint_);
-                    if (segment_it == memory_segments_by_alias.end()) {
-                        // The snapshot can still carry replicas on segments
-                        // that were unloaded before the handoff. Those are
-                        // gone for good, so drop just these replicas instead
-                        // of failing the whole promotion.
-                        LOG(WARNING)
-                            << "RestoreFromStandbySnapshot: dropping replica "
-                            << "id=" << desc.id << " on unknown memory "
-                            << "endpoint=" << buffer.transport_endpoint_
-                            << ", tenant=" << tenant_id.value()
-                            << ", key=" << user_key;
-                        ++dropped_stale_replica_count;
-                        dropped_stale_replica = true;
-                        continue;
-                    }
-                    if (buffer.size_ != standby_meta.size ||
-                        buffer.size_ == 0 ||
-                        buffer.buffer_address_ >
-                            std::numeric_limits<uintptr_t>::max() -
-                                buffer.size_) {
-                        LOG(ERROR)
-                            << "RestoreFromStandbySnapshot: invalid memory "
-                            << "descriptor, tenant=" << tenant_id.value()
-                            << ", key=" << user_key;
-                        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-                    }
-
-                    const auto* segment = segment_it->second;
-                    if (desc.status != ReplicaStatus::REMOVED &&
-                        desc.status != ReplicaStatus::FAILED) {
-                        auto& bytes =
-                            restored_accounted_memory_bytes[segment
-                                                                ->segment_name];
-                        if (bytes > segment->capacity ||
-                            buffer.size_ > segment->capacity - bytes) {
+            for (const auto& part_view : part_views) {
+                std::vector<Replica> replicas;
+                replicas.reserve(part_view.replicas->size());
+                const uint64_t part_length = part_view.length;
+                for (const auto& desc : *part_view.replicas) {
+                    if (desc.is_memory_replica()) {
+                        const auto& buffer =
+                            desc.get_memory_descriptor().buffer_descriptor;
+                        auto segment_it = memory_segments_by_alias.find(
+                            buffer.transport_endpoint_);
+                        if (segment_it == memory_segments_by_alias.end()) {
+                            // The snapshot can still carry replicas on segments
+                            // that were unloaded before the handoff. Those are
+                            // gone for good, so drop just these replicas
+                            // instead of failing the whole promotion.
+                            LOG(WARNING)
+                                << "RestoreFromStandbySnapshot: dropping "
+                                   "replica "
+                                << "id=" << desc.id << " on unknown memory "
+                                << "endpoint=" << buffer.transport_endpoint_
+                                << ", tenant=" << tenant_id.value()
+                                << ", key=" << user_key;
+                            ++dropped_stale_replica_count;
+                            dropped_stale_replica = true;
+                            continue;
+                        }
+                        if (buffer.size_ != part_length || buffer.size_ == 0 ||
+                            buffer.buffer_address_ >
+                                std::numeric_limits<uintptr_t>::max() -
+                                    buffer.size_) {
                             LOG(ERROR)
-                                << "RestoreFromStandbySnapshot: memory "
-                                   "descriptors exceed segment capacity, "
-                                   "segment="
-                                << segment->segment_name;
+                                << "RestoreFromStandbySnapshot: invalid memory "
+                                << "descriptor, tenant=" << tenant_id.value()
+                                << ", key=" << user_key;
                             return tl::make_unexpected(
                                 ErrorCode::INVALID_PARAMS);
                         }
-                        if (bounded_restore) {
-                            auto& ranges = bounded_memory_ranges[segment];
-                            auto next =
-                                ranges.lower_bound(buffer.buffer_address_);
-                            const uintptr_t end =
-                                buffer.buffer_address_ + buffer.size_;
-                            if ((next != ranges.end() && end > next->first) ||
-                                (next != ranges.begin() &&
-                                 std::prev(next)->first +
-                                         std::prev(next)->second >
-                                     buffer.buffer_address_)) {
-                                LOG(ERROR) << "RestoreFromStandbySnapshot: "
-                                              "overlapping "
-                                              "memory descriptors";
+
+                        const auto* segment = segment_it->second;
+                        if (desc.status != ReplicaStatus::REMOVED &&
+                            desc.status != ReplicaStatus::FAILED) {
+                            auto& bytes = restored_accounted_memory_bytes
+                                [segment->segment_name];
+                            if (bytes > segment->capacity ||
+                                buffer.size_ > segment->capacity - bytes) {
+                                LOG(ERROR)
+                                    << "RestoreFromStandbySnapshot: memory "
+                                       "descriptors exceed segment capacity, "
+                                       "segment="
+                                    << segment->segment_name;
                                 return tl::make_unexpected(
                                     ErrorCode::INVALID_PARAMS);
                             }
-                            ranges.emplace(buffer.buffer_address_,
-                                           buffer.size_);
-                        } else {
-                            legacy_memory_ranges[segment].emplace_back(
-                                buffer.buffer_address_, buffer.size_);
+                            if (bounded_restore) {
+                                auto& ranges = bounded_memory_ranges[segment];
+                                auto next =
+                                    ranges.lower_bound(buffer.buffer_address_);
+                                const uintptr_t end =
+                                    buffer.buffer_address_ + buffer.size_;
+                                if ((next != ranges.end() &&
+                                     end > next->first) ||
+                                    (next != ranges.begin() &&
+                                     std::prev(next)->first +
+                                             std::prev(next)->second >
+                                         buffer.buffer_address_)) {
+                                    LOG(ERROR) << "RestoreFromStandbySnapshot: "
+                                                  "overlapping "
+                                                  "memory descriptors";
+                                    return tl::make_unexpected(
+                                        ErrorCode::INVALID_PARAMS);
+                                }
+                                ranges.emplace(buffer.buffer_address_,
+                                               buffer.size_);
+                            } else {
+                                legacy_memory_ranges[segment].emplace_back(
+                                    buffer.buffer_address_, buffer.size_);
+                            }
+                            bytes += buffer.size_;
                         }
-                        bytes += buffer.size_;
-                    }
 
-                    auto alloc =
-                        restored_allocators.at(buffer.transport_endpoint_);
-                    auto restored_buffer =
-                        std::make_unique<AllocatedBuffer>(alloc, buffer);
-                    replicas.push_back(Replica(
-                        desc.id, std::move(restored_buffer), desc.status));
-                } else if (desc.is_nof_replica()) {
-                    const auto& buffer =
-                        desc.get_nof_descriptor().buffer_descriptor;
-                    if (buffer.size_ != standby_meta.size ||
-                        buffer.size_ == 0) {
-                        LOG(ERROR) << "RestoreFromStandbySnapshot: invalid NoF "
+                        auto alloc =
+                            restored_allocators.at(buffer.transport_endpoint_);
+                        auto restored_buffer =
+                            std::make_unique<AllocatedBuffer>(alloc, buffer);
+                        replicas.push_back(Replica(
+                            desc.id, std::move(restored_buffer), desc.status));
+                    } else if (desc.is_nof_replica()) {
+                        const auto& buffer =
+                            desc.get_nof_descriptor().buffer_descriptor;
+                        if (buffer.size_ != part_length || buffer.size_ == 0) {
+                            LOG(ERROR)
+                                << "RestoreFromStandbySnapshot: invalid NoF "
+                                << "descriptor, tenant=" << tenant_id.value()
+                                << ", key=" << user_key;
+                            return tl::make_unexpected(
+                                ErrorCode::INVALID_PARAMS);
+                        }
+                        auto& alloc =
+                            restored_allocators[buffer.transport_endpoint_];
+                        if (!alloc) {
+                            alloc = std::make_shared<DummyBufferAllocator>(
+                                buffer.transport_endpoint_,
+                                buffer.transport_endpoint_);
+                        }
+                        auto restored_buffer =
+                            std::make_unique<AllocatedBuffer>(alloc, buffer);
+                        replicas.push_back(
+                            Replica(desc.id, std::move(restored_buffer),
+                                    desc.status, ReplicaType::NOF_SSD));
+                    } else if (desc.is_disk_replica()) {
+                        const auto& disk_desc = desc.get_disk_descriptor();
+                        if (disk_desc.object_size != part_length) {
+                            LOG(ERROR)
+                                << "RestoreFromStandbySnapshot: invalid disk "
+                                << "descriptor, tenant=" << tenant_id.value()
+                                << ", key=" << user_key;
+                            return tl::make_unexpected(
+                                ErrorCode::INVALID_PARAMS);
+                        }
+                        replicas.push_back(Replica(desc.id, disk_desc.file_path,
+                                                   disk_desc.object_size,
+                                                   desc.status));
+                    } else if (desc.is_local_disk_replica()) {
+                        const auto& local_disk_desc =
+                            desc.get_local_disk_descriptor();
+                        if (local_disk_desc.object_size != part_length) {
+                            LOG(ERROR)
+                                << "RestoreFromStandbySnapshot: invalid local "
+                                   "disk "
+                                << "descriptor, tenant=" << tenant_id.value()
+                                << ", key=" << user_key;
+                            return tl::make_unexpected(
+                                ErrorCode::INVALID_PARAMS);
+                        }
+                        replicas.push_back(Replica(
+                            desc.id, local_disk_desc.client_id,
+                            local_disk_desc.object_size,
+                            local_disk_desc.transport_endpoint, desc.status,
+                            record_for_known_owner(local_disk_desc.client_id)));
+                    } else {
+                        LOG(ERROR) << "RestoreFromStandbySnapshot: unsupported "
+                                      "replica "
                                    << "descriptor, tenant=" << tenant_id.value()
                                    << ", key=" << user_key;
                         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
                     }
-                    auto& alloc =
-                        restored_allocators[buffer.transport_endpoint_];
-                    if (!alloc) {
-                        alloc = std::make_shared<DummyBufferAllocator>(
-                            buffer.transport_endpoint_,
-                            buffer.transport_endpoint_);
-                    }
-                    auto restored_buffer =
-                        std::make_unique<AllocatedBuffer>(alloc, buffer);
-                    replicas.push_back(
-                        Replica(desc.id, std::move(restored_buffer),
-                                desc.status, ReplicaType::NOF_SSD));
-                } else if (desc.is_disk_replica()) {
-                    const auto& disk_desc = desc.get_disk_descriptor();
-                    if (disk_desc.object_size != standby_meta.size) {
-                        LOG(ERROR)
-                            << "RestoreFromStandbySnapshot: invalid disk "
-                            << "descriptor, tenant=" << tenant_id.value()
-                            << ", key=" << user_key;
-                        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-                    }
-                    replicas.push_back(Replica(desc.id, disk_desc.file_path,
-                                               disk_desc.object_size,
-                                               desc.status));
-                } else if (desc.is_local_disk_replica()) {
-                    const auto& local_disk_desc =
-                        desc.get_local_disk_descriptor();
-                    if (local_disk_desc.object_size != standby_meta.size) {
-                        LOG(ERROR)
-                            << "RestoreFromStandbySnapshot: invalid local disk "
-                            << "descriptor, tenant=" << tenant_id.value()
-                            << ", key=" << user_key;
-                        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-                    }
-                    replicas.push_back(Replica(
-                        desc.id, local_disk_desc.client_id,
-                        local_disk_desc.object_size,
-                        local_disk_desc.transport_endpoint, desc.status,
-                        record_for_known_owner(local_disk_desc.client_id)));
-                } else {
-                    LOG(ERROR)
-                        << "RestoreFromStandbySnapshot: unsupported replica "
-                        << "descriptor, tenant=" << tenant_id.value()
-                        << ", key=" << user_key;
-                    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
                 }
+                parts.push_back({part_view.part_index, part_length,
+                                 part_view.checksum, std::move(replicas)});
             }
-            if (replicas.empty() && dropped_stale_replica) {
+            // An object that lost its last replica to a dead endpoint is
+            // skipped as a whole. An object the payload simply had no replica
+            // for is installed as it stands, as it always has been.
+            const bool any_replica_left =
+                std::any_of(parts.begin(), parts.end(),
+                            [](const PreparedObject::PreparedPart& part) {
+                                return !part.replicas.empty();
+                            });
+            if (!any_replica_left && dropped_stale_replica) {
                 LOG(WARNING)
                     << "RestoreFromStandbySnapshot: skipping object with no "
                     << "surviving replicas, tenant=" << tenant_id.value()
@@ -4098,7 +4172,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
             }
             objects_by_shard[shard_idx].push_back({&entry, std::move(tenant_id),
                                                    std::move(user_key),
-                                                   std::move(replicas)});
+                                                   std::move(parts)});
         }
 
         for (const auto& [shard_idx, shard_objects] : objects_by_shard) {
@@ -4136,20 +4210,44 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
                 const auto& standby_meta = object.entry->metadata;
                 auto& tenant_state =
                     GetOrCreateTenantState(shard.get(), object.tenant_id);
+                // The object's part count is the highest part index the
+                // payload carried plus one, so a part the snapshot had lost is
+                // restored as an empty slot the object still expects.
+                uint32_t part_count = 1;
+                for (const auto& part : object.parts) {
+                    part_count = std::max(part_count, part.part_index + 1);
+                }
+                auto& first_part = object.parts.front();
                 auto [it, inserted] = tenant_state.metadata.emplace(
                     std::piecewise_construct,
                     std::forward_as_tuple(object.user_key),
                     std::forward_as_tuple(
-                        standby_meta.client_id, now, standby_meta.size,
-                        std::move(object.replicas), std::nullopt,
+                        standby_meta.client_id, now, first_part.length,
+                        std::move(first_part.replicas), std::nullopt,
                         standby_meta.hard_pinned.value_or(false),
                         standby_meta.data_type, standby_meta.group_id,
-                        object.tenant_id, object.user_key));
+                        object.tenant_id, object.user_key, part_count,
+                        first_part.part_index));
                 (void)inserted;
-                it->second.metadata.session_id =
-                    standby_meta.session_id.value_or("");
+                auto& restored = it->second.metadata;
+                for (size_t index = 1; index < object.parts.size(); ++index) {
+                    auto& part = object.parts[index];
+                    restored.EmplacePart(part.part_index, part.length,
+                                         std::move(part.replicas));
+                }
+                for (const auto& part : object.parts) {
+                    if (restored.GetPart(part.part_index) != nullptr &&
+                        part.checksum.has_value()) {
+                        restored.MutablePart(part.part_index)
+                            ->SetChecksum(part.checksum);
+                    }
+                }
+                // A restored object is not a write in flight: its replicas
+                // arrived complete.
+                restored.ForgetWriteAttempts();
+                restored.session_id = standby_meta.session_id.value_or("");
                 if (!standby_meta.group_id.empty()) {
-                    it->second.metadata.lease_ =
+                    restored.lease_ =
                         RegisterGroupMember(object.tenant_id, object.user_key,
                                             standby_meta.group_id);
                 }
@@ -5956,6 +6054,9 @@ auto MasterService::PutEndForPart(
 
     const bool had_completed_replica =
         metadata.HasReplica(&Replica::fn_is_completed);
+    // Readability before this End: only the transition from unreadable to
+    // readable publishes a stored event.
+    const bool was_readable = HasReadableReplica(metadata);
     bool completed_pending_replica = false;
     for (auto& replica : metadata.MutablePart(part_index)->replicas()) {
         if (!replica.is_processing() || !is_target_replica(replica) ||
@@ -6036,7 +6137,11 @@ auto MasterService::PutEndForPart(
     SyncCacheTotalAccounting(metadata);
     // TODO: add inc_nof_cache_nums() (ranhaojia)
     metadata.GrantReadLease(std::chrono::milliseconds::zero());
-    PublishKvStored(key, metadata, object_id.tenant_id);
+    // A part completing is not the object being usable: the stored event goes
+    // out once, when the last part makes the whole object readable.
+    if (!was_readable && HasReadableReplica(metadata)) {
+        PublishKvStored(key, metadata, object_id.tenant_id);
+    }
 
     if (enable_oplog_ && ordered_oplog_writer_) {
         std::string payload = SerializeMetadataForOpLog(metadata);
@@ -10831,33 +10936,39 @@ void MasterService::DiscardExpiredProcessingReplicas(
             }
 
             auto& metadata = it->second.metadata;
-            if (!metadata.IsValid() ||
-                metadata.AllReplicas(&Replica::fn_is_completed)) {
-                metadata.ClearPendingSoftPinIfNoViableReplica();
-                metadata.ClearSessionTagIfNoViableReplica();
-                if (!metadata.IsValid()) {
-                    EraseMetadata(tenant_state, it, tenant_it->first,
-                                  QuotaEraseMode::kFull, &shard);
-                    it = objects.end();
-                } else {
-                    auto settle_result =
-                        SettlePrimaryWriteQuotaIfReady(tenant_state, metadata);
-                    if (settle_result) {
-                        it->second.state.is_processing = false;
+            // One writer's part timing out must not touch another writer's
+            // part, so the expiry is decided and applied per slot.
+            for (size_t part_index = 0; part_index < metadata.part_count;
+                 ++part_index) {
+                const WriteAttempt* attempt = metadata.GetAttempt(part_index);
+                if (attempt == nullptr) {
+                    continue;
+                }
+                const auto ttl =
+                    attempt->started + put_start_release_timeout_sec_;
+                if (!(ttl < now)) {
+                    continue;
+                }
+
+                const ObjectPart* part = metadata.GetPart(part_index);
+                std::vector<ReplicaID> expiring_ids;
+                if (part != nullptr) {
+                    for (const auto& replica : part->replicas()) {
+                        if (replica.is_processing()) {
+                            expiring_ids.push_back(replica.id());
+                        }
                     }
                 }
-                continue;
-            }
-
-            const auto ttl =
-                metadata.Slot(0).last_started + put_start_release_timeout_sec_;
-            if (ttl < now) {
+                const auto expires = [&expiring_ids](const Replica& replica) {
+                    return std::ranges::find(expiring_ids, replica.id()) !=
+                           expiring_ids.end();
+                };
                 const bool had_complete_replica =
                     metadata.HasReplica(&Replica::fn_is_completed);
-                // Predict post-discard descriptors WITHOUT mutating: drop
-                // PROCESSING replicas; keep COMPLETE replicas.
-                auto post_descriptors = BuildRemainingReplicaDescriptors(
-                    metadata, &Replica::fn_is_processing);
+                // Predict the post-discard payload WITHOUT mutating: drop this
+                // part's PROCESSING replicas, keep every COMPLETE replica.
+                auto post_descriptors =
+                    BuildRemainingReplicaDescriptors(metadata, expires);
                 const bool would_invalidate = post_descriptors.empty();
 
                 if (had_complete_replica && enable_oplog_ &&
@@ -10876,8 +10987,8 @@ void MasterService::DiscardExpiredProcessingReplicas(
                     } else {
                         persist_result = AppendOpLogWithDurableFinalize(
                             OpType::PUT_END, tenant_it->first.value(), it->first,
-                            SerializeMetadataForOpLogFromReplicaDescriptors(
-                                metadata, post_descriptors),
+                            SerializeMetadataForOpLogWithoutReplicas(metadata,
+                                                                     expires),
                             enable_oplog_
                                 ? [this, ttl](const OpLogEntry& durable_entry) {
                                       FinalizeExpiredProcessingReplicasAfterDurable(
@@ -10886,11 +10997,13 @@ void MasterService::DiscardExpiredProcessingReplicas(
                                 : DurableFinalizeCallback{});
                     }
                     if (!persist_result) {
-                        LOG(WARNING) << "DiscardExpiredProcessingReplicas: "
-                                        "OpLog persist failed for key="
-                                     << it->first << ", err="
-                                     << static_cast<int>(persist_result.error())
-                                     << ", deferring discard";
+                        LOG(WARNING)
+                            << "DiscardExpiredProcessingReplicas: "
+                               "OpLog persist failed for key="
+                            << it->first << ", part_index=" << part_index
+                            << ", err="
+                            << static_cast<int>(persist_result.error())
+                            << ", deferring discard";
                         continue;
                     }
                     if (enable_oplog_) {
@@ -10899,25 +11012,51 @@ void MasterService::DiscardExpiredProcessingReplicas(
                 }
 
                 // Persist OK (or HA disabled / never published) — apply.
-                auto replicas =
-                    metadata.PopAllReplicas(&Replica::fn_is_processing);
-                metadata.ClearPendingSoftPinIfNoViableReplica();
-                metadata.ClearSessionTagIfNoViableReplica();
+                auto replicas = PopPartReplicasWithCacheTotalAccounting(
+                    metadata, part_index, &Replica::fn_is_processing);
+                metadata.EndWrite(part_index);
                 if (!replicas.empty()) {
-                    FreeDfsReplicas(it->first, replicas);
                     discarded_replicas.emplace_back(std::move(replicas), ttl);
                 }
-                if (!metadata.IsValid()) {
-                    EraseMetadata(tenant_state, it, tenant_it->first,
-                                  QuotaEraseMode::kFull, &shard);
-                    it = objects.end();
-                } else {
-                    auto settle_result =
-                        SettlePrimaryWriteQuotaIfReady(tenant_state, metadata);
-                    if (settle_result) {
-                        it->second.state.is_processing = false;
-                    }
+            }
+            metadata.ClearPendingSoftPinIfNoViableReplica();
+            metadata.ClearSessionTagIfNoViableReplica();
+
+            // An object no writer is going to finish is reclaimed whole: it is
+            // not readable, nothing of it is in flight, no reader holds any of
+            // it, and no writer has started on any of its parts recently
+            // enough to still be coming.
+            bool every_part_settled = true;
+            for (size_t part_index = 0; part_index < metadata.part_count;
+                 ++part_index) {
+                if (now < metadata.Slot(part_index).last_started +
+                              put_start_release_timeout_sec_) {
+                    every_part_settled = false;
+                    break;
                 }
+            }
+            const bool no_reader_holds_it =
+                !metadata.HasReplica([](const Replica& replica) {
+                    return replica.get_refcnt() != 0;
+                });
+            std::chrono::system_clock::time_point lease_now = now;
+            const bool reclaim =
+                !metadata.IsValid() ||
+                (!HasReadableReplica(metadata) && every_part_settled &&
+                 no_reader_holds_it && !metadata.IsHardPinned() &&
+                 metadata.IsLeaseExpired(lease_now));
+            if (reclaim) {
+                EraseMetadata(tenant_state, it, tenant_it->first,
+                              QuotaEraseMode::kFull, &shard);
+                it = objects.end();
+                continue;
+            }
+            auto settle_result =
+                SettlePrimaryWriteQuotaIfReady(tenant_state, metadata);
+            // A part that still carries a write keeps the object processing,
+            // whatever the attempt's age: the writer may yet finish it.
+            if (settle_result && !metadata.HasRecordedWrite()) {
+                it->second.state.is_processing = false;
             }
         }
 
@@ -11148,7 +11287,14 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
         return IsEvictableMemoryReplica(replica);
     };
     auto can_evict_replicas = [&](const ObjectMetadata& metadata) {
-        return metadata.HasReplica(is_evictable_memory_replica);
+        // A part being written is not eviction material: writers arrive at
+        // different times, and a part written early must not be evicted before
+        // the object is complete. PutStart takes such a part over once its
+        // discard timeout has passed, so an attempt older than that no longer
+        // counts as a write in flight.
+        return !metadata.HasWriteInFlight(now -
+                                          put_start_discard_timeout_sec_) &&
+               metadata.HasReplica(is_evictable_memory_replica);
     };
     auto has_local_disk_replica = [](const ObjectMetadata& metadata) {
         return metadata.HasReplica(&Replica::fn_is_local_disk_replica);
@@ -11454,7 +11600,14 @@ void MasterService::BatchEvict(double evict_ratio_target,
     };
 
     auto can_evict_replicas = [&](const ObjectMetadata& metadata) {
-        return metadata.HasReplica(is_evictable_memory_replica);
+        // A part being written is not eviction material: writers arrive at
+        // different times, and a part written early must not be evicted before
+        // the object is complete. PutStart takes such a part over once its
+        // discard timeout has passed, so an attempt older than that no longer
+        // counts as a write in flight.
+        return !metadata.HasWriteInFlight(now -
+                                          put_start_discard_timeout_sec_) &&
+               metadata.HasReplica(is_evictable_memory_replica);
     };
 
     auto evict_replicas =
@@ -13797,9 +13950,9 @@ void MasterService::PublishKvStored(const std::string& key,
     if (!kv_event_publisher_ || !kv_event_publisher_->enabled()) {
         return;
     }
-    kv_event_publisher_->PublishCommitted(key, KvMediaForMetadata(metadata),
-                                          tenant_id.value(), metadata.group_id,
-                                          metadata.session_id);
+    kv_event_publisher_->PublishCommitted(
+        key, KvMediaForMetadata(metadata), tenant_id.value(), metadata.group_id,
+        metadata.session_id, metadata.part_count);
 }
 
 void MasterService::SyncKvObjectState(
@@ -14020,32 +14173,14 @@ void MasterService::HttpMetadataCleanupThreadFunc() {
 
 std::string MasterService::SerializeMetadataForOpLog(
     const ObjectMetadata& metadata) const {
-    MetadataPayload payload;
-    payload.client_id = metadata.WriterOf(0);
-    payload.size = metadata.TotalLength();
-    payload.group_id = metadata.group_id;
-    payload.session_id = metadata.session_id;
-    payload.data_type = metadata.data_type;
-    payload.hard_pinned = metadata.IsHardPinned();
-
-    // Extract replica descriptors, every part of the object
-    payload.replicas.reserve(metadata.CountReplicas());
-    metadata.ForEachReplica([&payload](const Replica& replica) {
-        payload.replicas.push_back(replica.get_descriptor());
-    });
-
-    // NOTE: Lease information is NOT serialized because:
-    // 1. Standby does not perform eviction, so lease info is not used
-    // 2. After promotion, new Primary should grant fresh leases, not restore
-    // old ones
-
-    // Serialize using struct_pack (msgpack binary format)
+    MetadataPayload payload = BuildMetadataPayload(metadata, nullptr);
     auto result = struct_pack::serialize(payload);
     return std::string(result.begin(), result.end());
 }
 
-std::string MasterService::SerializeMetadataForOpLogWithoutMemReplicas(
-    const ObjectMetadata& metadata) const {
+MetadataPayload MasterService::BuildMetadataPayload(
+    const ObjectMetadata& metadata,
+    const std::function<bool(const Replica&)>& should_remove) const {
     MetadataPayload payload;
     payload.client_id = metadata.WriterOf(0);
     payload.size = metadata.TotalLength();
@@ -14053,15 +14188,64 @@ std::string MasterService::SerializeMetadataForOpLogWithoutMemReplicas(
     payload.session_id = metadata.session_id;
     payload.data_type = metadata.data_type;
     payload.hard_pinned = metadata.IsHardPinned();
+    const auto is_dropped = [&should_remove](const Replica& replica) {
+        return should_remove != nullptr && should_remove(replica);
+    };
 
-    payload.replicas.reserve(metadata.CountReplicas());
-    metadata.ForEachReplica([&payload](const Replica& replica) {
-        if (replica.type() == ReplicaType::MEMORY) {
-            return;
+    if (metadata.part_count > 1) {
+        // One part per slot that holds content. The top-level replica list
+        // stays empty: a reader that does not know parts must not read them as
+        // interchangeable replicas of one another.
+        std::vector<PartPayload> parts;
+        parts.reserve(metadata.part_count);
+        for (size_t index = 0; index < metadata.part_count; ++index) {
+            const ObjectPart* part = metadata.GetPart(index);
+            if (part == nullptr) {
+                continue;
+            }
+            PartPayload part_payload;
+            part_payload.part_index = static_cast<uint32_t>(index);
+            part_payload.length = part->length();
+            part_payload.checksum = part->checksum();
+            for (const auto& replica : part->replicas()) {
+                if (is_dropped(replica) ||
+                    replica.status() != ReplicaStatus::COMPLETE) {
+                    continue;
+                }
+                part_payload.replicas.push_back(replica.get_descriptor());
+            }
+            parts.push_back(std::move(part_payload));
         }
-        payload.replicas.push_back(replica.get_descriptor());
-    });
+        payload.parts = std::move(parts);
+    } else {
+        // An object of one part keeps every field where it has always been, so
+        // its payload is byte for byte what it was before parts existed.
+        payload.replicas.reserve(metadata.CountReplicas());
+        metadata.ForEachReplica([&](const Replica& replica) {
+            if (is_dropped(replica) ||
+                replica.status() != ReplicaStatus::COMPLETE) {
+                return;
+            }
+            payload.replicas.push_back(replica.get_descriptor());
+        });
+    }
+    return payload;
+}
 
+std::string MasterService::SerializeMetadataForOpLogWithoutMemReplicas(
+    const ObjectMetadata& metadata) const {
+    MetadataPayload payload =
+        BuildMetadataPayload(metadata, [](const Replica& replica) {
+            return replica.type() == ReplicaType::MEMORY;
+        });
+    auto result = struct_pack::serialize(payload);
+    return std::string(result.begin(), result.end());
+}
+
+std::string MasterService::SerializeMetadataForOpLogWithoutReplicas(
+    const ObjectMetadata& metadata,
+    const std::function<bool(const Replica&)>& should_remove) const {
+    MetadataPayload payload = BuildMetadataPayload(metadata, should_remove);
     auto result = struct_pack::serialize(payload);
     return std::string(result.begin(), result.end());
 }
@@ -14069,6 +14253,15 @@ std::string MasterService::SerializeMetadataForOpLogWithoutMemReplicas(
 std::string MasterService::SerializeMetadataForOpLogFromReplicaDescriptors(
     const ObjectMetadata& metadata,
     const std::vector<Replica::Descriptor>& replicas) const {
+    if (metadata.part_count > 1) {
+        // One flat list cannot say which part a replica belongs to, so a part
+        // object is described from its metadata instead: the caller's list is
+        // the post-mutation view of a single part, which the completed-replica
+        // filter below reproduces for every part.
+        MetadataPayload parts_payload = BuildMetadataPayload(metadata, nullptr);
+        auto parts_bytes = struct_pack::serialize(parts_payload);
+        return std::string(parts_bytes.begin(), parts_bytes.end());
+    }
     MetadataPayload payload;
     payload.client_id = metadata.WriterOf(0);
     payload.size = metadata.TotalLength();
