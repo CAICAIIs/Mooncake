@@ -22,6 +22,7 @@
 
 #include "common/network.h"
 #include "master_client.h"
+#include "master_client/master_client_test_peer.h"
 #include "master_config.h"
 #include "master_service/master_service_test_peer.h"
 #include "rpc_helper.h"
@@ -553,6 +554,133 @@ TEST_F(PartRpcTest, APartReplicaLandsInTheSegmentTheWriteNames) {
         std::get<MemoryDescriptor>((*read)->replicas[0].descriptor_variant)
             .buffer_descriptor.transport_endpoint_,
         spare.segment.name);
+}
+
+// A client writes one part at a time and reads the part it wants; the call that
+// names no part is the one every client before parts makes, and it still
+// answers for a whole object.
+TEST_F(PartRpcTest, MasterClientWritesAndReadsOnePart) {
+    constexpr uint32_t kParts = 2;
+    const std::string key = "client_part_key";
+    const std::string tenant(TenantId::kDefaultValue);
+
+    MasterClient client(client_id_);
+    ASSERT_EQ(client.Connect(address(port_)), ErrorCode::OK);
+    auto supports = client.SupportsParts();
+    ASSERT_TRUE(supports.has_value()) << toString(supports.error());
+    EXPECT_TRUE(*supports);
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    for (uint32_t part = 0; part < kParts; ++part) {
+        auto started = client.PutStart(key, {1024}, config, part, kParts);
+        ASSERT_TRUE(started.has_value()) << toString(started.error());
+        std::vector<ReplicaID> ids;
+        ids.reserve(started->size());
+        for (const auto& descriptor : *started) {
+            ids.push_back(descriptor.id);
+        }
+        ASSERT_TRUE(client
+                        .PutEnd(ObjectMeta{key, uint64_t{7000} + part},
+                                ReplicaType::MEMORY, part, ids)
+                        .has_value());
+    }
+
+    auto read = client.GetReplicaList(key, tenant, /*part_index=*/1);
+    ASSERT_TRUE(read.has_value()) << toString(read.error());
+    ASSERT_TRUE(read->part_count.has_value());
+    EXPECT_EQ(*read->part_count, kParts);
+    ASSERT_TRUE(read->object_checksum.has_value());
+    EXPECT_EQ(*read->object_checksum, uint64_t{7001});
+    EXPECT_EQ(read->replicas.size(), 1u);
+
+    // Naming no part asks for a whole object, which this one cannot give.
+    auto whole = client.GetReplicaList(key, tenant);
+    ASSERT_FALSE(whole.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, whole.error());
+}
+
+// A client that names a part asks the master first: the part arguments trail
+// the call as compatible fields, so a master that predates them would answer
+// for a whole object rather than refuse.
+TEST_F(PartRpcTest, MasterClientRefusesPartsTheMasterCannotTake) {
+    const std::string key = "client_no_part_support_key";
+    const std::string tenant(TenantId::kDefaultValue);
+    MasterClient client(client_id_);
+    ASSERT_EQ(client.Connect(address(port_)), ErrorCode::OK);
+    test::MasterClientTestPeer::SetMasterTakesParts(client, false);
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    auto parted = client.PutStart(key, {1024}, config, /*part_index=*/0,
+                                  /*part_count=*/2);
+    ASSERT_FALSE(parted.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, parted.error());
+
+    // Nothing reached the master.
+    auto exists = service_->ExistKey(key, tenant);
+    ASSERT_TRUE(exists.has_value());
+    EXPECT_FALSE(exists.value());
+
+    // A call that names no part is unaffected: it is what every client before
+    // parts sends.
+    auto whole = client.PutStart(key, {1024}, config);
+    ASSERT_TRUE(whole.has_value()) << toString(whole.error());
+}
+
+// One batch writes one part of many keys, and one batch reads them back with a
+// part per item.
+TEST_F(PartRpcTest, MasterClientBatchCarriesAPartPerItem) {
+    constexpr uint32_t kParts = 2;
+    const std::string tenant(TenantId::kDefaultValue);
+    std::vector<std::string> keys{"client_batch_part_a", "client_batch_part_b"};
+
+    MasterClient client(client_id_);
+    ASSERT_EQ(client.Connect(address(port_)), ErrorCode::OK);
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    const std::vector<std::vector<uint64_t>> slice_lengths(keys.size(), {1024});
+    for (uint32_t part = 0; part < kParts; ++part) {
+        auto started = client.BatchPutStart(
+            keys, slice_lengths, config,
+            std::vector<uint32_t>(keys.size(), part), kParts);
+        ASSERT_EQ(started.size(), keys.size());
+        std::vector<std::vector<ReplicaID>> per_item_ids;
+        per_item_ids.reserve(started.size());
+        for (size_t i = 0; i < started.size(); ++i) {
+            ASSERT_TRUE(started[i].has_value()) << toString(started[i].error());
+            std::vector<ReplicaID> ids;
+            ids.reserve(started[i]->size());
+            for (const auto& descriptor : *started[i]) {
+                ids.push_back(descriptor.id);
+            }
+            per_item_ids.push_back(std::move(ids));
+        }
+        std::vector<ObjectMeta> metas;
+        metas.reserve(keys.size());
+        for (const auto& key : keys) {
+            metas.push_back(ObjectMeta{key, uint64_t{9000} + part});
+        }
+        auto ended = client.BatchPutEnd(
+            metas, ReplicaType::MEMORY,
+            std::vector<uint32_t>(keys.size(), part), per_item_ids);
+        ASSERT_EQ(ended.size(), keys.size());
+        for (const auto& item : ended) {
+            ASSERT_TRUE(item.has_value()) << toString(item.error());
+        }
+    }
+
+    auto read = client.BatchGetReplicaList(
+        keys, tenant, std::vector<uint32_t>(keys.size(), 1));
+    ASSERT_EQ(read.size(), keys.size());
+    for (const auto& item : read) {
+        ASSERT_TRUE(item.has_value()) << toString(item.error());
+        ASSERT_TRUE(item->part_count.has_value());
+        EXPECT_EQ(*item->part_count, kParts);
+        ASSERT_TRUE(item->object_checksum.has_value());
+        EXPECT_EQ(*item->object_checksum, uint64_t{9001});
+    }
 }
 
 }  // namespace

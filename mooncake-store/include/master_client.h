@@ -3,6 +3,7 @@
 #include <atomic>
 #include <csignal>
 #include <memory>
+#include <optional>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -28,6 +29,10 @@
 namespace mooncake {
 
 static const std::string kDefaultMasterAddress = "localhost:50051";
+
+namespace test {
+class MasterClientTestPeer;
+}  // namespace test
 
 namespace detail {
 
@@ -204,8 +209,11 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<GetReplicaListResponse, ErrorCode>
     GetReplicaList(const std::string& object_key);
+    // `part_index` names the part to read. A read that names none asks for a
+    // whole object, which an object of several parts cannot give.
     [[nodiscard]] tl::expected<GetReplicaListResponse, ErrorCode>
-    GetReplicaList(const std::string& object_key, const std::string& tenant_id);
+    GetReplicaList(const std::string& object_key, const std::string& tenant_id,
+                   std::optional<uint32_t> part_index = std::nullopt);
 
     /**
      * @brief Retrieves replica lists for object keys that match a regex
@@ -227,9 +235,12 @@ class MasterClient {
      */
     [[nodiscard]] std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaList(const std::vector<std::string>& object_keys);
+    // One part per key, in the caller's order; an empty list names no part and
+    // asks for whole objects.
     [[nodiscard]] std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaList(const std::vector<std::string>& object_keys,
-                        const std::string& tenant_id);
+                        const std::string& tenant_id,
+                        const std::vector<uint32_t>& part_indices = {});
 
     /**
      * @brief Read-only variants of GetReplicaList / BatchGetReplicaList.
@@ -263,9 +274,13 @@ class MasterClient {
      * @return tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
      * indicating success/failure
      */
+    // `part_index` of `part_count` names the part this write fills. The first
+    // writer of a key fixes its part count: naming one part of one is what
+    // every caller before parts does, and it is the same call.
     [[nodiscard]] tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
     PutStart(const std::string& key, const std::vector<size_t>& slice_lengths,
-             const ReplicateConfig& config);
+             const ReplicateConfig& config, uint32_t part_index = 0,
+             uint32_t part_count = 1);
 
     /**
      * @brief Starts a batch of put operations for N objects
@@ -279,7 +294,9 @@ class MasterClient {
         tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
     BatchPutStart(const std::vector<std::string>& keys,
                   const std::vector<std::vector<uint64_t>>& slice_lengths,
-                  const ReplicateConfig& config);
+                  const ReplicateConfig& config,
+                  const std::vector<uint32_t>& part_indices = {},
+                  uint32_t part_count = 1);
 
     /**
      * @brief Ends a put operation
@@ -287,8 +304,13 @@ class MasterClient {
      * @param replica_type Type of replica (memory or disk)
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
+    // `replica_ids` names the replicas of that part this End completes; naming
+    // none acknowledges every replica the part's write handed out.
     [[nodiscard]] tl::expected<void, ErrorCode> PutEnd(
-        const ObjectMeta& object_meta, ReplicaType replica_type);
+        const ObjectMeta& object_meta, ReplicaType replica_type,
+        uint32_t part_index = 0,
+        const std::optional<std::vector<ReplicaID>>& replica_ids =
+            std::nullopt);
 
     /**
      * @brief Ends a put operation for a batch of objects
@@ -297,7 +319,9 @@ class MasterClient {
      */
     [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
         const std::vector<ObjectMeta>& object_metas,
-        ReplicaType replica_type = ReplicaType::ALL);
+        ReplicaType replica_type = ReplicaType::ALL,
+        const std::vector<uint32_t>& part_indices = {},
+        const std::vector<std::vector<ReplicaID>>& replica_ids = {});
 
     /**
      * @brief Revokes a put operation
@@ -306,7 +330,10 @@ class MasterClient {
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
     [[nodiscard]] tl::expected<void, ErrorCode> PutRevoke(
-        const std::string& key, ReplicaType replica_type);
+        const std::string& key, ReplicaType replica_type,
+        uint32_t part_index = 0,
+        const std::optional<std::vector<ReplicaID>>& replica_ids =
+            std::nullopt);
 
     /**
      * @brief Revokes a put operation for a batch of objects
@@ -315,7 +342,20 @@ class MasterClient {
      */
     [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
         const std::vector<std::string>& keys,
-        ReplicaType replica_type = ReplicaType::ALL);
+        ReplicaType replica_type = ReplicaType::ALL,
+        const std::vector<uint32_t>& part_indices = {},
+        const std::vector<std::vector<ReplicaID>>& replica_ids = {});
+
+    /**
+     * @brief Whether the master this client talks to understands parts.
+     *
+     * A call that names a part asks this first: the part arguments trail the
+     * call as compatible fields, so a master that predates them ignores them
+     * and would answer for a whole object instead of refusing. The answer is
+     * remembered for the life of the client, because a master that changes its
+     * mind under a client is a deployment being replaced.
+     */
+    [[nodiscard]] tl::expected<bool, ErrorCode> SupportsParts();
 
     /**
      * @brief Starts an upsert operation (insert or update)
@@ -844,6 +884,19 @@ class MasterClient {
     // The address which is passed to the coro_rpc_client
     std::string client_addr_param_ GUARDED_BY(connect_mutex_);
     std::atomic<bool> ha_connection_policy_enabled_{false};
+
+    // Fails with INVALID_PARAMS when the master has not said it understands
+    // parts. Only a call that names one asks, so the path every caller before
+    // parts takes makes no extra round trip.
+    [[nodiscard]] tl::expected<void, ErrorCode> RequireParts(const char* call);
+
+    // What the master's Ping said about parts, once it has been asked.
+    mutable Mutex part_support_mutex_;
+    std::optional<bool> master_takes_parts_ GUARDED_BY(part_support_mutex_);
+
+    // A client whose master predates parts, for the refusal this class owes a
+    // caller that names one.
+    friend class test::MasterClientTestPeer;
 };
 
 }  // namespace mooncake
