@@ -4,6 +4,7 @@
 #include <async_simple/coro/Lazy.h>
 #include <async_simple/coro/SyncAwait.h>
 
+#include <algorithm>
 #include <csignal>
 #include <string>
 #include <vector>
@@ -634,13 +635,22 @@ tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
 }
 
 tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
-    const std::string& object_key, const std::string& tenant_id) {
+    const std::string& object_key, const std::string& tenant_id,
+    std::optional<uint32_t> part_index) {
     ScopedVLogTimer timer(1, "MasterClient::GetReplicaList");
-    timer.LogRequest("object_key=", object_key, ", tenant_id=", tenant_id);
+    timer.LogRequest("object_key=", object_key, ", tenant_id=", tenant_id,
+                     ", part_index=", part_index.value_or(0));
 
+    if (part_index.has_value()) {
+        if (auto supported = RequireParts("get_replica_list"); !supported) {
+            return tl::make_unexpected(supported.error());
+        }
+    }
     auto result = invoke_rpc<&WrappedMasterService::GetReplicaList,
                              GetReplicaListResponse>(
-        object_key, tenant_id, struct_pack::compatible<uint32_t>{});
+        object_key, tenant_id,
+        part_index.has_value() ? struct_pack::compatible<uint32_t>{*part_index}
+                               : struct_pack::compatible<uint32_t>{});
     timer.LogResponseExpected(result);
     return result;
 }
@@ -652,15 +662,25 @@ MasterClient::BatchGetReplicaList(const std::vector<std::string>& object_keys) {
 
 std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
 MasterClient::BatchGetReplicaList(const std::vector<std::string>& object_keys,
-                                  const std::string& tenant_id) {
+                                  const std::string& tenant_id,
+                                  const std::vector<uint32_t>& part_indices) {
     ScopedVLogTimer timer(1, "MasterClient::BatchGetReplicaList");
     timer.LogRequest("keys_count=", object_keys.size(),
                      ", tenant_id=", tenant_id);
 
+    if (!part_indices.empty()) {
+        if (auto supported = RequireParts("batch_get_replica_list");
+            !supported) {
+            return std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>(
+                object_keys.size(), tl::make_unexpected(supported.error()));
+        }
+    }
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchGetReplicaList,
                                    GetReplicaListResponse>(
         object_keys.size(), object_keys, tenant_id,
-        struct_pack::compatible<std::vector<uint32_t>>{});
+        part_indices.empty()
+            ? struct_pack::compatible<std::vector<uint32_t>>{}
+            : struct_pack::compatible<std::vector<uint32_t>>{part_indices});
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }
@@ -668,20 +688,30 @@ MasterClient::BatchGetReplicaList(const std::vector<std::string>& object_keys,
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
 MasterClient::PutStart(const std::string& key,
                        const std::vector<size_t>& slice_lengths,
-                       const ReplicateConfig& config) {
+                       const ReplicateConfig& config, uint32_t part_index,
+                       uint32_t part_count) {
     ScopedVLogTimer timer(1, "MasterClient::PutStart");
-    timer.LogRequest("key=", key, ", slice_count=", slice_lengths.size());
+    timer.LogRequest("key=", key, ", slice_count=", slice_lengths.size(),
+                     ", part_index=", part_index, ", part_count=", part_count);
 
     uint64_t total_slice_length = 0;
     for (const auto& slice_length : slice_lengths) {
         total_slice_length += slice_length;
     }
 
+    const bool names_part = part_index != 0 || part_count != 1;
+    if (names_part) {
+        if (auto supported = RequireParts("put_start"); !supported) {
+            return tl::make_unexpected(supported.error());
+        }
+    }
     auto result = invoke_rpc<&WrappedMasterService::PutStart,
                              std::vector<Replica::Descriptor>>(
         client_id_, key, total_slice_length, config, tenant_id_.value(),
-        struct_pack::compatible<uint32_t>{},
-        struct_pack::compatible<uint32_t>{});
+        names_part ? struct_pack::compatible<uint32_t>{part_index}
+                   : struct_pack::compatible<uint32_t>{},
+        names_part ? struct_pack::compatible<uint32_t>{part_count}
+                   : struct_pack::compatible<uint32_t>{});
     timer.LogResponseExpected(result);
     return result;
 }
@@ -690,9 +720,10 @@ std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
 MasterClient::BatchPutStart(
     const std::vector<std::string>& keys,
     const std::vector<std::vector<uint64_t>>& slice_lengths,
-    const ReplicateConfig& config) {
+    const ReplicateConfig& config, const std::vector<uint32_t>& part_indices,
+    uint32_t part_count) {
     ScopedVLogTimer timer(1, "MasterClient::BatchPutStart");
-    timer.LogRequest("keys_count=", keys.size());
+    timer.LogRequest("keys_count=", keys.size(), ", part_count=", part_count);
 
     std::vector<uint64_t> total_slice_lengths;
     total_slice_lengths.reserve(slice_lengths.size());
@@ -704,63 +735,128 @@ MasterClient::BatchPutStart(
         total_slice_lengths.emplace_back(total_slice_length);
     }
 
+    const bool names_part =
+        part_count != 1 ||
+        std::ranges::any_of(part_indices,
+                            [](uint32_t index) { return index != 0; });
+    if (names_part) {
+        if (auto supported = RequireParts("batch_put_start"); !supported) {
+            return std::vector<
+                tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>(
+                keys.size(), tl::make_unexpected(supported.error()));
+        }
+    }
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchPutStart,
                                    std::vector<Replica::Descriptor>>(
         keys.size(), client_id_, keys, total_slice_lengths, config,
-        tenant_id_.value(), struct_pack::compatible<std::vector<uint32_t>>{},
-        struct_pack::compatible<uint32_t>{});
+        tenant_id_.value(),
+        part_indices.empty()
+            ? struct_pack::compatible<std::vector<uint32_t>>{}
+            : struct_pack::compatible<std::vector<uint32_t>>{part_indices},
+        names_part ? struct_pack::compatible<uint32_t>{part_count}
+                   : struct_pack::compatible<uint32_t>{});
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }
 
 tl::expected<void, ErrorCode> MasterClient::PutEnd(
-    const ObjectMeta& object_meta, ReplicaType replica_type) {
+    const ObjectMeta& object_meta, ReplicaType replica_type,
+    uint32_t part_index,
+    const std::optional<std::vector<ReplicaID>>& replica_ids) {
     ScopedVLogTimer timer(1, "MasterClient::PutEnd");
-    timer.LogRequest("key=", object_meta.key);
+    timer.LogRequest("key=", object_meta.key, ", part_index=", part_index);
 
+    if (part_index != 0) {
+        if (auto supported = RequireParts("put_end"); !supported) {
+            return tl::make_unexpected(supported.error());
+        }
+    }
     auto result = invoke_rpc<&WrappedMasterService::PutEnd, void>(
         client_id_, object_meta, replica_type, tenant_id_.value(),
-        struct_pack::compatible<uint32_t>{},
-        struct_pack::compatible<std::vector<uint64_t>>{});
+        part_index != 0 ? struct_pack::compatible<uint32_t>{part_index}
+                        : struct_pack::compatible<uint32_t>{},
+        replica_ids.has_value()
+            ? struct_pack::compatible<std::vector<uint64_t>>{*replica_ids}
+            : struct_pack::compatible<std::vector<uint64_t>>{});
     timer.LogResponseExpected(result);
     return result;
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutEnd(
-    const std::vector<ObjectMeta>& object_metas, ReplicaType replica_type) {
+    const std::vector<ObjectMeta>& object_metas, ReplicaType replica_type,
+    const std::vector<uint32_t>& part_indices,
+    const std::vector<std::vector<ReplicaID>>& replica_ids) {
     ScopedVLogTimer timer(1, "MasterClient::BatchPutEnd");
     timer.LogRequest("keys_count=", object_metas.size());
 
+    const bool names_part = std::ranges::any_of(
+        part_indices, [](uint32_t index) { return index != 0; });
+    if (names_part) {
+        if (auto supported = RequireParts("batch_put_end"); !supported) {
+            return std::vector<tl::expected<void, ErrorCode>>(
+                object_metas.size(), tl::make_unexpected(supported.error()));
+        }
+    }
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchPutEnd, void>(
         object_metas.size(), client_id_, object_metas, replica_type,
-        tenant_id_.value(), struct_pack::compatible<std::vector<uint32_t>>{},
-        struct_pack::compatible<std::vector<std::vector<uint64_t>>>{});
+        tenant_id_.value(),
+        part_indices.empty()
+            ? struct_pack::compatible<std::vector<uint32_t>>{}
+            : struct_pack::compatible<std::vector<uint32_t>>{part_indices},
+        replica_ids.empty()
+            ? struct_pack::compatible<std::vector<std::vector<uint64_t>>>{}
+            : struct_pack::compatible<std::vector<std::vector<uint64_t>>>{
+                  replica_ids});
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }
 
 tl::expected<void, ErrorCode> MasterClient::PutRevoke(
-    const std::string& key, ReplicaType replica_type) {
+    const std::string& key, ReplicaType replica_type, uint32_t part_index,
+    const std::optional<std::vector<ReplicaID>>& replica_ids) {
     ScopedVLogTimer timer(1, "MasterClient::PutRevoke");
-    timer.LogRequest("key=", key);
+    timer.LogRequest("key=", key, ", part_index=", part_index);
 
+    if (part_index != 0) {
+        if (auto supported = RequireParts("put_revoke"); !supported) {
+            return tl::make_unexpected(supported.error());
+        }
+    }
     auto result = invoke_rpc<&WrappedMasterService::PutRevoke, void>(
         client_id_, key, replica_type, tenant_id_.value(),
-        struct_pack::compatible<uint32_t>{},
-        struct_pack::compatible<std::vector<uint64_t>>{});
+        part_index != 0 ? struct_pack::compatible<uint32_t>{part_index}
+                        : struct_pack::compatible<uint32_t>{},
+        replica_ids.has_value()
+            ? struct_pack::compatible<std::vector<uint64_t>>{*replica_ids}
+            : struct_pack::compatible<std::vector<uint64_t>>{});
     timer.LogResponseExpected(result);
     return result;
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutRevoke(
-    const std::vector<std::string>& keys, ReplicaType replica_type) {
+    const std::vector<std::string>& keys, ReplicaType replica_type,
+    const std::vector<uint32_t>& part_indices,
+    const std::vector<std::vector<ReplicaID>>& replica_ids) {
     ScopedVLogTimer timer(1, "MasterClient::BatchPutRevoke");
     timer.LogRequest("keys_count=", keys.size());
 
+    const bool names_part = std::ranges::any_of(
+        part_indices, [](uint32_t index) { return index != 0; });
+    if (names_part) {
+        if (auto supported = RequireParts("batch_put_revoke"); !supported) {
+            return std::vector<tl::expected<void, ErrorCode>>(
+                keys.size(), tl::make_unexpected(supported.error()));
+        }
+    }
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchPutRevoke, void>(
         keys.size(), client_id_, keys, replica_type, tenant_id_.value(),
-        struct_pack::compatible<std::vector<uint32_t>>{},
-        struct_pack::compatible<std::vector<std::vector<uint64_t>>>{});
+        part_indices.empty()
+            ? struct_pack::compatible<std::vector<uint32_t>>{}
+            : struct_pack::compatible<std::vector<uint32_t>>{part_indices},
+        replica_ids.empty()
+            ? struct_pack::compatible<std::vector<std::vector<uint64_t>>>{}
+            : struct_pack::compatible<std::vector<std::vector<uint64_t>>>{
+                  replica_ids});
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }
@@ -1023,6 +1119,40 @@ tl::expected<PingResponse, ErrorCode> MasterClient::Ping() {
             ping_pool, client_id_);
     timer.LogResponseExpected(result);
     return result;
+}
+
+tl::expected<bool, ErrorCode> MasterClient::SupportsParts() {
+    {
+        MutexLocker lock(&part_support_mutex_);
+        if (master_takes_parts_.has_value()) {
+            return *master_takes_parts_;
+        }
+    }
+    auto ping = Ping();
+    if (!ping.has_value()) {
+        return tl::make_unexpected(ping.error());
+    }
+    const bool takes_parts =
+        ping->supported_features.has_value() &&
+        (*ping->supported_features & kPartSupportFeature) != 0;
+    {
+        MutexLocker lock(&part_support_mutex_);
+        master_takes_parts_ = takes_parts;
+    }
+    return takes_parts;
+}
+
+tl::expected<void, ErrorCode> MasterClient::RequireParts(const char* call) {
+    auto supported = SupportsParts();
+    if (!supported.has_value()) {
+        return tl::make_unexpected(supported.error());
+    }
+    if (!*supported) {
+        LOG(ERROR) << "call=" << call
+                   << ", master=knows_no_parts, error=part_refused";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return {};
 }
 
 tl::expected<std::string, ErrorCode> MasterClient::GetFsdir() {
