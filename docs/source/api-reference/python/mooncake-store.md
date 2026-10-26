@@ -463,6 +463,25 @@ def put_from(self, key: str, buffer_ptr: int, size: int, config=None) -> int
 - `size`: Number of bytes to store
 - `config`: Optional replication configuration
 
+#### put_part_from()
+Store one part of an object from a registered buffer.
+
+The first part write of a key fixes the object's part count; every part must
+carry the same `part_count`. The object becomes readable once every part has
+arrived.
+
+```python
+def put_part_from(self, key: str, buffer_ptr: int, size: int, part_index: int, part_count: int, config=None) -> int
+```
+
+**Parameters:**
+- `key`: Object identifier
+- `buffer_ptr`: Memory address of the part's data
+- `size`: Number of bytes in this part
+- `part_index`: Zero-based index of this part
+- `part_count`: Total number of parts the object consists of
+- `config`: Optional replication configuration
+
 #### get_into()
 Retrieve data directly into a registered buffer (zero-copy).
 
@@ -474,6 +493,24 @@ def get_into(self, key: str, buffer_ptr: int, size: int) -> int
 - `key`: Object identifier to retrieve
 - `buffer_ptr`: Memory address of pre-allocated buffer
 - `size`: Size of the buffer (must be >= object size)
+
+**Returns:** Number of bytes read, or negative on error
+
+#### get_part_into()
+Retrieve one part of an object into a registered buffer.
+
+The buffer holds exactly that part, so `size` is the part's length. The read
+fails while any part of the object is still missing.
+
+```python
+def get_part_into(self, key: str, buffer_ptr: int, size: int, part_index: int) -> int
+```
+
+**Parameters:**
+- `key`: Object identifier to retrieve
+- `buffer_ptr`: Memory address of pre-allocated buffer
+- `size`: Size of the buffer (must be >= part size)
+- `part_index`: Zero-based index of the part to read
 
 **Returns:** Number of bytes read, or negative on error
 

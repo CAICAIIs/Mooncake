@@ -4942,10 +4942,18 @@ RealClient::resolve_ranged_read_metadata(
 tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
     const std::string &key, void *buffer, size_t dst_offset, size_t src_offset,
     size_t size, const RangedReadMetadata &metadata,
-    bool size_is_buffer_capacity, bool verify_checksum) {
+    bool size_is_buffer_capacity, bool verify_checksum, bool use_hot_cache) {
     const auto &query_result = metadata.query_result;
     const auto &replica = metadata.replica;
     const uint64_t total_size = metadata.total_size;
+
+    // A whole object may be served from and fed into the local hot cache; a
+    // part read never touches it, because the cache holds whole objects.
+    auto read_from_memory = [&](const QueryResult &qr,
+                               std::vector<Slice> &dst_slices) {
+        return use_hot_cache ? client_->Get(key, qr, dst_slices)
+                             : client_->GetPart(key, qr, dst_slices);
+    };
 
     if (size_is_buffer_capacity) {
         if (size < total_size) {
@@ -5043,7 +5051,7 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
 
             auto filtered_qr =
                 FilterQueryResult(query_result, replica, verify_checksum);
-            auto get_result = client_->Get(key, filtered_qr, tmp_slices);
+            auto get_result = read_from_memory(filtered_qr, tmp_slices);
             if (!get_result) {
                 LOG(ERROR) << "Get failed for key: " << key
                            << " with error: " << toString(get_result.error());
@@ -5063,7 +5071,7 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
 
         auto filtered_qr =
             FilterQueryResult(query_result, replica, verify_checksum);
-        auto get_result = client_->Get(key, filtered_qr, slices);
+        auto get_result = read_from_memory(filtered_qr, slices);
         if (!get_result) {
             LOG(ERROR) << "Get failed for key: " << key
                        << " with error: " << toString(get_result.error());
@@ -5234,6 +5242,40 @@ int64_t RealClient::get_into(const std::string &key, void *buffer,
         [&](uint64_t latency_us, const auto &ret) {
             client_->ObserveTransferOperation(
                 TransferOperationKind::kRead, "get_into",
+                static_cast<uint64_t>(ret.value()), latency_us);
+        });
+    return to_py_ret(result);
+}
+
+tl::expected<int64_t, ErrorCode> RealClient::get_part_into_internal(
+    const std::string &key, void *buffer, size_t size, uint32_t part_index) {
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    // No query cache: the cache is keyed by object, and this read resolves one
+    // part of it.
+    auto metadata = build_ranged_read_metadata_from_query_result(
+        key, client_->Query(key, part_index));
+    if (!metadata) {
+        return tl::unexpected(metadata.error());
+    }
+
+    return execute_ranged_read(key, buffer, 0, 0, size, metadata.value(),
+                               /*size_is_buffer_capacity=*/true,
+                               /*verify_checksum=*/true,
+                               /*use_hot_cache=*/false);
+}
+
+int64_t RealClient::get_part_into(const std::string &key, void *buffer,
+                                  size_t size, uint32_t part_index) {
+    auto result = execute_timed_operation<tl::expected<int64_t, ErrorCode>>(
+        [&]() { return get_part_into_internal(key, buffer, size, part_index); },
+        [](const auto &ret) { return ret.has_value(); },
+        [&](uint64_t latency_us, const auto &ret) {
+            client_->ObserveTransferOperation(
+                TransferOperationKind::kRead, "get_part_into",
                 static_cast<uint64_t>(ret.value()), latency_us);
         });
     return to_py_ret(result);
@@ -5793,6 +5835,44 @@ int RealClient::put_from(const std::string &key, void *buffer, size_t size,
         [&](uint64_t latency_us, const auto &) {
             client_->ObserveTransferOperation(TransferOperationKind::kWrite,
                                               "put_from", size, latency_us);
+        });
+    return to_py_ret(result);
+}
+
+tl::expected<void, ErrorCode> RealClient::put_part_from_internal(
+    const std::string &key, void *buffer, size_t size, uint32_t part_index,
+    uint32_t part_count, const ReplicateConfig &config) {
+    if (config.prefer_alloc_in_same_node) {
+        LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    std::vector<mooncake::Slice> slices = split_into_slices(buffer, size);
+
+    auto put_result = client_->Put(key, slices, config, part_index, part_count);
+    if (!put_result) {
+        return tl::unexpected(put_result.error());
+    }
+
+    return {};
+}
+
+int RealClient::put_part_from(const std::string &key, void *buffer, size_t size,
+                              uint32_t part_index, uint32_t part_count,
+                              const ReplicateConfig &config) {
+    auto result = execute_timed_operation<tl::expected<void, ErrorCode>>(
+        [&]() {
+            return put_part_from_internal(key, buffer, size, part_index,
+                                          part_count, config);
+        },
+        [](const auto &ret) { return ret.has_value(); },
+        [&](uint64_t latency_us, const auto &) {
+            client_->ObserveTransferOperation(TransferOperationKind::kWrite,
+                                              "put_part_from", size, latency_us);
         });
     return to_py_ret(result);
 }
@@ -6558,6 +6638,54 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_range_shm_helper(
 
     return get_into_range_internal(key, real_buffer, 0, src_offset, size,
                                    size_is_buffer_capacity, verify_checksum);
+}
+
+tl::expected<int64_t, ErrorCode> RealClient::get_part_into_shm_helper(
+    const std::string &key, uint64_t dummy_buffer, size_t size,
+    uint32_t part_index, const UUID &client_id) {
+    std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto it = shm_contexts_.find(client_id);
+    if (it == shm_contexts_.end()) {
+        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto &context = it->second;
+
+    void *real_buffer = nullptr;
+    if (!map_dummy_buffer_range_to_real(context, dummy_buffer, 0, size,
+                                        real_buffer)) {
+        LOG(ERROR) << "Dummy buffer at " << dummy_buffer << " (size=" << size
+                   << ") not found in any mapped shared memory for client "
+                   << client_id;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    return get_part_into_internal(key, real_buffer, size, part_index);
+}
+
+tl::expected<void, ErrorCode> RealClient::put_part_from_shm_helper(
+    const std::string &key, uint64_t dummy_buffer, size_t size,
+    uint32_t part_index, uint32_t part_count, const ReplicateConfig &config,
+    const UUID &client_id) {
+    std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto it = shm_contexts_.find(client_id);
+    if (it == shm_contexts_.end()) {
+        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto &context = it->second;
+
+    void *real_buffer = nullptr;
+    if (!map_dummy_buffer_range_to_real(context, dummy_buffer, 0, size,
+                                        real_buffer)) {
+        LOG(ERROR) << "Dummy buffer at " << dummy_buffer << " (size=" << size
+                   << ") not found in any mapped shared memory for client "
+                   << client_id;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    return put_part_from_internal(key, real_buffer, size, part_index,
+                                  part_count, config);
 }
 
 std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>

@@ -747,6 +747,89 @@ TEST_F(ClientIntegrationTest, BasicPutGetOperations) {
     client_buffer_allocator_->deallocate(buffer, test_data.size());
 }
 
+// One key written part by part is read part by part, and no read can ask for
+// it as a whole.
+TEST_F(ClientIntegrationTest, WritesAndReadsAnObjectPartByPart) {
+    constexpr uint32_t kPartCount = 3;
+    constexpr size_t kPartSize = 1024;
+    const std::string key = "part_by_part_key";
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    std::vector<std::string> part_data;
+    for (uint32_t part_index = 0; part_index < kPartCount; ++part_index) {
+        part_data.emplace_back(kPartSize, static_cast<char>('a' + part_index));
+    }
+
+    for (uint32_t part_index = 0; part_index < kPartCount; ++part_index) {
+        void* buffer = client_buffer_allocator_->allocate(kPartSize);
+        memcpy(buffer, part_data[part_index].data(), kPartSize);
+        std::vector<Slice> slices{{buffer, kPartSize}};
+        auto put_result =
+            test_client_->Put(key, slices, config, part_index, kPartCount);
+        ASSERT_TRUE(put_result.has_value())
+            << "part " << part_index << ": " << toString(put_result.error());
+        client_buffer_allocator_->deallocate(buffer, kPartSize);
+
+        // A part read waits for the whole object.
+        auto query_result = test_client_->Query(key, part_index);
+        if (part_index + 1 < kPartCount) {
+            ASSERT_FALSE(query_result.has_value());
+            EXPECT_EQ(query_result.error(), ErrorCode::REPLICA_IS_NOT_READY);
+        } else {
+            ASSERT_TRUE(query_result.has_value())
+                << toString(query_result.error());
+        }
+    }
+
+    for (uint32_t part_index = 0; part_index < kPartCount; ++part_index) {
+        auto query_result = test_client_->Query(key, part_index);
+        ASSERT_TRUE(query_result.has_value()) << toString(query_result.error());
+
+        void* buffer = client_buffer_allocator_->allocate(kPartSize);
+        std::vector<Slice> slices{{buffer, kPartSize}};
+        auto get_result =
+            test_client_->GetPart(key, query_result.value(), slices);
+        ASSERT_TRUE(get_result.has_value())
+            << "part " << part_index << ": " << toString(get_result.error());
+        ASSERT_EQ(slices.size(), 1);
+        ASSERT_EQ(slices[0].size, kPartSize);
+        EXPECT_EQ(memcmp(slices[0].ptr, part_data[part_index].data(), kPartSize),
+                  0)
+            << "part " << part_index;
+        client_buffer_allocator_->deallocate(buffer, kPartSize);
+    }
+
+    // A parted object has no whole to hand out.
+    void* whole_buffer =
+        client_buffer_allocator_->allocate(kPartSize * kPartCount);
+    std::vector<Slice> whole_slices{{whole_buffer, kPartSize * kPartCount}};
+    auto whole_result = test_client_->Get(key, whole_slices);
+    ASSERT_FALSE(whole_result.has_value());
+    EXPECT_EQ(whole_result.error(), ErrorCode::INVALID_PARAMS);
+    client_buffer_allocator_->deallocate(whole_buffer,
+                                         kPartSize * kPartCount);
+
+    // The first write fixes the part count, and a part beyond it cannot be
+    // named.
+    void* buffer = client_buffer_allocator_->allocate(kPartSize);
+    std::vector<Slice> slices{{buffer, kPartSize}};
+    auto mismatched = test_client_->Put(key, slices, config, 0, kPartCount + 1);
+    ASSERT_FALSE(mismatched.has_value());
+    EXPECT_EQ(mismatched.error(), ErrorCode::INVALID_PARAMS);
+
+    auto beyond_last = test_client_->Query(key, kPartCount);
+    ASSERT_FALSE(beyond_last.has_value());
+    EXPECT_EQ(beyond_last.error(), ErrorCode::INVALID_PARAMS);
+    client_buffer_allocator_->deallocate(buffer, kPartSize);
+
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(default_kv_lease_ttl_));
+    auto remove_result = test_client_->Remove(key);
+    ASSERT_TRUE(remove_result.has_value())
+        << "Remove operation failed: " << toString(remove_result.error());
+}
+
 TEST_F(ClientIntegrationTest, ObjectChecksumRejectsCorruptedObject) {
     if (!ClientObjectChecksumConfig::IsEnabledAtFirstUse()) {
         GTEST_SKIP() << "MOONCAKE_STORE_CHECKSUM is not enabled";

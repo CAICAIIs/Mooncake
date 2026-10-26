@@ -109,6 +109,13 @@ class DummyClient : public PyClient {
         const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
         const ReplicateConfig &config = ReplicateConfig{});
 
+    int put_part_from(const std::string &key, void *buffer, size_t size,
+                      uint32_t part_index, uint32_t part_count,
+                      const ReplicateConfig &config = ReplicateConfig{});
+
+    int64_t get_part_into(const std::string &key, void *buffer, size_t size,
+                          uint32_t part_index);
+
     std::vector<int> batch_put_from_multi_buffers(
         const std::vector<std::string> &keys,
         const std::vector<std::vector<void *>> &all_buffers,

@@ -182,10 +182,14 @@ class Client {
     /**
      * @brief Gets object metadata without transferring data
      * @param object_key Key to query
+     * @param part_index Which part to resolve; nullopt asks for the whole
+     * object, which a key written part by part has none of
      * @return QueryResult containing replicas and lease timeout, or ErrorCode
      * indicating failure
      */
-    tl::expected<QueryResult, ErrorCode> Query(const std::string& object_key);
+    tl::expected<QueryResult, ErrorCode> Query(
+        const std::string& object_key,
+        std::optional<uint32_t> part_index = std::nullopt);
 
     /**
      * @brief Read-only variant of Query(): fetches replica metadata without
@@ -270,6 +274,19 @@ class Client {
                                       const QueryResult& query_result,
                                       std::vector<Slice>& slices,
                                       uint64_t src_offset);
+    /**
+     * @brief Transfers one part of an object using a part-level query result
+     *
+     * The same transfer as Get(), except that neither side of it touches the
+     * whole-object hot cache.
+     * @param object_key Key of the object
+     * @param query_result Result of Query(object_key, part_index)
+     * @param slices Vector of slices to store the part
+     * @return ErrorCode indicating success/failure
+     */
+    tl::expected<void, ErrorCode> GetPart(const std::string& object_key,
+                                          const QueryResult& query_result,
+                                          std::vector<Slice>& slices);
     std::optional<TransferEngine::ScatterTransferOperation> SubmitScatter(
         const std::vector<TransferEngine::ScatterTransferRange>& transfers,
         TransferIntent intent = TransferIntent::kUnspecified);
@@ -300,11 +317,16 @@ class Client {
      * @param key Object key
      * @param slices Vector of data slices to store
      * @param config Replication configuration
+     * @param part_index Which part of the object these slices fill
+     * @param part_count How many parts the object has; the first writer fixes
+     * it and later writers must agree
      * @return ErrorCode indicating success/failure
      */
     tl::expected<void, ErrorCode> Put(const ObjectKey& key,
                                       std::vector<Slice>& slices,
-                                      const ReplicateConfig& config);
+                                      const ReplicateConfig& config,
+                                      uint32_t part_index = 0,
+                                      uint32_t part_count = 1);
 
     /**
      * @brief Batch put data with replication
@@ -990,6 +1012,13 @@ class Client {
      * @brief Internal helper functions for initialization and data transfer
      */
     ErrorCode ConnectToMaster(const std::string& master_server_entry);
+
+    // Backs every whole-object transfer: Get() feeds the hot cache, GetPart()
+    // leaves it alone.
+    tl::expected<void, ErrorCode> GetInternal(const std::string& object_key,
+                                              const QueryResult& query_result,
+                                              std::vector<Slice>& slices,
+                                              bool use_hot_cache);
     // The BatchPutStart counterpart: heals the OBJECT_ALREADY_EXISTS subset
     // with one batched replica-list query and one batched evict, then retries
     // PutStart for just the evicted keys and splices the responses back, so a

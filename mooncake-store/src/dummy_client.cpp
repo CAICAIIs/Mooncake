@@ -1534,6 +1534,29 @@ int64_t DummyClient::get_into(const std::string& key, void* buffer,
     return bytes_read;
 }
 
+int64_t DummyClient::get_part_into(const std::string& key, void* buffer,
+                                   size_t size, uint32_t part_index) {
+    auto prepared = prepare_buffer(buffer, size, false, true);
+    if (!prepared) return toInt(ErrorCode::INVALID_PARAMS);
+    const uint64_t dummy_addr = reinterpret_cast<uint64_t>(prepared->dummy);
+    const auto start_time = std::chrono::steady_clock::now();
+    auto result = invoke_rpc<&RealClient::get_part_into_shm_helper,
+                             tl::expected<int64_t, ErrorCode>>(
+        key, dummy_addr, size, part_index, client_id_);
+    if (!result) return static_cast<int64_t>(toInt(result.error()));
+
+    const int64_t bytes_read = to_py_ret(*result);
+    if (bytes_read >= 0) {
+        if (!copy_from_staging(*prepared, static_cast<size_t>(bytes_read))) {
+            return toInt(ErrorCode::INTERNAL_ERROR);
+        }
+        ObserveTransferMetric(TransferOperationKind::kRead, "get_part_into",
+                              static_cast<size_t>(bytes_read),
+                              elapsed_us_since(start_time), false);
+    }
+    return bytes_read;
+}
+
 std::vector<std::vector<std::vector<int64_t>>> DummyClient::get_into_ranges(
     const std::vector<void*>& buffers,
     const std::vector<std::vector<std::string>>& all_keys,
@@ -1778,6 +1801,27 @@ int DummyClient::put_from(const std::string& key, void* buffer, size_t size,
                           const ReplicateConfig& config) {
     auto results = batch_put_from({key}, {buffer}, {size}, config);
     return results.empty() ? -1 : results[0];
+}
+
+int DummyClient::put_part_from(const std::string& key, void* buffer,
+                               size_t size, uint32_t part_index,
+                               uint32_t part_count,
+                               const ReplicateConfig& config) {
+    auto prepared = prepare_buffer(buffer, size, true);
+    if (!prepared) return toInt(ErrorCode::INVALID_PARAMS);
+    const uint64_t dummy_addr = reinterpret_cast<uint64_t>(prepared->dummy);
+    const auto start_time = std::chrono::steady_clock::now();
+    auto result = invoke_rpc<&RealClient::put_part_from_shm_helper,
+                             tl::expected<void, ErrorCode>>(
+        key, dummy_addr, size, part_index, part_count, config, client_id_);
+    if (!result) return toInt(result.error());
+
+    const int ret = to_py_ret(*result);
+    if (ret == 0) {
+        ObserveTransferMetric(TransferOperationKind::kWrite, "put_part_from",
+                              size, elapsed_us_since(start_time), false);
+    }
+    return ret;
 }
 
 std::vector<int64_t> DummyClient::batch_get_into(

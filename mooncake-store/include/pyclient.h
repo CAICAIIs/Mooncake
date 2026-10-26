@@ -363,6 +363,9 @@ class PyClient {
     virtual int64_t get_into(const std::string &key, void *buffer,
                              size_t size) = 0;
 
+    virtual int64_t get_part_into(const std::string &key, void *buffer,
+                                  size_t size, uint32_t part_index) = 0;
+
     // query_result_cache is optional and is only used to reuse fresh
     // batch_query() results for this read; callers still do not provide any
     // replica-selection or ranged-read metadata directly.
@@ -427,6 +430,11 @@ class PyClient {
 
     virtual int put_from(const std::string &key, void *buffer, size_t size,
                          const ReplicateConfig &config = ReplicateConfig{}) = 0;
+
+    virtual int put_part_from(const std::string &key, void *buffer, size_t size,
+                              uint32_t part_index, uint32_t part_count,
+                              const ReplicateConfig &config =
+                                  ReplicateConfig{}) = 0;
 
     virtual int put_from_with_metadata(
         const std::string &key, void *buffer, void *metadata_buffer,

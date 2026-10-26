@@ -3063,6 +3063,18 @@ PYBIND11_MODULE(_store, m) {
             py::arg("key"), py::arg("buffer_ptr"), py::arg("size"),
             "Get object data directly into a pre-allocated buffer")
         .def(
+            "get_part_into",
+            [](MooncakeStorePyWrapper &self, const std::string &key,
+               uintptr_t buffer_ptr, size_t size, uint32_t part_index) {
+                // One part of the object; the buffer holds exactly that part.
+                void *buffer = reinterpret_cast<void *>(buffer_ptr);
+                py::gil_scoped_release release;
+                return self.store_->get_part_into(key, buffer, size, part_index);
+            },
+            py::arg("key"), py::arg("buffer_ptr"), py::arg("size"),
+            py::arg("part_index"),
+            "Get one part of an object into a pre-allocated buffer")
+        .def(
             "get_into_ranges",
             [](MooncakeStorePyWrapper &self,
                const std::vector<uintptr_t> &buffer_ptrs,
@@ -3175,6 +3187,25 @@ PYBIND11_MODULE(_store, m) {
             py::arg("key"), py::arg("buffer_ptr"), py::arg("size"),
             py::arg("config") = ReplicateConfig{},
             "Put object data directly from a pre-allocated buffer")
+        .def(
+            "put_part_from",
+            [](MooncakeStorePyWrapper &self, const std::string &key,
+               uintptr_t buffer_ptr, size_t size, uint32_t part_index,
+               uint32_t part_count,
+               const ReplicateConfig &config = ReplicateConfig{}) {
+                if (!self.is_client_initialized()) {
+                    LOG(ERROR) << "Client is not initialized";
+                    return to_py_ret(ErrorCode::INVALID_PARAMS);
+                }
+                void *buffer = reinterpret_cast<void *>(buffer_ptr);
+                py::gil_scoped_release release;
+                return self.store_->put_part_from(key, buffer, size, part_index,
+                                                  part_count, config);
+            },
+            py::arg("key"), py::arg("buffer_ptr"), py::arg("size"),
+            py::arg("part_index"), py::arg("part_count"),
+            py::arg("config") = ReplicateConfig{},
+            "Put one part of a multi-part object from a pre-allocated buffer")
         .def(
             "put_from_with_metadata",
             [](MooncakeStorePyWrapper &self, const std::string &key,

@@ -4866,6 +4866,66 @@ TEST_F(RealClientTest,
     std::remove(quota_path);
 }
 
+TEST_F(RealClientTest, PutPartFromAndGetPartIntoCarryOnePartEach) {
+    StartMasterAndSetupClient();
+
+    constexpr uint32_t kPartCount = 3;
+    constexpr size_t kPartSize = 4096;
+    const std::string key = "part_from_into";
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    std::vector<std::string> parts;
+    parts.reserve(kPartCount);
+    for (uint32_t part_index = 0; part_index < kPartCount; ++part_index) {
+        parts.emplace_back(kPartSize, static_cast<char>('a' + part_index));
+        ASSERT_EQ(py_client_->register_buffer(parts.back().data(),
+                                              parts.back().size()),
+                  0);
+    }
+
+    for (uint32_t part_index = 0; part_index < kPartCount; ++part_index) {
+        EXPECT_EQ(py_client_->put_part_from(key, parts[part_index].data(),
+                                            kPartSize, part_index, kPartCount,
+                                            config),
+                  0);
+        // No part reads before the last one lands.
+        if (part_index + 1 < kPartCount) {
+            std::string destination(kPartSize, '\0');
+            ASSERT_EQ(py_client_->register_buffer(destination.data(),
+                                                 destination.size()),
+                      0);
+            EXPECT_EQ(py_client_->get_part_into(key, destination.data(),
+                                               kPartSize, part_index),
+                      static_cast<int64_t>(
+                          toInt(ErrorCode::REPLICA_IS_NOT_READY)));
+            EXPECT_EQ(py_client_->unregister_buffer(destination.data()), 0);
+        }
+    }
+
+    for (uint32_t part_index = 0; part_index < kPartCount; ++part_index) {
+        std::string destination(kPartSize, '\0');
+        ASSERT_EQ(py_client_->register_buffer(destination.data(),
+                                              destination.size()),
+                  0);
+        EXPECT_EQ(py_client_->get_part_into(key, destination.data(), kPartSize,
+                                            part_index),
+                  static_cast<int64_t>(kPartSize));
+        EXPECT_EQ(destination, parts[part_index]) << "part " << part_index;
+        EXPECT_EQ(py_client_->unregister_buffer(destination.data()), 0);
+    }
+
+    std::string whole(kPartSize * kPartCount, '\0');
+    ASSERT_EQ(py_client_->register_buffer(whole.data(), whole.size()), 0);
+    EXPECT_EQ(py_client_->get_into(key, whole.data(), whole.size()),
+              static_cast<int64_t>(toInt(ErrorCode::INVALID_PARAMS)));
+    EXPECT_EQ(py_client_->unregister_buffer(whole.data()), 0);
+
+    for (auto& part : parts) {
+        EXPECT_EQ(py_client_->unregister_buffer(part.data()), 0);
+    }
+}
+
 }  // namespace testing
 
 }  // namespace mooncake

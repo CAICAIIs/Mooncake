@@ -1381,10 +1381,13 @@ Client::QueryByRegex(const std::string& str) {
 }
 
 tl::expected<QueryResult, ErrorCode> Client::Query(
-    const std::string& object_key) {
+    const std::string& object_key, std::optional<uint32_t> part_index) {
     std::chrono::steady_clock::time_point start_time =
         std::chrono::steady_clock::now();
-    auto result = master_client_.GetReplicaList(object_key);
+    auto result = part_index.has_value()
+                      ? master_client_.GetReplicaList(
+                            object_key, master_client_.tenant_id(), part_index)
+                      : master_client_.GetReplicaList(object_key);
     if (!result) {
         return tl::unexpected(result.error());
     }
@@ -1578,6 +1581,20 @@ tl::expected<std::vector<std::string>, ErrorCode> Client::BatchReplicaClear(
 tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
                                           const QueryResult& query_result,
                                           std::vector<Slice>& slices) {
+    return GetInternal(object_key, query_result, slices,
+                       /*use_hot_cache=*/true);
+}
+
+tl::expected<void, ErrorCode> Client::GetPart(const std::string& object_key,
+                                              const QueryResult& query_result,
+                                              std::vector<Slice>& slices) {
+    return GetInternal(object_key, query_result, slices,
+                       /*use_hot_cache=*/false);
+}
+
+tl::expected<void, ErrorCode> Client::GetInternal(
+    const std::string& object_key, const QueryResult& query_result,
+    std::vector<Slice>& slices, bool use_hot_cache) {
     // Select a complete replica for this request's destination.
     Replica::Descriptor replica;
     ErrorCode err =
@@ -1591,7 +1608,7 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
 
     // Check local hot cache and update replica descriptor if cache hit
     bool cache_used = false;
-    if (hot_cache_ && replica.is_memory_replica()) {
+    if (use_hot_cache && hot_cache_ && replica.is_memory_replica()) {
         cache_used = RedirectToHotCache(object_key, replica);
     }
 
@@ -1603,7 +1620,7 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
     }
 
     // Release the cache block after transfer completes (memcpy is done)
-    if (hot_cache_ && cache_used) {
+    if (use_hot_cache && hot_cache_ && cache_used) {
         hot_cache_->ReleaseHotKey(object_key);
     }
 
@@ -1634,7 +1651,7 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
     // Frequency admission: only promote frequently accessed keys to hot cache.
     // Skip when cache_used — data was already served from local cache, no need
     // to re-promote or increment the CMS counter.
-    if (ShouldAdmitToHotCache(object_key, cache_used)) {
+    if (use_hot_cache && ShouldAdmitToHotCache(object_key, cache_used)) {
         ProcessSlicesAsync(object_key, slices, replica);
     }
 
@@ -2052,7 +2069,9 @@ bool Client::RedirectToHotCache(const std::string& key,
 
 tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                                           std::vector<Slice>& slices,
-                                          const ReplicateConfig& config) {
+                                          const ReplicateConfig& config,
+                                          uint32_t part_index,
+                                          uint32_t part_count) {
     std::optional<uint64_t> object_checksum;
     if (object_checksum_enabled_) {
         auto checksum_result = ComputeObjectChecksumForSlices(
@@ -2080,11 +2099,13 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     }
 
     // Start put operation
-    auto start_result = master_client_.PutStart(key, slice_lengths, client_cfg);
+    auto start_result = master_client_.PutStart(key, slice_lengths, client_cfg,
+                                               part_index, part_count);
     if (!start_result &&
         start_result.error() == ErrorCode::OBJECT_ALREADY_EXISTS &&
         healDanglingLocalDiskReplica(key) == DiskReplicaHealResult::kEvicted) {
-        start_result = master_client_.PutStart(key, slice_lengths, client_cfg);
+        start_result = master_client_.PutStart(key, slice_lengths, client_cfg,
+                                              part_index, part_count);
     }
     if (!start_result) {
         ErrorCode err = start_result.error();
@@ -2185,7 +2206,8 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
 
     if (finalize_decision.end_type.has_value()) {
         auto end_result = master_client_.PutEnd(
-            ObjectMeta{key, object_checksum}, *finalize_decision.end_type);
+            ObjectMeta{key, object_checksum}, *finalize_decision.end_type,
+            part_index);
         if (!end_result) {
             ErrorCode err = end_result.error();
             LOG(ERROR) << "Failed to end put operation: " << err;
@@ -2194,8 +2216,8 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     }
 
     if (finalize_decision.revoke_type.has_value()) {
-        auto revoke_result =
-            master_client_.PutRevoke(key, *finalize_decision.revoke_type);
+        auto revoke_result = master_client_.PutRevoke(
+            key, *finalize_decision.revoke_type, part_index);
         if (!revoke_result) {
             LOG(ERROR) << "Failed to revoke put operation";
             return tl::unexpected(revoke_result.error());

@@ -148,6 +148,19 @@ class RealClient : public PyClient {
      */
     int64_t get_into(const std::string &key, void *buffer, size_t size);
 
+    /**
+     * @brief Get one part of an object into a pre-allocated buffer
+     * @param key Key of the object to get
+     * @param buffer Pointer to a writable Store buffer
+     * @param size Size of the buffer
+     * @param part_index Which part to read
+     * @return Number of bytes read on success, negative value on error
+     * @note The buffer holds exactly that part: a part read never goes through
+     * the whole-object hot cache.
+     */
+    int64_t get_part_into(const std::string &key, void *buffer, size_t size,
+                          uint32_t part_index);
+
     std::vector<std::vector<std::vector<int64_t>>> get_into_ranges(
         const std::vector<void *> &buffers,
         const std::vector<std::vector<std::string>> &all_keys,
@@ -215,6 +228,22 @@ class RealClient : public PyClient {
      */
     int put_from(const std::string &key, void *buffer, size_t size,
                  const ReplicateConfig &config = ReplicateConfig{});
+
+    /**
+     * @brief Put one part of a multi-part object from a registered buffer
+     * @param key Key of the object to put
+     * @param buffer Pointer to the registered data buffer
+     * @param size Size of the part in bytes
+     * @param part_index Which part of the object this buffer holds
+     * @param part_count How many parts the object has; every writer of the key
+     * must pass the same count
+     * @param config Replication configuration
+     * @return 0 on success, negative value on error
+     * @note The object becomes readable once every part has landed.
+     */
+    int put_part_from(const std::string &key, void *buffer, size_t size,
+                      uint32_t part_index, uint32_t part_count,
+                      const ReplicateConfig &config = ReplicateConfig{});
 
     /**
      * @brief Put one object directly from a registered data buffer plus a
@@ -576,6 +605,11 @@ class RealClient : public PyClient {
         const std::vector<size_t> &sizes, const ReplicateConfig &config,
         int32_t device_id, const UUID &client_id);
 
+    tl::expected<void, ErrorCode> put_part_from_shm_helper(
+        const std::string &key, uint64_t dummy_buffer, size_t size,
+        uint32_t part_index, uint32_t part_count,
+        const ReplicateConfig &config, const UUID &client_id);
+
     std::vector<tl::expected<void, ErrorCode>>
     batch_put_from_multi_buffers_dummy_helper(
         const std::vector<std::string> &keys,
@@ -618,6 +652,10 @@ class RealClient : public PyClient {
         const std::string &key, uint64_t buffer, size_t dst_offset,
         size_t src_offset, size_t size, bool size_is_buffer_capacity,
         bool verify_checksum, const UUID &client_id);
+
+    tl::expected<int64_t, ErrorCode> get_part_into_shm_helper(
+        const std::string &key, uint64_t buffer, size_t size,
+        uint32_t part_index, const UUID &client_id);
 
     std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
     get_into_ranges_shm_helper(
@@ -730,12 +768,17 @@ class RealClient : public PyClient {
     tl::expected<int64_t, ErrorCode> execute_ranged_read(
         const std::string &key, void *buffer, size_t dst_offset,
         size_t src_offset, size_t size, const RangedReadMetadata &metadata,
-        bool size_is_buffer_capacity, bool verify_checksum);
+        bool size_is_buffer_capacity, bool verify_checksum,
+        bool use_hot_cache = true);
 
     tl::expected<int64_t, ErrorCode> get_into_range_internal(
         const std::string &key, void *buffer, size_t dst_offset,
         size_t src_offset, size_t size, bool size_is_buffer_capacity,
         bool verify_checksum);
+
+    tl::expected<int64_t, ErrorCode> get_part_into_internal(
+        const std::string &key, void *buffer, size_t size,
+        uint32_t part_index);
 
     std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
     get_into_ranges_internal(
@@ -785,6 +828,11 @@ class RealClient : public PyClient {
 
     tl::expected<void, ErrorCode> put_from_internal(
         const std::string &key, void *buffer, size_t size,
+        const ReplicateConfig &config = ReplicateConfig{});
+
+    tl::expected<void, ErrorCode> put_part_from_internal(
+        const std::string &key, void *buffer, size_t size,
+        uint32_t part_index, uint32_t part_count,
         const ReplicateConfig &config = ReplicateConfig{});
 
     tl::expected<void, ErrorCode> upsert_internal(
