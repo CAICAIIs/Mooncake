@@ -718,8 +718,8 @@ tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
                      ", part_index=", part_index.value_or(0));
 
     if (part_index.has_value()) {
-        if (auto supported = RequireParts("get_replica_list"); !supported) {
-            return tl::make_unexpected(supported.error());
+        if (auto refusal = RequireParts("get_replica_list"); !refusal) {
+            return tl::make_unexpected(refusal.error());
         }
     }
     auto result = invoke_rpc<&WrappedMasterService::GetReplicaList,
@@ -745,10 +745,9 @@ MasterClient::BatchGetReplicaList(const std::vector<std::string>& object_keys,
                      ", tenant_id=", tenant_id);
 
     if (!part_indices.empty()) {
-        if (auto supported = RequireParts("batch_get_replica_list");
-            !supported) {
+        if (auto refusal = RequireParts("batch_get_replica_list"); !refusal) {
             return std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>(
-                object_keys.size(), tl::make_unexpected(supported.error()));
+                object_keys.size(), tl::make_unexpected(refusal.error()));
         }
     }
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchGetReplicaList,
@@ -815,8 +814,8 @@ MasterClient::PutStart(const std::string& key,
 
     const bool names_part = part_index != 0 || part_count != 1;
     if (names_part) {
-        if (auto supported = RequireParts("put_start"); !supported) {
-            return tl::make_unexpected(supported.error());
+        if (auto refusal = RequireParts("put_start"); !refusal) {
+            return tl::make_unexpected(refusal.error());
         }
     }
     auto result = invoke_rpc<&WrappedMasterService::PutStart,
@@ -854,10 +853,10 @@ MasterClient::BatchPutStart(
         std::ranges::any_of(part_indices,
                             [](uint32_t index) { return index != 0; });
     if (names_part) {
-        if (auto supported = RequireParts("batch_put_start"); !supported) {
+        if (auto refusal = RequireParts("batch_put_start"); !refusal) {
             return std::vector<
                 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>(
-                keys.size(), tl::make_unexpected(supported.error()));
+                keys.size(), tl::make_unexpected(refusal.error()));
         }
     }
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchPutStart,
@@ -881,8 +880,8 @@ tl::expected<void, ErrorCode> MasterClient::PutEnd(
     timer.LogRequest("key=", object_meta.key, ", part_index=", part_index);
 
     if (part_index != 0) {
-        if (auto supported = RequireParts("put_end"); !supported) {
-            return tl::make_unexpected(supported.error());
+        if (auto refusal = RequireParts("put_end"); !refusal) {
+            return tl::make_unexpected(refusal.error());
         }
     }
     auto result = invoke_rpc<&WrappedMasterService::PutEnd, void>(
@@ -906,9 +905,9 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutEnd(
     const bool names_part = std::ranges::any_of(
         part_indices, [](uint32_t index) { return index != 0; });
     if (names_part) {
-        if (auto supported = RequireParts("batch_put_end"); !supported) {
+        if (auto refusal = RequireParts("batch_put_end"); !refusal) {
             return std::vector<tl::expected<void, ErrorCode>>(
-                object_metas.size(), tl::make_unexpected(supported.error()));
+                object_metas.size(), tl::make_unexpected(refusal.error()));
         }
     }
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchPutEnd, void>(
@@ -932,8 +931,8 @@ tl::expected<void, ErrorCode> MasterClient::PutRevoke(
     timer.LogRequest("key=", key, ", part_index=", part_index);
 
     if (part_index != 0) {
-        if (auto supported = RequireParts("put_revoke"); !supported) {
-            return tl::make_unexpected(supported.error());
+        if (auto refusal = RequireParts("put_revoke"); !refusal) {
+            return tl::make_unexpected(refusal.error());
         }
     }
     auto result = invoke_rpc<&WrappedMasterService::PutRevoke, void>(
@@ -957,9 +956,9 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutRevoke(
     const bool names_part = std::ranges::any_of(
         part_indices, [](uint32_t index) { return index != 0; });
     if (names_part) {
-        if (auto supported = RequireParts("batch_put_revoke"); !supported) {
+        if (auto refusal = RequireParts("batch_put_revoke"); !refusal) {
             return std::vector<tl::expected<void, ErrorCode>>(
-                keys.size(), tl::make_unexpected(supported.error()));
+                keys.size(), tl::make_unexpected(refusal.error()));
         }
     }
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchPutRevoke, void>(
@@ -1257,11 +1256,11 @@ tl::expected<bool, ErrorCode> MasterClient::SupportsParts() {
 }
 
 tl::expected<void, ErrorCode> MasterClient::RequireParts(const char* call) {
-    auto supported = SupportsParts();
-    if (!supported.has_value()) {
-        return tl::make_unexpected(supported.error());
+    auto capability = SupportsParts();
+    if (!capability.has_value()) {
+        return tl::make_unexpected(capability.error());
     }
-    if (!*supported) {
+    if (!*capability) {
         LOG(ERROR) << "call=" << call
                    << ", master=knows_no_parts, error=part_refused";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
