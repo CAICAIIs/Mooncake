@@ -604,6 +604,12 @@ ErrorCode MasterClient::Connect(const std::string& master_addr) {
         ha_control_client_accessor_.GetOrCreateClientPool(master_addr);
     }
     client_addr_param_ = master_addr;
+    // A connect can point the client at another master, so the answer the
+    // previous one gave about parts no longer holds.
+    {
+        MutexLocker lock(&part_support_mutex_);
+        master_takes_parts_.reset();
+    }
     timer.LogResponse("error_code=", ErrorCode::OK);
     return ErrorCode::OK;
 }
