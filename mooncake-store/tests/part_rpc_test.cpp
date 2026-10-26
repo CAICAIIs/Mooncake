@@ -681,5 +681,83 @@ TEST_F(PartRpcTest, MasterClientBatchCarriesAPartPerItem) {
     }
 }
 
+// One client serves many threads: every part of one key arrives on its own
+// thread, and a reader that names a part gets that part's checksum back.
+TEST_F(PartRpcTest, ConcurrentPartsFromOneClient) {
+    constexpr uint32_t kParts = 8;
+    constexpr uint32_t kReaders = 8;
+    const std::string key = "client_concurrent_parts_key";
+    const std::string tenant(TenantId::kDefaultValue);
+
+    MasterClient client(client_id_);
+    ASSERT_EQ(client.Connect(address(port_)), ErrorCode::OK);
+
+    std::vector<std::string> write_failures(kParts);
+    std::vector<std::thread> writers;
+    writers.reserve(kParts);
+    for (uint32_t part = 0; part < kParts; ++part) {
+        writers.emplace_back([&client, &write_failures, &key, part]() {
+            ReplicateConfig config;
+            config.replica_num = 1;
+            auto started = client.PutStart(key, {1024}, config, part, kParts);
+            if (!started.has_value()) {
+                write_failures[part] = toString(started.error());
+                return;
+            }
+            std::vector<ReplicaID> ids;
+            ids.reserve(started->size());
+            for (const auto& descriptor : *started) {
+                ids.push_back(descriptor.id);
+            }
+            auto ended = client.PutEnd(ObjectMeta{key, uint64_t{7100} + part},
+                                       ReplicaType::MEMORY, part, ids);
+            if (!ended.has_value()) {
+                write_failures[part] = toString(ended.error());
+            }
+        });
+    }
+    for (auto& writer : writers) {
+        writer.join();
+    }
+    for (uint32_t part = 0; part < kParts; ++part) {
+        EXPECT_TRUE(write_failures[part].empty())
+            << "part " << part << ": " << write_failures[part];
+    }
+
+    std::vector<std::string> read_failures(kReaders);
+    std::vector<std::thread> readers;
+    readers.reserve(kReaders);
+    for (uint32_t reader = 0; reader < kReaders; ++reader) {
+        readers.emplace_back(
+            [&client, &read_failures, &key, &tenant, reader]() {
+                for (uint32_t part = 0; part < kParts; ++part) {
+                    auto read = client.GetReplicaList(key, tenant, part);
+                    if (!read.has_value()) {
+                        read_failures[reader] = toString(read.error());
+                        return;
+                    }
+                    if (!read->object_checksum.has_value() ||
+                        *read->object_checksum != uint64_t{7100} + part) {
+                        read_failures[reader] = "part " + std::to_string(part) +
+                                                " answered with another "
+                                                "part's checksum";
+                        return;
+                    }
+                }
+            });
+    }
+    for (auto& reader : readers) {
+        reader.join();
+    }
+    for (uint32_t reader = 0; reader < kReaders; ++reader) {
+        EXPECT_TRUE(read_failures[reader].empty()) << read_failures[reader];
+    }
+
+    // The threads that raced into the first part call asked the master once.
+    auto takes_parts = test::MasterClientTestPeer::MasterTakesParts(client);
+    ASSERT_TRUE(takes_parts.has_value());
+    EXPECT_TRUE(*takes_parts);
+}
+
 }  // namespace
 }  // namespace mooncake
