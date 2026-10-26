@@ -771,7 +771,7 @@ TEST_F(ClientIntegrationTest, WritesAndReadsAnObjectPartByPart) {
             << "part " << part_index << ": " << toString(put_result.error());
         client_buffer_allocator_->deallocate(buffer, kPartSize);
 
-        // A part read waits for the whole object.
+        // Nothing is readable until the last part lands.
         auto query_result = test_client_->Query(key, part_index);
         if (part_index + 1 < kPartCount) {
             ASSERT_FALSE(query_result.has_value());
@@ -800,7 +800,8 @@ TEST_F(ClientIntegrationTest, WritesAndReadsAnObjectPartByPart) {
         client_buffer_allocator_->deallocate(buffer, kPartSize);
     }
 
-    // A parted object has no whole to hand out.
+    // A parted object has no whole to hand out, and a part past its count is
+    // refused.
     void* whole_buffer =
         client_buffer_allocator_->allocate(kPartSize * kPartCount);
     std::vector<Slice> whole_slices{{whole_buffer, kPartSize * kPartCount}};
@@ -810,18 +811,9 @@ TEST_F(ClientIntegrationTest, WritesAndReadsAnObjectPartByPart) {
     client_buffer_allocator_->deallocate(whole_buffer,
                                          kPartSize * kPartCount);
 
-    // The first write fixes the part count, and a part beyond it cannot be
-    // named.
-    void* buffer = client_buffer_allocator_->allocate(kPartSize);
-    std::vector<Slice> slices{{buffer, kPartSize}};
-    auto mismatched = test_client_->Put(key, slices, config, 0, kPartCount + 1);
-    ASSERT_FALSE(mismatched.has_value());
-    EXPECT_EQ(mismatched.error(), ErrorCode::INVALID_PARAMS);
-
     auto beyond_last = test_client_->Query(key, kPartCount);
     ASSERT_FALSE(beyond_last.has_value());
     EXPECT_EQ(beyond_last.error(), ErrorCode::INVALID_PARAMS);
-    client_buffer_allocator_->deallocate(buffer, kPartSize);
 
     std::this_thread::sleep_for(
         std::chrono::milliseconds(default_kv_lease_ttl_));

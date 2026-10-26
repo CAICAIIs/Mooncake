@@ -500,7 +500,8 @@ def get_into(self, key: str, buffer_ptr: int, size: int) -> int
 Retrieve one part of an object into a registered buffer.
 
 The buffer holds exactly that part, so `size` is the part's length. The read
-fails while any part of the object is still missing.
+fails while any part of the object is still missing. A part is fixed when it is
+written; it is not a byte range of a whole object.
 
 ```python
 def get_part_into(self, key: str, buffer_ptr: int, size: int, part_index: int) -> int

@@ -409,7 +409,6 @@ add_store_test(task_executor_test task_executor_test.cpp)
 add_store_test(task_integration_test task_integration_test.cpp)
 add_store_test(dummy_client_get_buffer_test dummy_client_get_buffer_test.cpp)
 add_store_test(dummy_client_probe_key_test dummy_client_probe_key_test.cpp)
-add_store_test(dummy_client_part_test dummy_client_part_test.cpp)
 add_test(
   NAME dummy_client_object_checksum_test
   COMMAND

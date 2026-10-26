@@ -183,7 +183,7 @@ class Client {
      * @brief Gets object metadata without transferring data
      * @param object_key Key to query
      * @param part_index Which part to resolve; nullopt asks for the whole
-     * object, which a key written part by part has none of
+     * object
      * @return QueryResult containing replicas and lease timeout, or ErrorCode
      * indicating failure
      */
@@ -275,10 +275,9 @@ class Client {
                                       std::vector<Slice>& slices,
                                       uint64_t src_offset);
     /**
-     * @brief Transfers one part of an object using a part-level query result
+     * @brief Transfers one part using a part-level query result
      *
-     * The same transfer as Get(), except that neither side of it touches the
-     * whole-object hot cache.
+     * Never touches the hot cache, which holds whole objects.
      * @param object_key Key of the object
      * @param query_result Result of Query(object_key, part_index)
      * @param slices Vector of slices to store the part
@@ -318,8 +317,8 @@ class Client {
      * @param slices Vector of data slices to store
      * @param config Replication configuration
      * @param part_index Which part of the object these slices fill
-     * @param part_count How many parts the object has; the first writer fixes
-     * it and later writers must agree
+     * @param part_count How many parts the object has; every writer of the key
+     * must pass the same count
      * @return ErrorCode indicating success/failure
      */
     tl::expected<void, ErrorCode> Put(const ObjectKey& key,
@@ -1013,8 +1012,8 @@ class Client {
      */
     ErrorCode ConnectToMaster(const std::string& master_server_entry);
 
-    // Backs every whole-object transfer: Get() feeds the hot cache, GetPart()
-    // leaves it alone.
+    // The transfer both Get() and GetPart() run; only Get() consults the hot
+    // cache.
     tl::expected<void, ErrorCode> GetInternal(const std::string& object_key,
                                               const QueryResult& query_result,
                                               std::vector<Slice>& slices,

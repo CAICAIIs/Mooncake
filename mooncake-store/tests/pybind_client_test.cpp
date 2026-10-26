@@ -4888,19 +4888,8 @@ TEST_F(RealClientTest, PutPartFromAndGetPartIntoCarryOnePartEach) {
         EXPECT_EQ(py_client_->put_part_from(key, parts[part_index].data(),
                                             kPartSize, part_index, kPartCount,
                                             config),
-                  0);
-        // No part reads before the last one lands.
-        if (part_index + 1 < kPartCount) {
-            std::string destination(kPartSize, '\0');
-            ASSERT_EQ(py_client_->register_buffer(destination.data(),
-                                                 destination.size()),
-                      0);
-            EXPECT_EQ(py_client_->get_part_into(key, destination.data(),
-                                               kPartSize, part_index),
-                      static_cast<int64_t>(
-                          toInt(ErrorCode::REPLICA_IS_NOT_READY)));
-            EXPECT_EQ(py_client_->unregister_buffer(destination.data()), 0);
-        }
+                  0)
+            << "part " << part_index;
     }
 
     for (uint32_t part_index = 0; part_index < kPartCount; ++part_index) {

@@ -3066,7 +3066,6 @@ PYBIND11_MODULE(_store, m) {
             "get_part_into",
             [](MooncakeStorePyWrapper &self, const std::string &key,
                uintptr_t buffer_ptr, size_t size, uint32_t part_index) {
-                // One part of the object; the buffer holds exactly that part.
                 void *buffer = reinterpret_cast<void *>(buffer_ptr);
                 py::gil_scoped_release release;
                 return self.store_->get_part_into(key, buffer, size, part_index);

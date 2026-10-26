@@ -4913,7 +4913,7 @@ bool RealClient::can_use_direct_memory_read(const Replica::Descriptor &replica,
 tl::expected<RealClient::RangedReadMetadata, ErrorCode>
 RealClient::resolve_ranged_read_metadata(
     const std::string &key, const QueryResultCache *query_result_cache,
-    bool allow_query_refresh) {
+    bool allow_query_refresh, std::optional<uint32_t> part_index) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -4935,8 +4935,8 @@ RealClient::resolve_ranged_read_metadata(
     if (!allow_query_refresh) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    return build_ranged_read_metadata_from_query_result(key,
-                                                        client_->Query(key));
+    return build_ranged_read_metadata_from_query_result(
+        key, client_->Query(key, part_index));
 }
 
 tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
@@ -4947,8 +4947,7 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
     const auto &replica = metadata.replica;
     const uint64_t total_size = metadata.total_size;
 
-    // A whole object may be served from and fed into the local hot cache; a
-    // part read never touches it, because the cache holds whole objects.
+    // The hot cache holds whole objects, so a part read leaves it alone.
     auto read_from_memory = [&](const QueryResult &qr,
                                std::vector<Slice> &dst_slices) {
         return use_hot_cache ? client_->Get(key, qr, dst_slices)
@@ -5249,15 +5248,7 @@ int64_t RealClient::get_into(const std::string &key, void *buffer,
 
 tl::expected<int64_t, ErrorCode> RealClient::get_part_into_internal(
     const std::string &key, void *buffer, size_t size, uint32_t part_index) {
-    if (!client_) {
-        LOG(ERROR) << "Client is not initialized";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    // No query cache: the cache is keyed by object, and this read resolves one
-    // part of it.
-    auto metadata = build_ranged_read_metadata_from_query_result(
-        key, client_->Query(key, part_index));
+    auto metadata = resolve_ranged_read_metadata(key, nullptr, true, part_index);
     if (!metadata) {
         return tl::unexpected(metadata.error());
     }

@@ -152,11 +152,10 @@ class RealClient : public PyClient {
      * @brief Get one part of an object into a pre-allocated buffer
      * @param key Key of the object to get
      * @param buffer Pointer to a writable Store buffer
-     * @param size Size of the buffer
+     * @param size Size of the buffer, at least the part's length
      * @param part_index Which part to read
      * @return Number of bytes read on success, negative value on error
-     * @note The buffer holds exactly that part: a part read never goes through
-     * the whole-object hot cache.
+     * @note Only that part moves; the whole-object hot cache stays out.
      */
     int64_t get_part_into(const std::string &key, void *buffer, size_t size,
                           uint32_t part_index);
@@ -763,7 +762,8 @@ class RealClient : public PyClient {
     tl::expected<RangedReadMetadata, ErrorCode> resolve_ranged_read_metadata(
         const std::string &key,
         const QueryResultCache *query_result_cache = nullptr,
-        bool allow_query_refresh = true);
+        bool allow_query_refresh = true,
+        std::optional<uint32_t> part_index = std::nullopt);
 
     tl::expected<int64_t, ErrorCode> execute_ranged_read(
         const std::string &key, void *buffer, size_t dst_offset,
