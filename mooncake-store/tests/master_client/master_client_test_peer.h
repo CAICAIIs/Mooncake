@@ -1,10 +1,3 @@
-// master_client_test_peer.h
-//
-// Reaches the one piece of MasterClient's state no call can set: what its
-// master said about parts. A suite that needs a client whose master predates
-// parts says so here, because the answer otherwise comes from the master's
-// Ping.
-
 #pragma once
 
 #include <optional>
@@ -14,18 +7,19 @@
 namespace mooncake {
 namespace test {
 
+// Reaches the state no call can set: what the client holds as its master's
+// answer about parts.
 class MasterClientTestPeer {
    public:
-    // The answer the client takes as its master's, as of the next call that
-    // names a part. `std::nullopt` forgets it, so the client asks again.
+    // Stands in for that answer. `std::nullopt` forgets it, so the client asks
+    // the master again.
     static void SetMasterTakesParts(MasterClient& client,
                                     std::optional<bool> takes_parts) {
         MutexLocker lock(&client.part_support_mutex_);
         client.master_takes_parts_ = takes_parts;
     }
 
-    // What the client has taken as its master's answer. `std::nullopt` until a
-    // call that names a part asked.
+    // The answer the client holds, `std::nullopt` before it asked.
     static std::optional<bool> MasterTakesParts(const MasterClient& client) {
         MutexLocker lock(&client.part_support_mutex_);
         return client.master_takes_parts_;

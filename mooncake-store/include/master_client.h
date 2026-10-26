@@ -209,8 +209,7 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<GetReplicaListResponse, ErrorCode>
     GetReplicaList(const std::string& object_key);
-    // `part_index` names the part to read. A read that names none asks for a
-    // whole object, which an object of several parts cannot give.
+    // `part_index` names the part to read; absent asks for the whole object.
     [[nodiscard]] tl::expected<GetReplicaListResponse, ErrorCode>
     GetReplicaList(const std::string& object_key, const std::string& tenant_id,
                    std::optional<uint32_t> part_index = std::nullopt);
@@ -235,8 +234,7 @@ class MasterClient {
      */
     [[nodiscard]] std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaList(const std::vector<std::string>& object_keys);
-    // One part per key, in the caller's order; an empty list names no part and
-    // asks for whole objects.
+    // One part per key, in the caller's order; empty asks for whole objects.
     [[nodiscard]] std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaList(const std::vector<std::string>& object_keys,
                         const std::string& tenant_id,
@@ -274,9 +272,8 @@ class MasterClient {
      * @return tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
      * indicating success/failure
      */
-    // `part_index` of `part_count` names the part this write fills. The first
-    // writer of a key fixes its part count: naming one part of one is what
-    // every caller before parts does, and it is the same call.
+    // `part_index` of `part_count` names the part this write fills; the first
+    // writer of a key fixes its part count.
     [[nodiscard]] tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
     PutStart(const std::string& key, const std::vector<size_t>& slice_lengths,
              const ReplicateConfig& config, uint32_t part_index = 0,
@@ -304,8 +301,8 @@ class MasterClient {
      * @param replica_type Type of replica (memory or disk)
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
-    // `replica_ids` names the replicas of that part this End completes; naming
-    // none acknowledges every replica the part's write handed out.
+    // `replica_ids` names which replicas of the part this completes; absent
+    // completes all of them.
     [[nodiscard]] tl::expected<void, ErrorCode> PutEnd(
         const ObjectMeta& object_meta, ReplicaType replica_type,
         uint32_t part_index = 0,
@@ -874,25 +871,19 @@ class MasterClient {
     std::string client_addr_param_ GUARDED_BY(connect_mutex_);
     std::atomic<bool> ha_connection_policy_enabled_{false};
 
-    // Whether this client's master understands parts. A call that names a part
-    // asks this first: the part arguments trail the call as compatible fields,
-    // so a master that predates them ignores them and would answer for a whole
-    // object instead of refusing. The answer is remembered for the life of the
-    // client, because a master that changes its mind under a client is a
-    // deployment being replaced.
+    // Whether the master takes parts, asked once per connection. The part
+    // arguments trail the call as compatible fields, so a master that predates
+    // them would answer for a whole object where it should refuse.
     [[nodiscard]] tl::expected<bool, ErrorCode> SupportsParts();
 
-    // Fails with INVALID_PARAMS when the master has not said it understands
-    // parts. Only a call that names one asks, so the path every caller before
-    // parts takes makes no extra round trip.
+    // INVALID_PARAMS unless the master takes parts.
     [[nodiscard]] tl::expected<void, ErrorCode> RequireParts(const char* call);
 
-    // What the master's Ping said about parts, once it has been asked.
+    // What the master said, once it has been asked.
     mutable Mutex part_support_mutex_;
     std::optional<bool> master_takes_parts_ GUARDED_BY(part_support_mutex_);
 
-    // A client whose master predates parts, for the refusal this class owes a
-    // caller that names one.
+    // Lets a test present a master that predates parts.
     friend class test::MasterClientTestPeer;
 };
 

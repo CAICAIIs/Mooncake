@@ -556,9 +556,8 @@ TEST_F(PartRpcTest, APartReplicaLandsInTheSegmentTheWriteNames) {
         spare.segment.name);
 }
 
-// A client writes one part at a time and reads the part it wants; the call that
-// names no part is the one every client before parts makes, and it still
-// answers for a whole object.
+// A client writes one part at a time, reads the part it wants, and a read that
+// names no part asks for a whole object.
 TEST_F(PartRpcTest, MasterClientWritesAndReadsOnePart) {
     constexpr uint32_t kParts = 2;
     const std::string key = "client_part_key";
@@ -583,8 +582,7 @@ TEST_F(PartRpcTest, MasterClientWritesAndReadsOnePart) {
                         .has_value());
     }
 
-    // The first call that named a part asked the master once, and the client
-    // keeps the answer.
+    // The first part call asked the master, and the client kept the answer.
     auto takes_parts = test::MasterClientTestPeer::MasterTakesParts(client);
     ASSERT_TRUE(takes_parts.has_value());
     EXPECT_TRUE(*takes_parts);
@@ -603,9 +601,7 @@ TEST_F(PartRpcTest, MasterClientWritesAndReadsOnePart) {
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, whole.error());
 }
 
-// A client that names a part asks the master first: the part arguments trail
-// the call as compatible fields, so a master that predates them would answer
-// for a whole object rather than refuse.
+// A client that names a part asks the master first and refuses without it.
 TEST_F(PartRpcTest, MasterClientRefusesPartsTheMasterCannotTake) {
     const std::string key = "client_no_part_support_key";
     const std::string tenant(TenantId::kDefaultValue);
@@ -625,8 +621,7 @@ TEST_F(PartRpcTest, MasterClientRefusesPartsTheMasterCannotTake) {
     ASSERT_TRUE(exists.has_value());
     EXPECT_FALSE(exists.value());
 
-    // A call that names no part is unaffected: it is what every client before
-    // parts sends.
+    // A call that names no part is unaffected.
     auto whole = client.PutStart(key, {1024}, config);
     ASSERT_TRUE(whole.has_value()) << toString(whole.error());
 }
