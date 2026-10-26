@@ -566,9 +566,6 @@ TEST_F(PartRpcTest, MasterClientWritesAndReadsOnePart) {
 
     MasterClient client(client_id_);
     ASSERT_EQ(client.Connect(address(port_)), ErrorCode::OK);
-    auto supports = client.SupportsParts();
-    ASSERT_TRUE(supports.has_value()) << toString(supports.error());
-    EXPECT_TRUE(*supports);
 
     ReplicateConfig config;
     config.replica_num = 1;
@@ -585,6 +582,12 @@ TEST_F(PartRpcTest, MasterClientWritesAndReadsOnePart) {
                                 ReplicaType::MEMORY, part, ids)
                         .has_value());
     }
+
+    // The first call that named a part asked the master once, and the client
+    // keeps the answer.
+    auto takes_parts = test::MasterClientTestPeer::MasterTakesParts(client);
+    ASSERT_TRUE(takes_parts.has_value());
+    EXPECT_TRUE(*takes_parts);
 
     auto read = client.GetReplicaList(key, tenant, /*part_index=*/1);
     ASSERT_TRUE(read.has_value()) << toString(read.error());

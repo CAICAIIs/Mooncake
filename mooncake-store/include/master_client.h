@@ -347,17 +347,6 @@ class MasterClient {
         const std::vector<std::vector<ReplicaID>>& replica_ids = {});
 
     /**
-     * @brief Whether the master this client talks to understands parts.
-     *
-     * A call that names a part asks this first: the part arguments trail the
-     * call as compatible fields, so a master that predates them ignores them
-     * and would answer for a whole object instead of refusing. The answer is
-     * remembered for the life of the client, because a master that changes its
-     * mind under a client is a deployment being replaced.
-     */
-    [[nodiscard]] tl::expected<bool, ErrorCode> SupportsParts();
-
-    /**
      * @brief Starts an upsert operation (insert or update)
      * @param key Object key
      * @param slice_lengths Vector of slice lengths
@@ -884,6 +873,14 @@ class MasterClient {
     // The address which is passed to the coro_rpc_client
     std::string client_addr_param_ GUARDED_BY(connect_mutex_);
     std::atomic<bool> ha_connection_policy_enabled_{false};
+
+    // Whether this client's master understands parts. A call that names a part
+    // asks this first: the part arguments trail the call as compatible fields,
+    // so a master that predates them ignores them and would answer for a whole
+    // object instead of refusing. The answer is remembered for the life of the
+    // client, because a master that changes its mind under a client is a
+    // deployment being replaced.
+    [[nodiscard]] tl::expected<bool, ErrorCode> SupportsParts();
 
     // Fails with INVALID_PARAMS when the master has not said it understands
     // parts. Only a call that names one asks, so the path every caller before

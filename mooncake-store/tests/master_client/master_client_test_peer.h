@@ -23,6 +23,13 @@ class MasterClientTestPeer {
         MutexLocker lock(&client.part_support_mutex_);
         client.master_takes_parts_ = takes_parts;
     }
+
+    // What the client has taken as its master's answer. `std::nullopt` until a
+    // call that names a part asked.
+    static std::optional<bool> MasterTakesParts(const MasterClient& client) {
+        MutexLocker lock(&client.part_support_mutex_);
+        return client.master_takes_parts_;
+    }
 };
 
 }  // namespace test
