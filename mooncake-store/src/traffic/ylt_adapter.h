@@ -24,6 +24,26 @@ class RecordingRouter;
 
 struct RecordingProtocol : coro_rpc::protocol::coro_rpc_protocol {
     using router = RecordingRouter<RecordingProtocol>;
+
+    template <typename Socket>
+    static async_simple::coro::Lazy<std::error_code> read_payload(
+        Socket& socket, req_header& req_head, std::string& buffer,
+        coro_io::heterogeneous_buffer& attachment) {
+        co_return co_await coro_rpc_protocol::read_payload(socket, req_head,
+                                                           buffer, attachment);
+    }
+
+    // Newer ylt revisions pass the protocol-specific context to
+    // read_payload; the base implementation still expects the default
+    // protocol context. Ignore it and reuse the default framing.
+    template <typename Socket>
+    static async_simple::coro::Lazy<std::error_code> read_payload(
+        Socket& socket, req_header& req_head, std::string& buffer,
+        coro_io::heterogeneous_buffer& attachment,
+        coro_rpc::context_info_t<RecordingProtocol>*) {
+        co_return co_await coro_rpc_protocol::read_payload(socket, req_head,
+                                                           buffer, attachment);
+    }
 };
 
 template <typename Protocol>

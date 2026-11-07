@@ -4,6 +4,7 @@
 #include <ylt/coro_http/coro_http_server.hpp>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -145,6 +146,11 @@ void TrafficRecorder::Install() {
         SetState("error");
         return;
     }
+    if (control_token_.empty()) {
+        LOG(ERROR) << "traffic: control.token must be configured";
+        SetState("error");
+        return;
+    }
     if (root["routes"].isArray()) {
         for (const auto& item : root["routes"]) {
             if (!item.isString()) {
@@ -158,8 +164,10 @@ void TrafficRecorder::Install() {
                 continue;
             }
             char* end = nullptr;
+            errno = 0;
             const unsigned long key = std::strtoul(route.c_str(), &end, 10);
-            if (end == route.c_str() || *end != '\0') {
+            if (end == route.c_str() || *end != '\0' || errno == ERANGE ||
+                key > std::numeric_limits<std::uint32_t>::max()) {
                 LOG(ERROR) << "traffic: invalid route key " << route;
                 SetState("error");
                 return;
@@ -208,11 +216,11 @@ bool TrafficRecorder::Start() {
     if (stop_thread_.joinable()) {
         stop_thread_.join();
     }
-    if (writer_thread_.joinable()) {
-        Stop();
-    }
     if (active_.load(std::memory_order_acquire)) {
         return false;
+    }
+    if (writer_thread_.joinable()) {
+        StopInternal();
     }
     writer_failed_.store(false, std::memory_order_relaxed);
     stop_timed_out_.store(false, std::memory_order_relaxed);
@@ -287,6 +295,9 @@ void TrafficRecorder::StopAsync() {
 void TrafficRecorder::StopInternal() {
     const std::uint64_t stop_begin_ms = TrafficNowMs();
     active_.store(false, std::memory_order_release);
+    while (in_request_.load(std::memory_order_acquire) != 0) {
+        std::this_thread::yield();
+    }
     {
         std::lock_guard<std::mutex> lock(shards_mu_);
         for (auto& shard : shards_) {
@@ -374,6 +385,11 @@ void TrafficRecorder::WriteSummaryJson(const RecorderStatus& status) const {
 }
 
 void TrafficRecorder::OnRequest(const RequestView& view) noexcept {
+    in_request_.fetch_add(1, std::memory_order_acq_rel);
+    struct InRequestGuard {
+        std::atomic<std::uint32_t>& count;
+        ~InRequestGuard() { count.fetch_sub(1, std::memory_order_acq_rel); }
+    } in_request_guard{in_request_};
     if (!active_.load(std::memory_order_acquire)) {
         return;
     }
@@ -513,12 +529,15 @@ void TrafficRecorder::WriterLoop() {
 }
 
 void TrafficRecorder::DrainShardDirect(Shard& shard) {
+    std::uint64_t tail = shard.tail.load(std::memory_order_acquire);
+    const std::uint64_t head = shard.head.load(std::memory_order_acquire);
+    if (tail == head) {
+        return;
+    }
     std::vector<struct iovec> iov;
     iov.reserve(256);
     std::uint64_t bytes = 0;
     std::uint32_t records = 0;
-    std::uint64_t tail = shard.tail.load(std::memory_order_acquire);
-    const std::uint64_t head = shard.head.load(std::memory_order_acquire);
     std::uint64_t commit_tail = tail;
     while (tail != head) {
         const std::uint64_t index = tail & shard.mask;

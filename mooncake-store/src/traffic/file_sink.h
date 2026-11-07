@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <mutex>
@@ -53,6 +54,7 @@ class FileSink final : public TrafficSink {
     std::uint64_t segment_seq_ = 0;
     std::uint64_t segment_bytes_written_ = 0;
     std::uint64_t segment_start_ms_ = 0;
+    std::array<std::uint8_t, 16> session_uuid_{};
     std::uint64_t block_count_ = 0;
     std::uint64_t record_count_ = 0;
     std::uint64_t payload_bytes_ = 0;

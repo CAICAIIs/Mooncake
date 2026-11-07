@@ -94,6 +94,7 @@ class TrafficRecorder {
     std::atomic<bool> shutdown_{false};
     std::atomic<bool> writer_stop_{false};
     std::atomic<std::uint32_t> starting_{0};
+    std::atomic<std::uint32_t> in_request_{0};
     std::atomic<std::uint64_t> generation_{0};
     std::atomic<std::uint64_t> next_shard_{0};
     std::atomic<std::uint64_t> dropped_no_shard_{0};

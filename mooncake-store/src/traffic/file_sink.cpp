@@ -4,10 +4,12 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <system_error>
+#include <vector>
 
 #include <glog/logging.h>
 
@@ -24,10 +26,6 @@ std::string MakeSessionDir(const std::string& output_dir,
     if (ec) {
         LOG(ERROR) << "traffic: create output directory failed: "
                    << ec.message();
-        return {};
-    }
-    if (::chmod(output_dir.c_str(), 0700) != 0) {
-        LOG(ERROR) << "traffic: chmod output directory failed: " << output_dir;
         return {};
     }
     const std::string base = output_dir + "/session-" +
@@ -76,6 +74,12 @@ bool FileSink::OpenSession(const std::string& output_dir,
         failed_ = true;
         return false;
     }
+    const std::uint64_t uuid_seed =
+        start_ms ^ (static_cast<std::uint64_t>(::getpid()) << 32);
+    for (std::size_t i = 0; i < session_uuid_.size(); ++i) {
+        session_uuid_[i] =
+            static_cast<std::uint8_t>(uuid_seed >> ((i % 8) * 8));
+    }
     return OpenNextSegment();
 }
 
@@ -112,11 +116,8 @@ bool FileSink::OpenNextSegment() {
     TrafficFileHeader header;
     header.segment_seq = segment_seq_;
     header.start_ms = segment_start_ms_;
-    const std::uint64_t seed = segment_start_ms_ ^ (segment_seq_ + 1);
-    for (std::size_t i = 0; i < sizeof(header.session_uuid); ++i) {
-        header.session_uuid[i] =
-            static_cast<std::uint8_t>(seed >> ((i % 8) * 8));
-    }
+    std::memcpy(header.session_uuid, session_uuid_.data(),
+                session_uuid_.size());
     if (std::fwrite(&header, sizeof(header), 1, file_) != 1) {
         LOG(ERROR) << "traffic: write segment header failed: " << segment_path_;
         failed_ = true;
@@ -225,23 +226,24 @@ bool FileSink::WriteRecords(const struct iovec* iov, int iov_count,
         return false;
     }
     int remaining = iov_count;
-    struct iovec* vec = const_cast<struct iovec*>(iov);
+    std::vector<struct iovec> vec(iov, iov + iov_count);
+    struct iovec* cursor = vec.data();
     while (remaining > 0) {
-        const ssize_t written = ::writev(::fileno(file_), vec, remaining);
+        const ssize_t written = ::writev(::fileno(file_), cursor, remaining);
         if (written <= 0) {
             LOG(ERROR) << "traffic: write records failed: " << segment_path_;
             failed_ = true;
             return false;
         }
         std::size_t left = static_cast<std::size_t>(written);
-        while (remaining > 0 && left >= vec->iov_len) {
-            left -= vec->iov_len;
-            ++vec;
+        while (remaining > 0 && left >= cursor->iov_len) {
+            left -= cursor->iov_len;
+            ++cursor;
             --remaining;
         }
         if (remaining > 0 && left > 0) {
-            vec->iov_base = static_cast<char*>(vec->iov_base) + left;
-            vec->iov_len -= left;
+            cursor->iov_base = static_cast<char*>(cursor->iov_base) + left;
+            cursor->iov_len -= left;
         }
     }
     segment_bytes_written_ += block_total;

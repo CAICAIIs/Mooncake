@@ -71,7 +71,8 @@ TEST(TrafficRecorderTest, RecordsAcrossWrapAndRestarts) {
           "segment_bytes": 65536,
           "segment_seconds": 300,
           "routes": ["*"],
-          "control": {"host": "127.0.0.1", "port": 37999}
+          "control": {"host": "127.0.0.1", "port": 37999,
+                      "token": "test-token"}
         })";
     }
     setenv("MOONCAKE_TRAFFIC_CONFIG", config_path.c_str(), 1);
@@ -119,7 +120,8 @@ TEST(TrafficRecorderTest, WriterFailureCanBeStoppedAndRestarted) {
           "segment_seconds": 300,
           "max_total_bytes": 131072,
           "routes": ["*"],
-          "control": {"host": "127.0.0.1", "port": 38001}
+          "control": {"host": "127.0.0.1", "port": 38001,
+                      "token": "test-token"}
         })";
     }
     setenv("MOONCAKE_TRAFFIC_CONFIG", config_path.c_str(), 1);
