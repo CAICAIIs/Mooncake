@@ -160,8 +160,10 @@ void TrafficRecorder::Install() {
             }
             const std::string route = item.asString();
             if (route == "*") {
-                allow_all_routes_ = true;
-                continue;
+                LOG(ERROR) << "traffic: wildcard route is not allowed; list "
+                              "numeric route keys explicitly";
+                SetState("error");
+                return;
             }
             char* end = nullptr;
             errno = 0;
@@ -422,8 +424,7 @@ void TrafficRecorder::OnRequest(const RequestView& view) noexcept {
         shard.dropped_filtered.fetch_add(1, std::memory_order_relaxed);
         return;
     }
-    if (!allow_all_routes_ &&
-        allowed_routes_.find(view.route_key) == allowed_routes_.end()) {
+    if (allowed_routes_.find(view.route_key) == allowed_routes_.end()) {
         shard.dropped_filtered.fetch_add(1, std::memory_order_relaxed);
         return;
     }

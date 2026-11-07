@@ -70,7 +70,7 @@ TEST(TrafficRecorderTest, RecordsAcrossWrapAndRestarts) {
           "block_bytes": 4096,
           "segment_bytes": 65536,
           "segment_seconds": 300,
-          "routes": ["*"],
+          "routes": ["1"],
           "control": {"host": "127.0.0.1", "port": 37999,
                       "token": "test-token"}
         })";
@@ -119,7 +119,7 @@ TEST(TrafficRecorderTest, WriterFailureCanBeStoppedAndRestarted) {
           "segment_bytes": 65536,
           "segment_seconds": 300,
           "max_total_bytes": 131072,
-          "routes": ["*"],
+          "routes": ["1"],
           "control": {"host": "127.0.0.1", "port": 38001,
                       "token": "test-token"}
         })";

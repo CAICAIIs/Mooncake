@@ -119,7 +119,6 @@ class TrafficRecorder {
     std::string output_dir_;
     std::string config_path_;
     bool config_loaded_ = false;
-    bool allow_all_routes_ = false;
     std::unordered_set<std::uint32_t> allowed_routes_;
     std::string control_host_ = "127.0.0.1";
     std::uint16_t control_port_ = 37901;
