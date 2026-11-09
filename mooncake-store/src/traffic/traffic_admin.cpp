@@ -31,6 +31,8 @@ Json::Value BuildStatusJson(const RecorderStatus& status) {
         static_cast<Json::UInt64>(status.observed_requests);
     root["recorded_requests"] =
         static_cast<Json::UInt64>(status.recorded_requests);
+    root["filtered_requests"] =
+        static_cast<Json::UInt64>(status.filtered_requests);
     root["dropped_requests"] =
         static_cast<Json::UInt64>(status.dropped_requests);
     root["bytes_written"] = static_cast<Json::UInt64>(status.bytes_written);

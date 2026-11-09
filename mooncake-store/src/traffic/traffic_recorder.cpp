@@ -74,6 +74,7 @@ struct alignas(64) TrafficRecorder::Shard {
     std::atomic<std::uint64_t> state{1};
     std::atomic<std::uint64_t> observed{0};
     std::atomic<std::uint64_t> recorded{0};
+    std::atomic<std::uint64_t> filtered{0};
     alignas(64) std::atomic<std::uint64_t> tail{0};
     alignas(64) std::atomic<std::uint64_t> dropped{0};
 };
@@ -573,7 +574,7 @@ void TrafficRecorder::OnRequest(const RequestView& view) noexcept {
     shard.observed.fetch_add(1, std::memory_order_relaxed);
     if (!allowed_routes_.empty() &&
         allowed_routes_.find(view.route_key) == allowed_routes_.end()) {
-        shard.dropped.fetch_add(1, std::memory_order_relaxed);
+        shard.filtered.fetch_add(1, std::memory_order_relaxed);
         return;
     }
     if (view.attach_length != 0) {
@@ -828,6 +829,7 @@ RecorderStatus TrafficRecorder::GetStatus() const {
     }
     std::uint64_t observed = 0;
     std::uint64_t recorded = 0;
+    std::uint64_t filtered = 0;
     std::uint64_t dropped = 0;
     std::uint64_t used = 0;
     std::uint64_t capacity = 0;
@@ -836,6 +838,7 @@ RecorderStatus TrafficRecorder::GetStatus() const {
         for (const auto& shard : shards_) {
             observed += shard->observed.load(std::memory_order_relaxed);
             recorded += shard->recorded.load(std::memory_order_relaxed);
+            filtered += shard->filtered.load(std::memory_order_relaxed);
             dropped += shard->dropped.load(std::memory_order_relaxed);
             used += shard->head.load(std::memory_order_relaxed) -
                     shard->tail.load(std::memory_order_relaxed);
@@ -844,6 +847,7 @@ RecorderStatus TrafficRecorder::GetStatus() const {
     }
     status.observed_requests = observed;
     status.recorded_requests = recorded;
+    status.filtered_requests = filtered;
     status.dropped_requests =
         dropped + dropped_no_shard_.load(std::memory_order_relaxed);
     status.ring_used_bytes = used;

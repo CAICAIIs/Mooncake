@@ -236,7 +236,9 @@ TEST(TrafficRecorderTest, ReinstallReplacesPreviousRoutes) {
     recorder.Stop();
     const RecorderStatus status = recorder.GetStatus();
     EXPECT_EQ(status.recorded_requests, 1u);
-    EXPECT_EQ(status.dropped_requests, 1u);
+    EXPECT_EQ(status.filtered_requests, 1u);
+    EXPECT_EQ(status.dropped_requests, 0u);
+    EXPECT_TRUE(status.capture_complete);
 }
 
 TEST(TrafficRecorderTest, ControlTokenUsesSecureFilePermissions) {

@@ -40,6 +40,7 @@ struct RecorderStatus {
     std::string state = "disabled";
     std::uint64_t observed_requests = 0;
     std::uint64_t recorded_requests = 0;
+    std::uint64_t filtered_requests = 0;
     std::uint64_t dropped_requests = 0;
     std::uint64_t bytes_written = 0;
     std::uint64_t segments = 0;
