@@ -22,6 +22,8 @@
 #include <thread>
 #include <vector>
 
+#include <json/json.h>
+
 #include "crc32c.h"
 #include "traffic_format.h"
 
@@ -89,6 +91,7 @@ class SessionReader {
         std::error_code ec;
         auto collect = [&](const std::filesystem::path& root) {
             files_.clear();
+            session_dir_ = root;
             for (const auto& entry :
                  std::filesystem::directory_iterator(root, ec)) {
                 if (!entry.is_regular_file(ec)) {
@@ -177,6 +180,7 @@ class SessionReader {
     std::uint64_t block_count() const { return block_count_; }
     std::size_t segment_count() const { return segment_count_; }
     std::uint8_t redaction() const { return redaction_; }
+    const std::filesystem::path& session_dir() const { return session_dir_; }
     const std::map<std::uint32_t, std::uint64_t>& routes() const {
         return routes_;
     }
@@ -341,6 +345,7 @@ class SessionReader {
     std::uint64_t block_count_ = 0;
     std::size_t segment_count_ = 0;
     std::map<std::uint32_t, std::uint64_t> routes_;
+    std::filesystem::path session_dir_;
 };
 
 bool WriteAll(int fd, const void* data, std::size_t len) {
@@ -491,7 +496,7 @@ struct Options {
     bool allow_all = false;
     bool dry_run = false;
     bool verbose = false;
-    std::vector<std::uint32_t> allow_routes;
+    std::vector<std::string> allow_route_args;
 };
 
 bool ParseU64(const std::string& text, std::uint64_t* value) {
@@ -514,6 +519,42 @@ bool ParseU32(const std::string& text, std::uint32_t* value) {
     return true;
 }
 
+bool LoadRouteNames(const std::filesystem::path& session_dir,
+                    std::map<std::string, std::uint32_t>* names,
+                    std::string* error) {
+    names->clear();
+    const std::filesystem::path path = session_dir / "routes.json";
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec)) {
+        return true;
+    }
+    std::ifstream in(path);
+    if (!in) {
+        *error = "cannot read " + path.string();
+        return false;
+    }
+    Json::CharReaderBuilder builder;
+    Json::Value root;
+    std::string parse_error;
+    if (!Json::parseFromStream(builder, in, &root, &parse_error)) {
+        *error = "cannot parse " + path.string() + ": " + parse_error;
+        return false;
+    }
+    if (!root.isObject()) {
+        *error = path.string() + " must be a JSON object";
+        return false;
+    }
+    for (const auto& key : root.getMemberNames()) {
+        std::uint32_t route = 0;
+        if (!ParseU32(key, &route) || !root[key].isString()) {
+            *error = "invalid route entry in " + path.string();
+            return false;
+        }
+        (*names)[root[key].asString()] = route;
+    }
+    return true;
+}
+
 bool ParseDouble(const std::string& text, double* value) {
     char* end = nullptr;
     errno = 0;
@@ -533,7 +574,7 @@ void PrintUsage() {
            "[options]\n"
         << "\noptions:\n"
         << "  --limit N             replay at most N records\n"
-        << "  --allow-route KEY     allow this numeric route key (repeatable)\n"
+        << "  --allow-route ROUTE   allow a route key or name (repeatable)\n"
         << "  --allow-all           allow every route\n"
         << "  --dry-run             parse and count without sending\n"
         << "  --rate QPS            fixed send rate\n"
@@ -592,15 +633,11 @@ bool ParseOptions(int argc, char** argv, Options* options, std::string* error) {
             }
             options->timeout_ms = static_cast<int>(timeout);
         } else if (arg == "--allow-route") {
-            std::uint32_t route = 0;
-            if (!NextValue(argc, argv, &i, &value) ||
-                !ParseU32(value, &route)) {
-                *error =
-                    "--allow-route needs a numeric route key; use "
-                    "`inspect` to list keys";
+            if (!NextValue(argc, argv, &i, &value) || value.empty()) {
+                *error = "--allow-route needs a route key or name";
                 return false;
             }
-            options->allow_routes.push_back(route);
+            options->allow_route_args.push_back(value);
         } else if (arg == "--allow-all") {
             options->allow_all = true;
         } else if (arg == "--dry-run") {
@@ -627,12 +664,14 @@ bool ParseOptions(int argc, char** argv, Options* options, std::string* error) {
     return true;
 }
 
-bool Allowed(const Options& options, std::uint32_t route) {
+bool Allowed(const Options& options,
+             const std::vector<std::uint32_t>& allow_routes,
+             std::uint32_t route) {
     if (options.allow_all) {
         return true;
     }
-    return std::find(options.allow_routes.begin(), options.allow_routes.end(),
-                     route) != options.allow_routes.end();
+    return std::find(allow_routes.begin(), allow_routes.end(), route) !=
+           allow_routes.end();
 }
 
 class Pacer {
@@ -672,6 +711,43 @@ class Pacer {
     std::uint64_t count_ = 0;
 };
 
+bool ResolveAllowRoutes(const Options& options,
+                        const std::map<std::string, std::uint32_t>& names,
+                        std::vector<std::uint32_t>* routes,
+                        std::string* error) {
+    routes->clear();
+    for (const std::string& arg : options.allow_route_args) {
+        std::uint32_t key = 0;
+        if (ParseU32(arg, &key)) {
+            routes->push_back(key);
+            continue;
+        }
+        const auto it = names.find(arg);
+        if (it != names.end()) {
+            routes->push_back(it->second);
+            continue;
+        }
+        std::vector<std::uint32_t> matches;
+        const std::string suffix = "::" + arg;
+        for (const auto& [name, key] : names) {
+            if (name.size() >= suffix.size() &&
+                name.compare(name.size() - suffix.size(), suffix.size(),
+                             suffix) == 0) {
+                matches.push_back(key);
+            }
+        }
+        if (matches.size() != 1) {
+            *error = matches.empty()
+                         ? "unknown route name: " + arg +
+                               "; use `inspect` to list names"
+                         : "ambiguous route name: " + arg;
+            return false;
+        }
+        routes->push_back(matches.front());
+    }
+    return true;
+}
+
 int Inspect(const Options& options) {
     SessionReader reader;
     std::string error;
@@ -690,16 +766,29 @@ int Inspect(const Options& options) {
             return 1;
         }
     }
+    std::map<std::string, std::uint32_t> names;
+    if (!LoadRouteNames(reader.session_dir(), &names, &error)) {
+        std::cerr << error << "\n";
+        return 1;
+    }
+    std::map<std::uint32_t, std::string> by_key;
+    for (const auto& [name, key] : names) {
+        by_key[key] = name;
+    }
     std::cout << "dir=" << options.dir << "\n"
               << "segments=" << reader.segment_count() << "\n"
               << "blocks=" << reader.block_count() << "\n"
               << "records=" << reader.records() << "\n"
               << "payload_bytes=" << reader.payload_bytes() << "\n"
               << "redaction=" << RedactionName(reader.redaction()) << "\n"
-              << "routes (numeric keys; set MOONCAKE_TRAFFIC_DUMP_ROUTES=1 "
-                 "on the master for names):\n";
+              << "routes:\n";
     for (const auto& [route, count] : reader.routes()) {
-        std::cout << "  " << route << " " << count << "\n";
+        std::cout << "  " << route;
+        const auto it = by_key.find(route);
+        if (it != by_key.end()) {
+            std::cout << " " << it->second;
+        }
+        std::cout << " " << count << "\n";
     }
     return 0;
 }
@@ -716,8 +805,17 @@ int Run(const Options& options) {
                      "be replayed\n";
         return 1;
     }
-    if (!options.dry_run && !options.allow_all &&
-        options.allow_routes.empty()) {
+    std::map<std::string, std::uint32_t> names;
+    if (!LoadRouteNames(reader.session_dir(), &names, &error)) {
+        std::cerr << error << "\n";
+        return 1;
+    }
+    std::vector<std::uint32_t> allow_routes;
+    if (!ResolveAllowRoutes(options, names, &allow_routes, &error)) {
+        std::cerr << error << "\n";
+        return 1;
+    }
+    if (!options.dry_run && !options.allow_all && allow_routes.empty()) {
         std::cerr << "refusing to replay every route without --allow-all or "
                      "--allow-route\n";
         return 1;
@@ -746,7 +844,7 @@ int Run(const Options& options) {
         }
         ++records_read;
         if (!options.dry_run && !options.allow_all &&
-            !Allowed(options, record.header.route_key)) {
+            !Allowed(options, allow_routes, record.header.route_key)) {
             continue;
         }
         if (options.limit > 0 && selected >= options.limit) {
