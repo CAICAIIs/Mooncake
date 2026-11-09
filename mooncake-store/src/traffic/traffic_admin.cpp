@@ -37,9 +37,6 @@ Json::Value BuildStatusJson(const RecorderStatus& status) {
         static_cast<Json::UInt64>(status.dropped_requests);
     root["bytes_written"] = static_cast<Json::UInt64>(status.bytes_written);
     root["segments"] = static_cast<Json::UInt64>(status.segments);
-    root["ring_used_bytes"] = static_cast<Json::UInt64>(status.ring_used_bytes);
-    root["ring_capacity_bytes"] =
-        static_cast<Json::UInt64>(status.ring_capacity_bytes);
     return root;
 }
 

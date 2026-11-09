@@ -256,6 +256,9 @@ bool TrafficRecorder::ApplyControl(const Json::Value& root) {
         }
     }
     if (!control_token_.empty()) {
+        if (!token_file.empty()) {
+            LOG(INFO) << "traffic: control token file " << token_file;
+        }
         return true;
     }
     std::error_code ec;
@@ -282,6 +285,7 @@ bool TrafficRecorder::ApplyControl(const Json::Value& root) {
             return false;
         }
     }
+    LOG(INFO) << "traffic: control token file " << token_path;
     return true;
 }
 
@@ -364,6 +368,8 @@ void TrafficRecorder::Install(std::size_t rpc_threads,
     if (!ApplyRoutes(root)) {
         return;
     }
+    LOG(INFO) << "traffic: recording to " << output_dir_ << " (config "
+              << config_path << ")";
     if (redaction_mode_ == RedactionMode::kRedacted) {
         if (allowed_routes_.empty()) {
             LOG(ERROR) << "traffic: redacted mode requires an explicit routes "
