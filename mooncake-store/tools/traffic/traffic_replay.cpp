@@ -594,46 +594,55 @@ bool NextValue(int argc, char** argv, int* index, std::string* value) {
 bool ParseOptions(int argc, char** argv, Options* options, std::string* error) {
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
+        std::string inline_value;
+        const auto equals = arg.find('=');
+        if (arg.rfind("--", 0) == 0 && equals != std::string::npos) {
+            inline_value = arg.substr(equals + 1);
+            arg.resize(equals);
+        }
+        const auto take = [&](std::string* out) {
+            if (!inline_value.empty()) {
+                *out = inline_value;
+                return true;
+            }
+            return NextValue(argc, argv, &i, out);
+        };
         std::string value;
         if (arg == "--dir") {
-            if (!NextValue(argc, argv, &i, &options->dir)) {
+            if (!take(&options->dir)) {
                 *error = "--dir needs a value";
                 return false;
             }
         } else if (arg == "--target") {
-            if (!NextValue(argc, argv, &i, &options->target)) {
+            if (!take(&options->target)) {
                 *error = "--target needs a value";
                 return false;
             }
         } else if (arg == "--limit") {
-            if (!NextValue(argc, argv, &i, &value) ||
-                !ParseU64(value, &options->limit)) {
+            if (!take(&value) || !ParseU64(value, &options->limit)) {
                 *error = "bad --limit";
                 return false;
             }
         } else if (arg == "--rate") {
-            if (!NextValue(argc, argv, &i, &value) ||
-                !ParseDouble(value, &options->rate)) {
+            if (!take(&value) || !ParseDouble(value, &options->rate)) {
                 *error = "bad --rate";
                 return false;
             }
         } else if (arg == "--speed") {
-            if (!NextValue(argc, argv, &i, &value) ||
-                !ParseDouble(value, &options->speed)) {
+            if (!take(&value) || !ParseDouble(value, &options->speed)) {
                 *error = "bad --speed";
                 return false;
             }
         } else if (arg == "--timeout-ms") {
             std::uint64_t timeout = 0;
-            if (!NextValue(argc, argv, &i, &value) ||
-                !ParseU64(value, &timeout) || timeout == 0 ||
+            if (!take(&value) || !ParseU64(value, &timeout) || timeout == 0 ||
                 timeout > 600000) {
                 *error = "bad --timeout-ms";
                 return false;
             }
             options->timeout_ms = static_cast<int>(timeout);
         } else if (arg == "--allow-route") {
-            if (!NextValue(argc, argv, &i, &value) || value.empty()) {
+            if (!take(&value) || value.empty()) {
                 *error = "--allow-route needs a route key or name";
                 return false;
             }
