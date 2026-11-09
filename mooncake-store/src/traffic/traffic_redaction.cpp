@@ -24,6 +24,21 @@ void Mask(std::vector<std::string>& values) {
     }
 }
 
+void Mask(ReplicateConfig& config) {
+    Mask(config.preferred_segments);
+    Mask(config.preferred_segment);
+    Mask(config.preferred_nof_segments);
+    Mask(config.host_id);
+}
+
+void Mask(ObjectMeta& meta) { Mask(meta.key); }
+
+void Mask(std::vector<ObjectMeta>& metas) {
+    for (auto& meta : metas) {
+        Mask(meta);
+    }
+}
+
 template <typename Tuple, typename Fn>
 class TupleRedactor final : public Redactor {
    public:
@@ -114,10 +129,10 @@ void RegisterMasterRedactors(RedactionRegistry& registry) {
             Mask(std::get<0>(args));
             Mask(std::get<1>(args));
         });
-    Add<std::tuple<std::vector<std::string>, std::string>>(
+    Add<std::tuple<GrantLeasePolicy, std::vector<std::string>, std::string>>(
         registry, RouteKey<&Service::BatchProbeKey>(), [](auto& args) {
-            Mask(std::get<0>(args));
             Mask(std::get<1>(args));
+            Mask(std::get<2>(args));
         });
     Add<std::tuple<std::string, bool, std::string>>(
         registry, RouteKey<&Service::Remove>(), [](auto& args) {
@@ -133,13 +148,35 @@ void RegisterMasterRedactors(RedactionRegistry& registry) {
                    std::string>>(registry, RouteKey<&Service::PutStart>(),
                                  [](auto& args) {
                                      Mask(std::get<1>(args));
+                                     Mask(std::get<3>(args));
                                      Mask(std::get<4>(args));
                                  });
     Add<std::tuple<UUID, std::vector<std::string>, std::vector<std::uint64_t>,
                    ReplicateConfig, std::string>>(
         registry, RouteKey<&Service::BatchPutStart>(), [](auto& args) {
             Mask(std::get<1>(args));
+            Mask(std::get<3>(args));
             Mask(std::get<4>(args));
+        });
+    Add<std::tuple<UUID, ObjectMeta, ReplicaType, std::string>>(
+        registry, RouteKey<&Service::PutEnd>(), [](auto& args) {
+            Mask(std::get<1>(args));
+            Mask(std::get<3>(args));
+        });
+    Add<std::tuple<UUID, std::vector<ObjectMeta>, ReplicaType, std::string>>(
+        registry, RouteKey<&Service::BatchPutEnd>(), [](auto& args) {
+            Mask(std::get<1>(args));
+            Mask(std::get<3>(args));
+        });
+    Add<std::tuple<UUID, std::string, ReplicaType, std::string>>(
+        registry, RouteKey<&Service::PutRevoke>(), [](auto& args) {
+            Mask(std::get<1>(args));
+            Mask(std::get<3>(args));
+        });
+    Add<std::tuple<UUID, std::vector<std::string>, ReplicaType, std::string>>(
+        registry, RouteKey<&Service::BatchPutRevoke>(), [](auto& args) {
+            Mask(std::get<1>(args));
+            Mask(std::get<3>(args));
         });
 }
 
