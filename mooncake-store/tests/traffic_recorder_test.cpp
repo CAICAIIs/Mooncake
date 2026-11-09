@@ -130,33 +130,6 @@ TEST(FileSinkTest, WritesHeaderRecordChecksumAndFooter) {
     EXPECT_EQ(footer.payload_bytes, record_bytes.size());
 }
 
-TEST(TrafficRecorderTest, RejectsShardCountBelowRpcThreads) {
-    TempDir dir;
-    const std::string config_path = (dir.path() / "traffic.json").string();
-    {
-        std::ofstream out(config_path);
-        out << R"({
-          "output_dir": ")"
-            << dir.path().string() << R"(",
-          "ring_bytes": 65536,
-          "ring_shards": 2,
-          "max_record_bytes": 1024,
-          "block_bytes": 2048,
-          "segment_bytes": 32768,
-          "segment_seconds": 300,
-          "routes": ["1"],
-          "control": {"host": "127.0.0.1", "port": 37997,
-                      "token": "test-token"}
-        })";
-    }
-    setenv("MOONCAKE_TRAFFIC_CONFIG", config_path.c_str(), 1);
-    auto& recorder = TrafficRecorder::Instance();
-    recorder.Install(4);
-    EXPECT_EQ(recorder.GetStatus().state, "error");
-    recorder.Shutdown();
-    unsetenv("MOONCAKE_TRAFFIC_CONFIG");
-}
-
 TEST(TrafficRecorderTest, RejectsRedactedWithoutRoutes) {
     TempDir dir;
     const std::string config_path = (dir.path() / "traffic.json").string();
@@ -166,7 +139,6 @@ TEST(TrafficRecorderTest, RejectsRedactedWithoutRoutes) {
           "output_dir": ")"
             << dir.path().string() << R"(",
           "ring_bytes": 65536,
-          "ring_shards": 1,
           "max_record_bytes": 1024,
           "block_bytes": 2048,
           "segment_bytes": 32768,
@@ -193,7 +165,6 @@ TEST(TrafficRecorderTest, RejectsRedactedWithoutRedactor) {
           "output_dir": ")"
             << dir.path().string() << R"(",
           "ring_bytes": 65536,
-          "ring_shards": 1,
           "max_record_bytes": 1024,
           "block_bytes": 2048,
           "segment_bytes": 32768,
@@ -221,7 +192,6 @@ TEST(TrafficRecorderTest, ReinstallReplacesPreviousRoutes) {
           "output_dir": ")"
             << dir.path().string() << R"(",
           "ring_bytes": 262144,
-          "ring_shards": 2,
           "max_record_bytes": 2048,
           "block_bytes": 4096,
           "segment_bytes": 65536,
@@ -251,7 +221,7 @@ TEST(TrafficRecorderTest, ReinstallReplacesPreviousRoutes) {
     setenv("MOONCAKE_TRAFFIC_CONFIG", config_path.c_str(), 1);
     auto& recorder = TrafficRecorder::Instance();
     write_config(1, 37997);
-    recorder.Install();
+    recorder.Install(1);
     ASSERT_TRUE(recorder.Start());
     const std::string payload = "payload";
     recorder.OnRequest(RequestView{1, payload, 1, 1, 0});
@@ -259,14 +229,14 @@ TEST(TrafficRecorderTest, ReinstallReplacesPreviousRoutes) {
     recorder.Shutdown();
 
     write_config(2, 37998);
-    recorder.Install();
+    recorder.Install(1);
     ASSERT_TRUE(recorder.Start());
     recorder.OnRequest(RequestView{1, payload, 2, 1, 0});
     recorder.OnRequest(RequestView{2, payload, 2, 2, 0});
     recorder.Stop();
     const RecorderStatus status = recorder.GetStatus();
     EXPECT_EQ(status.recorded_requests, 1u);
-    EXPECT_EQ(status.dropped_filtered, 1u);
+    EXPECT_EQ(status.dropped_requests, 1u);
 }
 
 TEST(TrafficRecorderTest, ControlTokenUsesSecureFilePermissions) {
@@ -307,7 +277,7 @@ TEST(TrafficRecorderTest, ControlTokenUsesSecureFilePermissions) {
 
     auto& recorder = TrafficRecorder::Instance();
     write_config(ports[0], {});
-    recorder.Install();
+    recorder.Install(1);
     ASSERT_EQ(recorder.GetStatus().state, "idle");
     const auto token_path = dir.path() / "control.token";
     struct stat token_stat{};
@@ -325,7 +295,7 @@ TEST(TrafficRecorderTest, ControlTokenUsesSecureFilePermissions) {
     }
     ASSERT_EQ(::chmod(token_path.c_str(), 0600), 0);
     write_config(ports[1], {});
-    recorder.Install();
+    recorder.Install(1);
     EXPECT_EQ(recorder.GetStatus().state, "error");
     recorder.Shutdown();
 
@@ -336,7 +306,7 @@ TEST(TrafficRecorderTest, ControlTokenUsesSecureFilePermissions) {
     }
     ASSERT_EQ(::chmod(insecure_token_path.c_str(), 0644), 0);
     write_config(ports[2], insecure_token_path.string());
-    recorder.Install();
+    recorder.Install(1);
     EXPECT_EQ(recorder.GetStatus().state, "error");
 }
 
@@ -352,7 +322,6 @@ TEST(TrafficRecorderTest, CoroutineAdapterFiltersRequestAttachments) {
           "output_dir": ")"
             << dir.path().string() << R"(",
           "ring_bytes": 65536,
-          "ring_shards": 1,
           "max_record_bytes": 4096,
           "block_bytes": 4096,
           "segment_bytes": 32768,
@@ -413,7 +382,7 @@ TEST(TrafficRecorderTest, CoroutineAdapterFiltersRequestAttachments) {
     recorder.Stop();
     const RecorderStatus status = recorder.GetStatus();
     EXPECT_EQ(status.recorded_requests, 1u);
-    EXPECT_EQ(status.dropped_filtered, 1u);
+    EXPECT_EQ(status.dropped_requests, 1u);
     EXPECT_FALSE(status.capture_complete);
 }
 
@@ -426,7 +395,6 @@ TEST(TrafficRecorderTest, RecordsAcrossWrapAndRestarts) {
           "output_dir": ")"
             << dir.path().string() << R"(",
           "ring_bytes": 262144,
-          "ring_shards": 2,
           "max_record_bytes": 2048,
           "block_bytes": 4096,
           "segment_bytes": 65536,
@@ -439,7 +407,7 @@ TEST(TrafficRecorderTest, RecordsAcrossWrapAndRestarts) {
     setenv("MOONCAKE_TRAFFIC_CONFIG", config_path.c_str(), 1);
 
     auto& recorder = TrafficRecorder::Instance();
-    recorder.Install();
+    recorder.Install(1);
     ASSERT_TRUE(recorder.Start());
     const std::string payload(128, 'x');
     for (int i = 0; i < 5000; ++i) {
@@ -474,7 +442,6 @@ TEST(TrafficRecorderTest, WriterFailureCanBeStoppedAndRestarted) {
           "output_dir": ")"
             << dir.path().string() << R"(",
           "ring_bytes": 262144,
-          "ring_shards": 2,
           "max_record_bytes": 2048,
           "block_bytes": 4096,
           "segment_bytes": 65536,
@@ -488,7 +455,7 @@ TEST(TrafficRecorderTest, WriterFailureCanBeStoppedAndRestarted) {
     setenv("MOONCAKE_TRAFFIC_CONFIG", config_path.c_str(), 1);
 
     auto& recorder = TrafficRecorder::Instance();
-    recorder.Install();
+    recorder.Install(1);
     ASSERT_TRUE(recorder.Start());
     const std::string payload(512, 'y');
     for (int i = 0; i < 2000; ++i) {
@@ -537,7 +504,7 @@ TEST(TrafficRecorderTest, MinimalConfigurationRecordsAllRoutes) {
     EXPECT_EQ(status.state, "idle");
     EXPECT_EQ(status.observed_requests, 1u);
     EXPECT_EQ(status.recorded_requests, 1u);
-    EXPECT_EQ(status.dropped_filtered, 0u);
+    EXPECT_EQ(status.dropped_requests, 0u);
 
     const std::filesystem::path token_path = dir.path() / "control.token";
     ASSERT_TRUE(std::filesystem::exists(token_path));
@@ -578,12 +545,12 @@ TEST(TrafficRecorderTest, RejectsMalformedRouteConfiguration) {
 
     auto& recorder = TrafficRecorder::Instance();
     write_config("\"1\"");
-    recorder.Install();
+    recorder.Install(1);
     EXPECT_EQ(recorder.GetStatus().state, "error");
     recorder.Shutdown();
 
     write_config("[\"*\", \"1\"]");
-    recorder.Install();
+    recorder.Install(1);
     EXPECT_EQ(recorder.GetStatus().state, "error");
 }
 

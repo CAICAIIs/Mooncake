@@ -41,10 +41,6 @@ struct RecorderStatus {
     std::uint64_t observed_requests = 0;
     std::uint64_t recorded_requests = 0;
     std::uint64_t dropped_requests = 0;
-    std::uint64_t dropped_ring = 0;
-    std::uint64_t dropped_filtered = 0;
-    std::uint64_t dropped_oversize = 0;
-    std::uint64_t dropped_unredacted = 0;
     std::uint64_t bytes_written = 0;
     std::uint64_t segments = 0;
     std::uint64_t ring_used_bytes = 0;
@@ -101,7 +97,6 @@ class TrafficRecorder {
     std::atomic<bool> active_{false};
     std::atomic<bool> shutdown_{false};
     std::atomic<bool> writer_stop_{false};
-    std::atomic<bool> attachment_dropped_{false};
     std::atomic<std::uint32_t> in_request_{0};
     std::atomic<std::uint64_t> generation_{0};
     std::atomic<std::uint64_t> next_shard_{0};

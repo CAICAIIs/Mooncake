@@ -75,11 +75,56 @@ struct alignas(64) TrafficRecorder::Shard {
     std::atomic<std::uint64_t> observed{0};
     std::atomic<std::uint64_t> recorded{0};
     alignas(64) std::atomic<std::uint64_t> tail{0};
-    alignas(64) std::atomic<std::uint64_t> dropped_ring{0};
-    std::atomic<std::uint64_t> dropped_filtered{0};
-    std::atomic<std::uint64_t> dropped_oversize{0};
-    std::atomic<std::uint64_t> dropped_unredacted{0};
+    alignas(64) std::atomic<std::uint64_t> dropped{0};
 };
+
+namespace {
+
+struct RingRecord {
+    TrafficRecordHeader header;
+    const char* data = nullptr;
+};
+
+enum class RingReadResult { kEnd, kSkip, kRecord, kCorrupt };
+
+template <typename ShardT>
+RingReadResult NextRingRecord(ShardT& shard, std::uint64_t head,
+                              std::uint64_t* tail, RingRecord* record) {
+    if (*tail == head) {
+        return RingReadResult::kEnd;
+    }
+    const std::uint64_t index = *tail & shard.mask;
+    if (index + kRingPadSize > shard.capacity) {
+        *tail += shard.capacity - index;
+        return RingReadResult::kSkip;
+    }
+    std::uint32_t pad_len = 0;
+    std::uint32_t pad_magic = 0;
+    std::memcpy(&pad_len, shard.ring.get() + index, sizeof(pad_len));
+    std::memcpy(&pad_magic, shard.ring.get() + index + sizeof(pad_len),
+                sizeof(pad_magic));
+    if (pad_magic == kRingPadMagic) {
+        if (pad_len < kRingPadSize || pad_len > shard.capacity - index) {
+            return RingReadResult::kCorrupt;
+        }
+        *tail += pad_len;
+        return RingReadResult::kSkip;
+    }
+    std::memcpy(&record->header, shard.ring.get() + index,
+                sizeof(record->header));
+    const auto& header = record->header;
+    if (header.total_len < kTrafficRecordHeaderSize ||
+        header.total_len > shard.capacity ||
+        index + header.total_len > shard.capacity ||
+        header.payload_len != header.total_len - kTrafficRecordHeaderSize) {
+        return RingReadResult::kCorrupt;
+    }
+    record->data = shard.ring.get() + index;
+    *tail += header.total_len;
+    return RingReadResult::kRecord;
+}
+
+}  // namespace
 
 TrafficRecorder& TrafficRecorder::Instance() {
     static TrafficRecorder instance;
@@ -145,23 +190,11 @@ bool TrafficRecorder::ApplyOptions(const Json::Value& root,
         SetState("error");
         return false;
     }
-    if (root["ring_shards"].isUInt()) {
-        ring_shards_ = root["ring_shards"].asUInt();
-    }
-    if (ring_shards_ == 0) {
-        const std::uint32_t fallback =
-            std::max(1u, std::thread::hardware_concurrency());
-        ring_shards_ =
-            rpc_threads > 0
-                ? static_cast<std::uint32_t>(std::min<std::size_t>(
-                      rpc_threads, std::numeric_limits<std::uint32_t>::max()))
-                : fallback;
-    } else if (rpc_threads > 0 && ring_shards_ < rpc_threads) {
-        LOG(ERROR) << "traffic: ring_shards " << ring_shards_
-                   << " is smaller than rpc_threads " << rpc_threads;
-        SetState("error");
-        return false;
-    }
+    ring_shards_ =
+        rpc_threads > 0
+            ? static_cast<std::uint32_t>(std::min<std::size_t>(
+                  rpc_threads, std::numeric_limits<std::uint32_t>::max()))
+            : std::max(1u, std::thread::hardware_concurrency());
     if (block_bytes_ == 0 || block_bytes_ > segment_bytes_) {
         LOG(ERROR) << "traffic: block_bytes must be in (0, segment_bytes]";
         SetState("error");
@@ -384,7 +417,6 @@ bool TrafficRecorder::Start() {
     }
     writer_failed_.store(false, std::memory_order_relaxed);
     stop_timed_out_.store(false, std::memory_order_relaxed);
-    attachment_dropped_.store(false, std::memory_order_relaxed);
     stop_deadline_ms_.store(0, std::memory_order_relaxed);
     const std::uint64_t shard_bytes =
         FloorPowerOfTwo(ring_bytes_ / std::max(1u, ring_shards_));
@@ -541,18 +573,17 @@ void TrafficRecorder::OnRequest(const RequestView& view) noexcept {
     shard.observed.fetch_add(1, std::memory_order_relaxed);
     if (!allowed_routes_.empty() &&
         allowed_routes_.find(view.route_key) == allowed_routes_.end()) {
-        shard.dropped_filtered.fetch_add(1, std::memory_order_relaxed);
+        shard.dropped.fetch_add(1, std::memory_order_relaxed);
         return;
     }
     if (view.attach_length != 0) {
-        attachment_dropped_.store(true, std::memory_order_relaxed);
-        shard.dropped_filtered.fetch_add(1, std::memory_order_relaxed);
+        shard.dropped.fetch_add(1, std::memory_order_relaxed);
         return;
     }
     const std::uint64_t total = kTrafficRecordHeaderSize +
                                 static_cast<std::uint64_t>(view.payload.size());
     if (total > max_record_bytes_ || total > shard.capacity) {
-        shard.dropped_oversize.fetch_add(1, std::memory_order_relaxed);
+        shard.dropped.fetch_add(1, std::memory_order_relaxed);
         return;
     }
 
@@ -575,7 +606,7 @@ void TrafficRecorder::OnRequest(const RequestView& view) noexcept {
     if (index + total > shard.capacity) {
         const std::uint64_t remaining = shard.capacity - index;
         if (used + remaining > shard.capacity) {
-            shard.dropped_ring.fetch_add(1, std::memory_order_relaxed);
+            shard.dropped.fetch_add(1, std::memory_order_relaxed);
             shard.state.fetch_sub(1, std::memory_order_release);
             return;
         }
@@ -591,7 +622,7 @@ void TrafficRecorder::OnRequest(const RequestView& view) noexcept {
         index = 0;
     }
     if (total > shard.capacity - used) {
-        shard.dropped_ring.fetch_add(1, std::memory_order_relaxed);
+        shard.dropped.fetch_add(1, std::memory_order_relaxed);
         shard.state.fetch_sub(1, std::memory_order_release);
         return;
     }
@@ -671,50 +702,31 @@ bool TrafficRecorder::DrainShardDirect(Shard& shard,
     std::uint64_t bytes = 0;
     std::uint32_t records = 0;
     std::uint64_t commit_tail = tail;
-    while (tail != head) {
-        const std::uint64_t index = tail & shard.mask;
-        if (index + kRingPadSize > shard.capacity) {
+    RingRecord record;
+    for (;;) {
+        const RingReadResult result =
+            NextRingRecord(shard, head, &tail, &record);
+        if (result == RingReadResult::kEnd) {
+            break;
+        }
+        if (result == RingReadResult::kCorrupt) {
+            shard.dropped.fetch_add(1, std::memory_order_relaxed);
             if (!FlushRecords(shard, iov, bytes, records, commit_tail)) {
                 return false;
             }
-            bytes = 0;
-            records = 0;
-            tail += shard.capacity - index;
-            commit_tail = tail;
-            shard.tail.store(tail, std::memory_order_release);
-            continue;
-        }
-        std::uint32_t pad_len = 0;
-        std::uint32_t pad_magic = 0;
-        std::memcpy(&pad_len, shard.ring.get() + index, sizeof(pad_len));
-        std::memcpy(&pad_magic, shard.ring.get() + index + sizeof(pad_len),
-                    sizeof(pad_magic));
-        if (pad_magic == kRingPadMagic) {
-            if (pad_len < kRingPadSize || pad_len > shard.capacity - index) {
-                shard.dropped_ring.fetch_add(1, std::memory_order_relaxed);
-                shard.tail.store(head, std::memory_order_release);
-                return true;
-            }
-            if (!FlushRecords(shard, iov, bytes, records, commit_tail)) {
-                return false;
-            }
-            bytes = 0;
-            records = 0;
-            tail += pad_len;
-            commit_tail = tail;
-            shard.tail.store(tail, std::memory_order_release);
-            continue;
-        }
-        TrafficRecordHeader header;
-        std::memcpy(&header, shard.ring.get() + index, sizeof(header));
-        if (header.total_len < kTrafficRecordHeaderSize ||
-            header.total_len > shard.capacity ||
-            index + header.total_len > shard.capacity) {
-            shard.dropped_ring.fetch_add(1, std::memory_order_relaxed);
             shard.tail.store(head, std::memory_order_release);
             return true;
         }
-        if (records > 0 && (bytes + header.total_len > block_bytes_ ||
+        if (result == RingReadResult::kSkip) {
+            if (!FlushRecords(shard, iov, bytes, records, commit_tail)) {
+                return false;
+            }
+            bytes = 0;
+            records = 0;
+            commit_tail = tail;
+            continue;
+        }
+        if (records > 0 && (bytes + record.header.total_len > block_bytes_ ||
                             iov.size() >= static_cast<std::size_t>(IOV_MAX))) {
             if (!FlushRecords(shard, iov, bytes, records, commit_tail)) {
                 return false;
@@ -722,10 +734,10 @@ bool TrafficRecorder::DrainShardDirect(Shard& shard,
             bytes = 0;
             records = 0;
         }
-        iov.push_back({shard.ring.get() + index, header.total_len});
-        bytes += header.total_len;
+        iov.push_back(
+            {const_cast<char*>(record.data), record.header.total_len});
+        bytes += record.header.total_len;
         ++records;
-        tail += header.total_len;
         commit_tail = tail;
     }
     return FlushRecords(shard, iov, bytes, records, commit_tail);
@@ -735,53 +747,36 @@ bool TrafficRecorder::DrainShardRedacted(Shard& shard) {
     std::uint64_t tail = shard.tail.load(std::memory_order_acquire);
     const std::uint64_t head = shard.head.load(std::memory_order_acquire);
     std::string redacted;
-    while (tail != head) {
-        const std::uint64_t index = tail & shard.mask;
-        if (index + kRingPadSize > shard.capacity) {
-            tail += shard.capacity - index;
-            shard.tail.store(tail, std::memory_order_release);
-            continue;
+    RingRecord record;
+    while (true) {
+        const RingReadResult result =
+            NextRingRecord(shard, head, &tail, &record);
+        if (result == RingReadResult::kEnd) {
+            return true;
         }
-        std::uint32_t pad_len = 0;
-        std::uint32_t pad_magic = 0;
-        std::memcpy(&pad_len, shard.ring.get() + index, sizeof(pad_len));
-        std::memcpy(&pad_magic, shard.ring.get() + index + sizeof(pad_len),
-                    sizeof(pad_magic));
-        if (pad_magic == kRingPadMagic) {
-            if (pad_len < kRingPadSize || pad_len > shard.capacity - index) {
-                shard.dropped_ring.fetch_add(1, std::memory_order_relaxed);
-                shard.tail.store(head, std::memory_order_release);
-                return true;
-            }
-            tail += pad_len;
-            shard.tail.store(tail, std::memory_order_release);
-            continue;
-        }
-        TrafficRecordHeader header;
-        std::memcpy(&header, shard.ring.get() + index, sizeof(header));
-        if (header.total_len < kTrafficRecordHeaderSize ||
-            header.total_len > shard.capacity ||
-            index + header.total_len > shard.capacity ||
-            header.payload_len != header.total_len - kTrafficRecordHeaderSize) {
-            shard.dropped_ring.fetch_add(1, std::memory_order_relaxed);
+        if (result == RingReadResult::kCorrupt) {
+            shard.dropped.fetch_add(1, std::memory_order_relaxed);
             shard.tail.store(head, std::memory_order_release);
             return true;
         }
-        const char* body = shard.ring.get() + index + sizeof(header);
+        if (result == RingReadResult::kSkip) {
+            shard.tail.store(tail, std::memory_order_release);
+            continue;
+        }
+        const char* body = record.data + sizeof(TrafficRecordHeader);
         redacted.clear();
         bool ok = true;
         if (redaction_mode_ == RedactionMode::kRedacted) {
             ok = redaction_registry_.Redact(
-                header.route_key, std::string_view(body, header.payload_len),
-                redacted);
+                record.header.route_key,
+                std::string_view(body, record.header.payload_len), redacted);
         }
         if (!ok) {
-            shard.dropped_unredacted.fetch_add(1, std::memory_order_relaxed);
-            tail += header.total_len;
+            shard.dropped.fetch_add(1, std::memory_order_relaxed);
             shard.tail.store(tail, std::memory_order_release);
             continue;
         }
-        TrafficRecordHeader output = header;
+        TrafficRecordHeader output = record.header;
         output.payload_len = static_cast<std::uint32_t>(redacted.size());
         output.total_len = static_cast<std::uint32_t>(kTrafficRecordHeaderSize +
                                                       redacted.size());
@@ -794,10 +789,8 @@ bool TrafficRecorder::DrainShardRedacted(Shard& shard) {
             !sink_->WriteRecords(iov, iov_count, output.total_len, 1)) {
             return false;
         }
-        tail += header.total_len;
         shard.tail.store(tail, std::memory_order_release);
     }
-    return true;
 }
 
 bool TrafficRecorder::FlushRecords(Shard& shard, std::vector<struct iovec>& iov,
@@ -835,10 +828,7 @@ RecorderStatus TrafficRecorder::GetStatus() const {
     }
     std::uint64_t observed = 0;
     std::uint64_t recorded = 0;
-    std::uint64_t dropped_ring = 0;
-    std::uint64_t dropped_filtered = 0;
-    std::uint64_t dropped_oversize = 0;
-    std::uint64_t dropped_unredacted = 0;
+    std::uint64_t dropped = 0;
     std::uint64_t used = 0;
     std::uint64_t capacity = 0;
     {
@@ -846,13 +836,7 @@ RecorderStatus TrafficRecorder::GetStatus() const {
         for (const auto& shard : shards_) {
             observed += shard->observed.load(std::memory_order_relaxed);
             recorded += shard->recorded.load(std::memory_order_relaxed);
-            dropped_ring += shard->dropped_ring.load(std::memory_order_relaxed);
-            dropped_filtered +=
-                shard->dropped_filtered.load(std::memory_order_relaxed);
-            dropped_oversize +=
-                shard->dropped_oversize.load(std::memory_order_relaxed);
-            dropped_unredacted +=
-                shard->dropped_unredacted.load(std::memory_order_relaxed);
+            dropped += shard->dropped.load(std::memory_order_relaxed);
             used += shard->head.load(std::memory_order_relaxed) -
                     shard->tail.load(std::memory_order_relaxed);
             capacity += shard->capacity;
@@ -860,13 +844,8 @@ RecorderStatus TrafficRecorder::GetStatus() const {
     }
     status.observed_requests = observed;
     status.recorded_requests = recorded;
-    status.dropped_ring =
-        dropped_ring + dropped_no_shard_.load(std::memory_order_relaxed);
-    status.dropped_filtered = dropped_filtered;
-    status.dropped_oversize = dropped_oversize;
-    status.dropped_unredacted = dropped_unredacted;
     status.dropped_requests =
-        status.dropped_ring + dropped_oversize + dropped_unredacted;
+        dropped + dropped_no_shard_.load(std::memory_order_relaxed);
     status.ring_used_bytes = used;
     status.ring_capacity_bytes = capacity;
     {
@@ -886,10 +865,8 @@ RecorderStatus TrafficRecorder::GetStatus() const {
         TrafficNowMs() >= deadline) {
         status.stop_timed_out = true;
     }
-    status.capture_complete =
-        status.dropped_requests == 0 && status.format_complete &&
-        !status.stop_timed_out &&
-        !attachment_dropped_.load(std::memory_order_relaxed);
+    status.capture_complete = status.dropped_requests == 0 &&
+                              status.format_complete && !status.stop_timed_out;
     return status;
 }
 

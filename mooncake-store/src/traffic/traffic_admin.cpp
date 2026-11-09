@@ -33,13 +33,6 @@ Json::Value BuildStatusJson(const RecorderStatus& status) {
         static_cast<Json::UInt64>(status.recorded_requests);
     root["dropped_requests"] =
         static_cast<Json::UInt64>(status.dropped_requests);
-    root["dropped_ring"] = static_cast<Json::UInt64>(status.dropped_ring);
-    root["dropped_filtered"] =
-        static_cast<Json::UInt64>(status.dropped_filtered);
-    root["dropped_oversize"] =
-        static_cast<Json::UInt64>(status.dropped_oversize);
-    root["dropped_unredacted"] =
-        static_cast<Json::UInt64>(status.dropped_unredacted);
     root["bytes_written"] = static_cast<Json::UInt64>(status.bytes_written);
     root["segments"] = static_cast<Json::UInt64>(status.segments);
     root["ring_used_bytes"] = static_cast<Json::UInt64>(status.ring_used_bytes);
