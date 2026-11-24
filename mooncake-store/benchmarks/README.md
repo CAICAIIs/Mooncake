@@ -2,6 +2,13 @@
 
 This directory contains benchmark tools for Mooncake Store internals.
 
+## Memory Segment Benchmark
+
+`memory_segment_bench` fills and reads one Memory Segment without using traffic
+recording. Its default workload is 100 million 1 KiB keys. See
+[`memory_segment_bench.md`](memory_segment_bench.md) for the workload, build,
+run, and scope.
+
 ## Allocation Strategy Benchmark
 
 `allocation_strategy_bench` evaluates Store allocation behavior across segment
