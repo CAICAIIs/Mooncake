@@ -2,12 +2,13 @@
 
 This directory contains benchmark tools for Mooncake Store internals.
 
-## Memory Segment Benchmark
+## SGLang HiCache Master Benchmark
 
-`memory_segment_bench` fills and reads one Memory Segment without using traffic
-recording. Its default workload is 100 million 1 KiB keys. See
-[`memory_segment_bench.md`](memory_segment_bench.md) for the workload, build,
-run, and scope.
+`master_bench --workload=sglang_hicache` replays the metadata traffic SGLang
+HiCache sends to one Master: `BatchExistKey`, `BatchGetReplicaList`,
+`BatchPutStart`, and `BatchPutEnd`. See
+[`master_sglang_bench.md`](master_sglang_bench.md) for the workload, build,
+run, and results.
 
 ## Allocation Strategy Benchmark
 

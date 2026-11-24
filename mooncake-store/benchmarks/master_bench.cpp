@@ -13,13 +13,25 @@
 // limitations under the License.
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
+#include <condition_variable>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <latch>
+#include <map>
+#include <mutex>
+#include <numeric>
 #include <random>
+#include <set>
+#include <sstream>
+#include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
+
+#include <openssl/sha.h>
 
 #include "gflags/gflags.h"
 #include "glog/logging.h"
@@ -364,6 +376,957 @@ class BenchClient {
     std::vector<std::thread> threads_;
 };
 
+// ---------------------------------------------------------------------------
+// SGLang HiCache metadata replay (--workload=sglang_hicache)
+//
+// Replays the metadata traffic a SGLang HiCache deployment sends to one master
+// for a multi-turn workload: every round re-queries its growing history prefix,
+// fetches replica metadata for the hits, then allocates and commits the pages
+// added in that round. Node count is the independent variable.
+// ---------------------------------------------------------------------------
+
+DEFINE_string(workload, "",
+              "Workload profile; empty selects the legacy operation mode, "
+              "sglang_hicache selects the SGLang HiCache metadata replay");
+DEFINE_uint64(node_count, 1, "Number of SGLang nodes (instances) to replay");
+DEFINE_uint64(session_count, 80, "Conversations replayed per node");
+DEFINE_uint64(round_count, 10, "Rounds per conversation");
+DEFINE_uint64(page_tokens, 64, "Tokens per logical page");
+DEFINE_uint64(tokens_per_round, 2048, "New input tokens per round");
+DEFINE_uint64(object_bytes, 1540096, "Bytes per K or V object");
+DEFINE_uint64(request_rate, 16, "Logical requests per second per node");
+DEFINE_uint64(slots_per_node, 4, "Logical request slots per node");
+DEFINE_uint64(ranks_per_node, 8, "TP ranks per node");
+DEFINE_uint64(page_batch, 128, "Logical pages per batched exists/get RPC");
+DEFINE_uint64(seed, 1, "Seed for arrival intervals and page keys");
+DEFINE_string(model_config_digest, "qwen3-235b-a22b-instruct-2507",
+              "Model digest mixed into page keys");
+DEFINE_uint64(warmup_objects_per_node, 512,
+              "Auxiliary objects warmed up per node");
+DEFINE_bool(round_barrier, true, "Barrier between rounds");
+DEFINE_bool(disable_validation, false,
+            "Skip the final validation pass over all measured keys");
+DEFINE_string(result_file, "",
+              "Write per-group results to this CSV file; empty prints only");
+
+namespace sglang_hicache {
+
+using Clock = std::chrono::steady_clock;
+
+static uint64_t ElapsedNs(Clock::time_point start) {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() -
+                                                                start)
+        .count();
+}
+
+static std::string HexSha256(const std::string& input) {
+    unsigned char digest[SHA256_DIGEST_LENGTH];
+    SHA256(reinterpret_cast<const unsigned char*>(input.data()), input.size(),
+           digest);
+    static const char* kHex = "0123456789abcdef";
+    std::string out;
+    out.reserve(2 * SHA256_DIGEST_LENGTH);
+    for (unsigned char byte : digest) {
+        out.push_back(kHex[byte >> 4]);
+        out.push_back(kHex[byte & 0x0F]);
+    }
+    return out;
+}
+
+struct Profile {
+    uint64_t nodes;
+    uint64_t sessions;
+    uint64_t rounds;
+    uint64_t ranks;
+    uint64_t slots;
+    uint64_t pages_per_round;
+    uint64_t page_batch;
+    uint64_t object_bytes;
+    uint64_t warmup_objects;
+
+    uint64_t ObjectsPerPage() const { return ranks * 2; }
+    uint64_t PagesBeforeRound(uint64_t round) const {
+        return pages_per_round * (round - 1);
+    }
+    uint64_t PagesAtRound(uint64_t round) const {
+        return pages_per_round * round;
+    }
+    // Batched RPCs needed for `pages` logical pages.
+    uint64_t Batches(uint64_t pages) const {
+        return pages == 0 ? 0 : (pages + page_batch - 1) / page_batch;
+    }
+};
+
+struct GroupKey {
+    std::string phase;
+    std::string rpc;
+    uint64_t batch_keys;
+
+    bool operator<(const GroupKey& other) const {
+        if (phase != other.phase) return phase < other.phase;
+        if (rpc != other.rpc) return rpc < other.rpc;
+        return batch_keys < other.batch_keys;
+    }
+};
+
+struct GroupStats {
+    std::atomic<uint64_t> rpc_count{0};
+    std::atomic<uint64_t> logical_pages{0};
+    std::atomic<uint64_t> object_keys{0};
+    std::atomic<uint64_t> hit{0};
+    std::atomic<uint64_t> miss{0};
+    std::atomic<uint64_t> error{0};
+    std::atomic<uint64_t> start_ok{0};
+    std::atomic<uint64_t> start_fail{0};
+    std::atomic<uint64_t> start_exists{0};
+    std::atomic<uint64_t> start_no_handle{0};
+    std::atomic<uint64_t> end_ok{0};
+    std::atomic<uint64_t> end_fail{0};
+    std::mutex latency_mutex;
+    std::vector<uint64_t> latency_ns;
+
+    void RecordLatency(uint64_t ns) {
+        std::lock_guard<std::mutex> guard(latency_mutex);
+        latency_ns.push_back(ns);
+    }
+    std::vector<uint64_t> Latencies() {
+        std::lock_guard<std::mutex> guard(latency_mutex);
+        return latency_ns;
+    }
+};
+
+class Registry {
+   public:
+    GroupStats& Get(const std::string& phase, const std::string& rpc,
+                    uint64_t batch_keys) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        return groups_[GroupKey{phase, rpc, batch_keys}];
+    }
+
+    template <typename Fn>
+    void ForEach(Fn&& fn) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        for (auto& entry : groups_) {
+            fn(entry.first, entry.second);
+        }
+    }
+
+   private:
+    std::mutex mutex_;
+    std::map<GroupKey, GroupStats> groups_;
+};
+
+static double Percentile(const std::vector<uint64_t>& sorted, double q) {
+    if (sorted.empty()) return 0.0;
+    size_t idx = static_cast<size_t>(q * (sorted.size() - 1));
+    return static_cast<double>(sorted[idx]) / 1e6;  // ns -> ms
+}
+
+struct CounterSnapshot {
+    uint64_t rpc = 0;
+    uint64_t keys = 0;
+    uint64_t hit = 0;
+    uint64_t miss = 0;
+    uint64_t error = 0;
+    uint64_t put_start = 0;
+    uint64_t put_end = 0;
+};
+
+// One MasterClient identity: a single TP rank of one node in one request slot.
+class RankChannel {
+   public:
+    RankChannel(const std::string& master, uint64_t node, uint64_t slot,
+                uint64_t rank, uintptr_t base, uint64_t segment_size,
+                Registry& registry)
+        : client_(mooncake::generate_uuid()),
+          node_(node),
+          slot_(slot),
+          rank_(rank),
+          registry_(registry),
+          segment_base_(base),
+          segment_size_(segment_size) {
+        auto ec = client_.Connect(master);
+        if (ec != mooncake::ErrorCode::OK) {
+            throw std::runtime_error("connect failed: " + toString(ec));
+        }
+        segment_.id = mooncake::generate_uuid();
+        segment_.name = "sg_node" + std::to_string(node) + "_slot" +
+                        std::to_string(slot) + "_rank" + std::to_string(rank);
+        segment_.base = base;
+        segment_.size = segment_size;
+        segment_.te_endpoint = segment_.name;
+        auto mount_ec = client_.MountSegment(segment_);
+        if (!mount_ec.has_value()) {
+            throw std::runtime_error("mount failed: " +
+                                     toString(mount_ec.error()));
+        }
+    }
+
+    ~RankChannel() {
+        auto result = client_.UnmountSegment(segment_.id);
+        if (!result.has_value()) {
+            LOG(ERROR) << "unmount failed for " << segment_.name;
+        }
+    }
+
+    RankChannel(const RankChannel&) = delete;
+    RankChannel& operator=(const RankChannel&) = delete;
+
+    mooncake::MasterClient& client() { return client_; }
+    uint64_t rank() const { return rank_; }
+    uintptr_t segment_base() const { return segment_base_; }
+    uint64_t segment_size() const { return segment_size_; }
+    Registry& registry() { return registry_; }
+
+    void Ping() { (void)client_.Ping(); }
+
+   private:
+    mooncake::MasterClient client_;
+    mooncake::Segment segment_;
+    uint64_t node_;
+    uint64_t slot_;
+    uint64_t rank_;
+    Registry& registry_;
+    uintptr_t segment_base_;
+    uint64_t segment_size_;
+};
+
+// Per-slot rendezvous shared by the rank threads of one request slot.
+struct SlotControl {
+    std::mutex mutex;
+    std::condition_variable cv;
+    uint64_t generation = 0;
+    uint64_t session = 0;
+    uint64_t round = 0;
+    std::atomic<uint64_t> pending{0};
+    std::atomic<bool> busy{false};
+    bool stop = false;
+};
+
+struct ValidationTotals {
+    uint64_t checked = 0;
+    uint64_t missing = 0;
+    uint64_t wrong_type = 0;
+    uint64_t wrong_size = 0;
+    uint64_t foreign_segment = 0;
+    uint64_t warmup_unexpected_hit = 0;
+    uint64_t warmup_put_failures = 0;
+    uint64_t warmup_get_failures = 0;
+};
+
+static std::string ObjectKey(const std::string& page_key, uint64_t rank,
+                             bool is_k) {
+    std::string key = page_key;
+    key += '_';
+    key += std::to_string(rank);
+    key += is_k ? "_k" : "_v";
+    return key;
+}
+
+static std::vector<std::string> BuildObjectKeys(
+    const std::vector<std::string>& page_keys, uint64_t begin, uint64_t end,
+    uint64_t rank) {
+    std::vector<std::string> keys;
+    keys.reserve((end - begin) * 2);
+    for (uint64_t i = begin; i < end; ++i) {
+        keys.push_back(ObjectKey(page_keys[i], rank, true));
+        keys.push_back(ObjectKey(page_keys[i], rank, false));
+    }
+    return keys;
+}
+
+// Result counters of one round of one rank, used by the expected-count oracle.
+struct RoundCounters {
+    uint64_t prefix_exists_rpcs = 0;
+    uint64_t get_rpcs = 0;
+    uint64_t prewrite_rpcs = 0;
+    uint64_t put_start_rpcs = 0;
+    uint64_t put_end_rpcs = 0;
+    uint64_t hits = 0;
+    uint64_t misses = 0;
+    uint64_t put_start_ok = 0;
+    uint64_t put_end_ok = 0;
+};
+
+static RoundCounters ExecuteRankRound(RankChannel& channel,
+                                      const Profile& profile,
+                                      const std::vector<std::string>& pages,
+                                      uint64_t round, Registry& registry,
+                                      const mooncake::ReplicateConfig& config) {
+    RoundCounters counters;
+    const uint64_t rank = channel.rank();
+    const uint64_t history_pages = profile.PagesBeforeRound(round);
+    const uint64_t total_pages = profile.PagesAtRound(round);
+
+    // Phase 1: prefix exists, 128 pages per RPC. A page counts as hit only when
+    // both its K and V objects exist; the first page that fails ends the
+    // contiguous hit range and no further batches are issued.
+    uint64_t contiguous_hit_pages = 0;
+    bool stop = false;
+    for (uint64_t begin = 0; begin < total_pages && !stop;
+         begin += profile.page_batch) {
+        const uint64_t end = std::min(begin + profile.page_batch, total_pages);
+        auto keys = BuildObjectKeys(pages, begin, end, rank);
+        const uint64_t batch_keys = keys.size();
+
+        auto start = Clock::now();
+        auto results = channel.client().BatchExistKey(keys);
+        const uint64_t elapsed = ElapsedNs(start);
+
+        GroupStats& stats =
+            registry.Get("prefix_exists", "BatchExistKey", batch_keys);
+        stats.rpc_count.fetch_add(1);
+        stats.logical_pages.fetch_add(end - begin);
+        stats.object_keys.fetch_add(batch_keys);
+        stats.RecordLatency(elapsed);
+        counters.prefix_exists_rpcs++;
+
+        for (uint64_t page = begin; page < end; ++page) {
+            const size_t offset = static_cast<size_t>(page - begin) * 2;
+            bool page_hit = true;
+            for (size_t component = 0; component < 2; ++component) {
+                const auto& result = results[offset + component];
+                if (!result.has_value()) {
+                    stats.error.fetch_add(1);
+                    page_hit = false;
+                } else if (result.value()) {
+                    stats.hit.fetch_add(1);
+                    counters.hits++;
+                } else {
+                    stats.miss.fetch_add(1);
+                    counters.misses++;
+                    page_hit = false;
+                }
+            }
+            if (page_hit) {
+                contiguous_hit_pages = page + 1;
+            } else {
+                stop = true;
+                break;
+            }
+        }
+    }
+
+    // Phase 2: replica metadata for the contiguous hit range.
+    for (uint64_t begin = 0; begin < contiguous_hit_pages;
+         begin += profile.page_batch) {
+        const uint64_t end =
+            std::min(begin + profile.page_batch, contiguous_hit_pages);
+        auto keys = BuildObjectKeys(pages, begin, end, rank);
+        const uint64_t batch_keys = keys.size();
+
+        auto start = Clock::now();
+        auto results = channel.client().BatchGetReplicaList(keys);
+        const uint64_t elapsed = ElapsedNs(start);
+
+        GroupStats& stats =
+            registry.Get("get_metadata", "BatchGetReplicaList", batch_keys);
+        stats.rpc_count.fetch_add(1);
+        stats.logical_pages.fetch_add(end - begin);
+        stats.object_keys.fetch_add(batch_keys);
+        stats.RecordLatency(elapsed);
+        counters.get_rpcs++;
+
+        for (const auto& result : results) {
+            if (!result.has_value()) {
+                stats.error.fetch_add(1);
+            } else {
+                stats.hit.fetch_add(1);
+                counters.hits++;
+            }
+        }
+    }
+
+    // Phase 3: pre-write dedup check on the pages added in this round.
+    auto new_keys = BuildObjectKeys(pages, history_pages, total_pages, rank);
+    const uint64_t new_batch_keys = new_keys.size();
+    {
+        auto start = Clock::now();
+        auto results = channel.client().BatchExistKey(new_keys);
+        const uint64_t elapsed = ElapsedNs(start);
+
+        GroupStats& stats =
+            registry.Get("prewrite_exists", "BatchExistKey", new_batch_keys);
+        stats.rpc_count.fetch_add(1);
+        stats.logical_pages.fetch_add(total_pages - history_pages);
+        stats.object_keys.fetch_add(new_batch_keys);
+        stats.RecordLatency(elapsed);
+        counters.prewrite_rpcs++;
+
+        for (const auto& result : results) {
+            if (!result.has_value()) {
+                stats.error.fetch_add(1);
+            } else if (result.value()) {
+                stats.hit.fetch_add(1);
+            } else {
+                stats.miss.fetch_add(1);
+                counters.misses++;
+            }
+        }
+    }
+
+    // Phase 4: allocate, then Phase 5: commit.
+    std::vector<std::vector<uint64_t>> slice_lengths(
+        new_batch_keys, std::vector<uint64_t>{profile.object_bytes});
+    std::vector<std::string> started;
+    {
+        auto start = Clock::now();
+        auto results =
+            channel.client().BatchPutStart(new_keys, slice_lengths, config);
+        const uint64_t elapsed = ElapsedNs(start);
+
+        GroupStats& stats =
+            registry.Get("put_start", "BatchPutStart", new_batch_keys);
+        stats.rpc_count.fetch_add(1);
+        stats.logical_pages.fetch_add(total_pages - history_pages);
+        stats.object_keys.fetch_add(new_batch_keys);
+        stats.RecordLatency(elapsed);
+        counters.put_start_rpcs++;
+
+        for (size_t i = 0; i < results.size(); ++i) {
+            if (results[i].has_value()) {
+                stats.start_ok.fetch_add(1);
+                started.push_back(new_keys[i]);
+                counters.put_start_ok++;
+                continue;
+            }
+            const auto error = results[i].error();
+            if (error == mooncake::ErrorCode::OBJECT_ALREADY_EXISTS) {
+                stats.start_exists.fetch_add(1);
+                started.push_back(new_keys[i]);
+            } else if (error == mooncake::ErrorCode::NO_AVAILABLE_HANDLE) {
+                stats.start_no_handle.fetch_add(1);
+                stats.start_fail.fetch_add(1);
+            } else {
+                stats.start_fail.fetch_add(1);
+            }
+        }
+    }
+
+    if (!started.empty()) {
+        std::vector<mooncake::ObjectMeta> object_metas;
+        object_metas.reserve(started.size());
+        for (const auto& key : started) {
+            object_metas.emplace_back(mooncake::ObjectMeta{key, std::nullopt});
+        }
+
+        auto start = Clock::now();
+        auto results = channel.client().BatchPutEnd(
+            object_metas, mooncake::ReplicaType::MEMORY);
+        const uint64_t elapsed = ElapsedNs(start);
+
+        GroupStats& stats =
+            registry.Get("put_end", "BatchPutEnd", started.size());
+        stats.rpc_count.fetch_add(1);
+        stats.logical_pages.fetch_add(total_pages - history_pages);
+        stats.object_keys.fetch_add(started.size());
+        stats.RecordLatency(elapsed);
+        counters.put_end_rpcs++;
+
+        for (const auto& result : results) {
+            if (result.has_value()) {
+                stats.end_ok.fetch_add(1);
+                counters.put_end_ok++;
+            } else {
+                stats.end_fail.fetch_add(1);
+            }
+        }
+    }
+
+    return counters;
+}
+
+static std::vector<std::string> BuildPageKeys(const Profile& profile,
+                                              uint64_t node, uint64_t session) {
+    const uint64_t total = profile.PagesAtRound(profile.rounds);
+    std::vector<std::string> pages;
+    pages.reserve(total);
+    for (uint64_t page = 1; page <= total; ++page) {
+        std::string material = "mc-sglang-master-v1";
+        material.push_back('\0');
+        material += FLAGS_model_config_digest;
+        material.push_back('\0');
+        material += std::to_string(FLAGS_seed);
+        material.push_back('\0');
+        material += std::to_string(node);
+        material.push_back('\0');
+        material += std::to_string(session);
+        material.push_back('\0');
+        material += std::to_string(page);
+        pages.push_back(HexSha256(material));
+    }
+    return pages;
+}
+
+struct NodeContext {
+    uint64_t node = 0;
+    std::vector<std::unique_ptr<RankChannel>> ranks;
+    std::vector<std::unique_ptr<SlotControl>> slots;
+    std::vector<std::vector<std::string>> pages;  // [session][page]
+    std::vector<std::thread> workers;
+    uint64_t active_window_ns = 0;
+    uint64_t logical_requests = 0;
+};
+
+static void WarmupChannel(RankChannel& channel, const Profile& profile,
+                          uint64_t objects_per_channel,
+                          ValidationTotals* totals) {
+    if (objects_per_channel == 0) return;
+    const uint64_t batch_objects = 16;
+    uint64_t done = 0;
+    uint64_t batch_id = 0;
+    while (done < objects_per_channel) {
+        const uint64_t count =
+            std::min(batch_objects, objects_per_channel - done);
+        std::vector<std::string> keys;
+        keys.reserve(count);
+        for (uint64_t i = 0; i < count; ++i) {
+            keys.push_back("sgw_" + std::to_string(channel.rank()) + "_" +
+                           std::to_string(batch_id) + "_" + std::to_string(i));
+        }
+        // Warmup traffic is reported separately and excluded from load totals.
+        auto exist_results = channel.client().BatchExistKey(keys);
+        if (totals != nullptr) {
+            for (const auto& result : exist_results) {
+                if (result.has_value() && result.value()) {
+                    totals->warmup_unexpected_hit++;
+                }
+            }
+        }
+
+        std::vector<std::vector<uint64_t>> slice_lengths(
+            keys.size(), std::vector<uint64_t>{profile.object_bytes});
+        mooncake::ReplicateConfig config;
+        config.replica_num = 1;
+        auto start_results =
+            channel.client().BatchPutStart(keys, slice_lengths, config);
+        std::vector<mooncake::ObjectMeta> metas;
+        for (size_t i = 0; i < start_results.size(); ++i) {
+            if (start_results[i].has_value()) {
+                metas.emplace_back(mooncake::ObjectMeta{keys[i], std::nullopt});
+            }
+        }
+        if (!metas.empty()) {
+            auto end_results = channel.client().BatchPutEnd(
+                metas, mooncake::ReplicaType::MEMORY);
+            for (const auto& result : end_results) {
+                if (!result.has_value() && totals != nullptr) {
+                    totals->warmup_put_failures++;
+                }
+            }
+        }
+        std::vector<std::string> committed;
+        committed.reserve(metas.size());
+        for (const auto& meta : metas) {
+            committed.push_back(meta.key);
+        }
+        if (!committed.empty()) {
+            auto get_results = channel.client().BatchGetReplicaList(committed);
+            for (const auto& result : get_results) {
+                if (!result.has_value() && totals != nullptr) {
+                    totals->warmup_get_failures++;
+                }
+            }
+        }
+        done += count;
+        batch_id++;
+    }
+}
+
+static void WorkerLoop(NodeContext& ctx, uint64_t slot_index, uint64_t rank,
+                       const Profile& profile, Registry& registry,
+                       const mooncake::ReplicateConfig& config) {
+    SlotControl& control = *ctx.slots[slot_index];
+    uint64_t seen = 0;
+    for (;;) {
+        uint64_t session = 0;
+        uint64_t round = 0;
+        {
+            std::unique_lock<std::mutex> lock(control.mutex);
+            control.cv.wait(lock, [&] {
+                return control.stop || control.generation != seen;
+            });
+            if (control.stop) {
+                return;
+            }
+            seen = control.generation;
+            session = control.session;
+            round = control.round;
+        }
+        ExecuteRankRound(*ctx.ranks[rank], profile, ctx.pages[session], round,
+                         registry, config);
+        if (control.pending.fetch_sub(1) == 1) {
+            control.busy.store(false, std::memory_order_release);
+        }
+    }
+}
+
+static void RunNodeRounds(NodeContext& ctx, const Profile& profile,
+                          Registry& registry,
+                          const mooncake::ReplicateConfig& config) {
+    std::mt19937_64 rng(static_cast<uint64_t>(FLAGS_seed) * 1000003ULL +
+                        ctx.node);
+    std::vector<uint64_t> order(profile.sessions);
+    std::iota(order.begin(), order.end(), 0ULL);
+    std::exponential_distribution<double> arrival(
+        static_cast<double>(FLAGS_request_rate));
+
+    const auto window_start = Clock::now();
+    for (uint64_t round = 1; round <= profile.rounds; ++round) {
+        std::shuffle(order.begin(), order.end(), rng);
+        auto next_dispatch = Clock::now();
+        for (uint64_t dispatched = 0; dispatched < order.size(); ++dispatched) {
+            int64_t free_slot = -1;
+            while (free_slot < 0) {
+                for (uint64_t s = 0; s < ctx.slots.size(); ++s) {
+                    if (!ctx.slots[s]->busy.load(std::memory_order_acquire)) {
+                        free_slot = static_cast<int64_t>(s);
+                        break;
+                    }
+                }
+                if (free_slot < 0) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                }
+            }
+            const auto now = Clock::now();
+            if (next_dispatch > now) {
+                std::this_thread::sleep_until(next_dispatch);
+            }
+            next_dispatch += std::chrono::duration_cast<Clock::duration>(
+                std::chrono::duration<double>(arrival(rng)));
+
+            SlotControl& control = *ctx.slots[free_slot];
+            {
+                std::lock_guard<std::mutex> guard(control.mutex);
+                control.session = order[dispatched];
+                control.round = round;
+                control.pending.store(profile.ranks);
+                control.busy.store(true, std::memory_order_release);
+                control.generation++;
+            }
+            control.cv.notify_all();
+            ctx.logical_requests++;
+        }
+
+        // Round barrier: the next round starts only after every slot is idle.
+        for (;;) {
+            bool all_idle = true;
+            for (auto& control : ctx.slots) {
+                if (control->busy.load(std::memory_order_acquire)) {
+                    all_idle = false;
+                    break;
+                }
+            }
+            if (all_idle) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    ctx.active_window_ns = ElapsedNs(window_start);
+}
+
+static ValidationTotals ValidateMeasuredKeys(
+    const Profile& profile, const std::vector<NodeContext>& contexts,
+    const std::string& master, uint64_t segment_size) {
+    ValidationTotals totals;
+    mooncake::MasterClient validator(mooncake::generate_uuid());
+    auto ec = validator.Connect(master);
+    if (ec != mooncake::ErrorCode::OK) {
+        LOG(ERROR) << "validation client failed to connect: " << toString(ec);
+        totals.missing = 1;
+        return totals;
+    }
+
+    const uint64_t batch_keys = 256;
+    for (const auto& ctx : contexts) {
+        for (uint64_t session = 0; session < profile.sessions; ++session) {
+            const auto& pages = ctx.pages[session];
+            std::vector<std::string> pending;
+            pending.reserve(batch_keys);
+            auto flush = [&]() {
+                if (pending.empty()) return;
+                auto results = validator.BatchGetReplicaList(pending);
+                for (size_t i = 0; i < results.size(); ++i) {
+                    totals.checked++;
+                    if (!results[i].has_value()) {
+                        totals.missing++;
+                        continue;
+                    }
+                    const auto& replicas = results[i].value().replicas;
+                    if (replicas.empty()) {
+                        totals.missing++;
+                        continue;
+                    }
+                    bool memory_found = false;
+                    for (const auto& replica : replicas) {
+                        if (!replica.is_memory_replica()) continue;
+                        memory_found = true;
+                        const auto& descriptor =
+                            replica.get_memory_descriptor();
+                        if (descriptor.buffer_descriptor.size_ !=
+                            profile.object_bytes) {
+                            totals.wrong_size++;
+                        }
+                        const uintptr_t address =
+                            descriptor.buffer_descriptor.buffer_address_;
+                        bool inside = false;
+                        for (uint64_t identity = 0;
+                             identity < profile.nodes * profile.ranks;
+                             ++identity) {
+                            const uintptr_t base =
+                                kSegmentBase + identity * segment_size;
+                            if (address >= base &&
+                                address < base + segment_size) {
+                                inside = true;
+                                break;
+                            }
+                        }
+                        if (!inside) {
+                            totals.foreign_segment++;
+                        }
+                    }
+                    if (!memory_found) {
+                        totals.wrong_type++;
+                    }
+                }
+                pending.clear();
+            };
+            for (uint64_t rank = 0; rank < profile.ranks; ++rank) {
+                for (uint64_t page = 0; page < pages.size(); ++page) {
+                    pending.push_back(ObjectKey(pages[page], rank, true));
+                    pending.push_back(ObjectKey(pages[page], rank, false));
+                    if (pending.size() >= batch_keys) flush();
+                }
+            }
+            flush();
+        }
+    }
+    return totals;
+}
+
+static int RunSglangHicache() {
+    if (FLAGS_page_tokens == 0 ||
+        FLAGS_tokens_per_round % FLAGS_page_tokens != 0) {
+        LOG(ERROR) << "tokens_per_round must be a multiple of page_tokens";
+        return 1;
+    }
+    if (FLAGS_node_count == 0 || FLAGS_request_rate == 0 ||
+        FLAGS_ranks_per_node == 0 || FLAGS_slots_per_node == 0 ||
+        FLAGS_session_count == 0 || FLAGS_round_count == 0) {
+        LOG(ERROR) << "nodes, rate, ranks, slots, sessions and rounds must be "
+                      "positive";
+        return 1;
+    }
+
+    Profile profile;
+    profile.nodes = FLAGS_node_count;
+    profile.sessions = FLAGS_session_count;
+    profile.rounds = FLAGS_round_count;
+    profile.ranks = FLAGS_ranks_per_node;
+    profile.slots = FLAGS_slots_per_node;
+    profile.pages_per_round = FLAGS_tokens_per_round / FLAGS_page_tokens;
+    profile.page_batch = FLAGS_page_batch;
+    profile.object_bytes = FLAGS_object_bytes;
+    profile.warmup_objects = FLAGS_warmup_objects_per_node;
+
+    const uint64_t identities = profile.nodes * profile.ranks;
+    LOG(INFO) << "sglang_hicache: nodes=" << profile.nodes
+              << " sessions=" << profile.sessions
+              << " rounds=" << profile.rounds
+              << " pages_per_round=" << profile.pages_per_round
+              << " ranks=" << profile.ranks << " slots=" << profile.slots
+              << " identities=" << identities
+              << " object_bytes=" << profile.object_bytes;
+
+    Registry registry;
+    mooncake::ReplicateConfig config;
+    config.replica_num = 1;
+
+    std::vector<NodeContext> contexts(profile.nodes);
+    for (uint64_t node = 0; node < profile.nodes; ++node) {
+        NodeContext& ctx = contexts[node];
+        ctx.node = node;
+        ctx.ranks.reserve(profile.ranks);
+        for (uint64_t rank = 0; rank < profile.ranks; ++rank) {
+            const uint64_t identity = node * profile.ranks + rank;
+            const uintptr_t base = kSegmentBase + identity * FLAGS_segment_size;
+            ctx.ranks.push_back(std::make_unique<RankChannel>(
+                FLAGS_master_server, node, 0, rank, base, FLAGS_segment_size,
+                registry));
+        }
+        ctx.slots.reserve(profile.slots);
+        for (uint64_t slot = 0; slot < profile.slots; ++slot) {
+            ctx.slots.push_back(std::make_unique<SlotControl>());
+        }
+        ctx.pages.reserve(profile.sessions);
+        for (uint64_t session = 0; session < profile.sessions; ++session) {
+            ctx.pages.push_back(BuildPageKeys(profile, node, session));
+        }
+    }
+    LOG(INFO) << "mounted " << identities << " segments";
+
+    // Master offboards idle clients after client_active_ttl_sec, which unmounts
+    // their segments. Keep every rank identity alive for the whole replay.
+    std::jthread heartbeat([&contexts](std::stop_token stop) {
+        while (!stop.stop_requested()) {
+            for (auto& ctx : contexts) {
+                for (auto& channel : ctx.ranks) {
+                    channel->Ping();
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+    });
+
+    const uint64_t channels_per_node = profile.slots * profile.ranks;
+    // Warmup keys are per rank identity, and each identity serves every request
+    // slot, so one identity warms up slots * (objects / (slots * ranks)).
+    const uint64_t warmup_per_channel =
+        profile.warmup_objects / std::max<uint64_t>(1, channels_per_node) *
+        profile.slots;
+    LOG(INFO) << "warming up " << profile.warmup_objects
+              << " objects per node (" << warmup_per_channel
+              << " per rank identity across " << profile.ranks
+              << " identities)";
+    ValidationTotals warmup_totals;
+    for (auto& ctx : contexts) {
+        for (auto& channel : ctx.ranks) {
+            WarmupChannel(*channel, profile, warmup_per_channel,
+                          &warmup_totals);
+        }
+    }
+    LOG(INFO) << "warmup done: unexpected_hit="
+              << warmup_totals.warmup_unexpected_hit
+              << " put_failures=" << warmup_totals.warmup_put_failures
+              << " get_failures=" << warmup_totals.warmup_get_failures;
+
+    for (auto& ctx : contexts) {
+        for (uint64_t slot = 0; slot < profile.slots; ++slot) {
+            for (uint64_t rank = 0; rank < profile.ranks; ++rank) {
+                ctx.workers.emplace_back(WorkerLoop, std::ref(ctx), slot, rank,
+                                         std::cref(profile), std::ref(registry),
+                                         std::cref(config));
+            }
+        }
+    }
+
+    std::vector<std::thread> schedulers;
+    schedulers.reserve(contexts.size());
+    for (auto& ctx : contexts) {
+        schedulers.emplace_back(RunNodeRounds, std::ref(ctx),
+                                std::cref(profile), std::ref(registry),
+                                std::cref(config));
+    }
+    for (auto& scheduler : schedulers) scheduler.join();
+
+    for (auto& ctx : contexts) {
+        for (auto& control : ctx.slots) {
+            {
+                std::lock_guard<std::mutex> guard(control->mutex);
+                control->stop = true;
+            }
+            control->cv.notify_all();
+        }
+        for (auto& worker : ctx.workers) worker.join();
+    }
+
+    uint64_t active_window_ns = 0;
+    uint64_t logical_requests = 0;
+    for (const auto& ctx : contexts) {
+        active_window_ns = std::max(active_window_ns, ctx.active_window_ns);
+        logical_requests += ctx.logical_requests;
+    }
+
+    ValidationTotals validation;
+    if (!FLAGS_disable_validation) {
+        LOG(INFO) << "validating measured keys...";
+        validation = ValidateMeasuredKeys(
+            profile, contexts, FLAGS_master_server, FLAGS_segment_size);
+        LOG(INFO) << "validation: checked=" << validation.checked
+                  << " missing=" << validation.missing
+                  << " wrong_type=" << validation.wrong_type
+                  << " wrong_size=" << validation.wrong_size
+                  << " foreign_segment=" << validation.foreign_segment;
+    }
+
+    // Expected counts from the profile, used to cross-check the generator.
+    uint64_t expected_prefix_rpcs = 0;
+    uint64_t expected_get_rpcs = 0;
+    uint64_t expected_per_round_rpcs = 0;
+    for (uint64_t round = 1; round <= profile.rounds; ++round) {
+        expected_prefix_rpcs += profile.Batches(profile.PagesAtRound(round));
+        expected_get_rpcs += profile.Batches(profile.PagesBeforeRound(round));
+    }
+    expected_prefix_rpcs *= profile.sessions * profile.ranks * profile.nodes;
+    expected_get_rpcs *= profile.sessions * profile.ranks * profile.nodes;
+    expected_per_round_rpcs =
+        profile.sessions * profile.ranks * profile.nodes * profile.rounds;
+
+    uint64_t business_rpcs = 0;
+    uint64_t total_errors = 0;
+    std::ostringstream table;
+    table << "\nphase,rpc,batch_keys,rpcs,items,p50_ms,p95_ms,p99_ms,max_ms\n";
+    registry.ForEach([&](const GroupKey& key, GroupStats& stats) {
+        auto latencies = stats.Latencies();
+        std::sort(latencies.begin(), latencies.end());
+        const uint64_t rpcs = stats.rpc_count.load();
+        business_rpcs += rpcs;
+        total_errors += stats.error.load();
+        table << key.phase << "," << key.rpc << "," << key.batch_keys << ","
+              << rpcs << "," << stats.object_keys.load() << "," << std::fixed
+              << std::setprecision(3) << Percentile(latencies, 0.50) << ","
+              << Percentile(latencies, 0.95) << ","
+              << Percentile(latencies, 0.99) << ","
+              << (latencies.empty()
+                      ? 0.0
+                      : static_cast<double>(latencies.back()) / 1e6)
+              << "\n";
+    });
+    std::cout << table.str() << std::flush;
+
+    if (!FLAGS_result_file.empty()) {
+        std::ofstream out(FLAGS_result_file);
+        if (!out.is_open()) {
+            LOG(ERROR) << "cannot open result file " << FLAGS_result_file;
+        } else {
+            out << table.str();
+            out.close();
+            LOG(INFO) << "results written to " << FLAGS_result_file;
+        }
+    }
+
+    const double active_seconds = active_window_ns / 1e9;
+    LOG(INFO) << "business_rpcs=" << business_rpcs
+              << " expected_prefix=" << expected_prefix_rpcs
+              << " expected_get=" << expected_get_rpcs
+              << " expected_per_round=" << expected_per_round_rpcs;
+    LOG(INFO) << "logical_requests=" << logical_requests
+              << " active_window_s=" << active_seconds << " active_rpc_per_sec="
+              << (active_seconds > 0 ? business_rpcs / active_seconds : 0.0);
+
+    bool ok = true;
+    if (business_rpcs != expected_prefix_rpcs + expected_get_rpcs +
+                             3 * expected_per_round_rpcs) {
+        LOG(ERROR) << "RPC count does not match the expected workload";
+        ok = false;
+    }
+    if (total_errors != 0) {
+        LOG(ERROR) << "unexpected RPC errors: " << total_errors;
+        ok = false;
+    }
+    if (!FLAGS_disable_validation &&
+        (validation.missing || validation.wrong_type || validation.wrong_size ||
+         validation.foreign_segment)) {
+        LOG(ERROR) << "validation failed";
+        ok = false;
+    }
+
+    LOG(INFO) << (ok ? "sglang_hicache replay finished OK"
+                     : "sglang_hicache replay finished with failures");
+    return ok ? 0 : 1;
+}
+
+}  // namespace sglang_hicache
+
 int main(int argc, char** argv) {
     std::vector<std::unique_ptr<SegmentClient>> segment_clients;
     std::mutex segment_clients_mutex;
@@ -374,6 +1337,17 @@ int main(int argc, char** argv) {
     FLAGS_logtostderr = true;
 
     gflags::ParseCommandLineFlags(&argc, &argv, false);
+
+    if (!FLAGS_workload.empty()) {
+        if (FLAGS_workload != "sglang_hicache") {
+            LOG(ERROR) << "unknown workload profile: " << FLAGS_workload;
+            google::ShutdownGoogleLogging();
+            return 1;
+        }
+        const int result = sglang_hicache::RunSglangHicache();
+        google::ShutdownGoogleLogging();
+        return result;
+    }
 
     ping_thread = std::jthread([&](std::stop_token stop_token) {
         static const auto OneSecond = std::chrono::seconds(1);

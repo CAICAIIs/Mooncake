@@ -61,10 +61,6 @@ endif()
 
 # Add subdirectories
 add_subdirectory(src)
-if(BUILD_BENCHMARK)
-  add_subdirectory(tools/traffic)
-endif()
-
 if (STORE_USE_ETCD)
     add_subdirectory(tools)
 endif()
