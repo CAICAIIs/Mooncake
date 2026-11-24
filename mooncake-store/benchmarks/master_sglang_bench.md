@@ -104,13 +104,32 @@ zero RPC errors.
 | put_end | BatchPutEnd | 64 | 6,400 | 0.501 | 2.625 |
 | put_start | BatchPutStart | 64 | 6,400 | 2.946 | 5.194 |
 
-## Comparing a PR with its base
+## Release gate
 
-Run the same command against the base and the PR build on the same Master and
-same machine. Compare the per-phase p50, p95, and p99 columns, plus the final
-`business_rpcs` and `active_rpc_per_sec` lines. The workload is deterministic
-for a fixed `--seed`, so a difference in RPC counts or validation totals points
-to a correctness regression before latency is considered.
+Run the same workload against the base and the PR Master on the same machine,
+restarting the Master between runs. Collect at least three CSV files per side;
+the gate uses the median of each group so a single noisy run cannot pass or fail
+the check.
+
+```bash
+python3 mooncake-store/benchmarks/master_sglang_gate.py \
+  --baseline-dir baseline/ --baseline-commit <base-sha> \
+  --current-dir current/ --current-commit <head-sha> \
+  --min-runs 3 \
+  --max-p50-regression-pct 5 \
+  --max-p99-regression-pct 10
+```
+
+Each CSV must come from a successful `master_bench` run. The gate requires the
+same `(phase, rpc, batch_keys)` groups and identical RPC/item counts on both
+sides, then fails when the median p50 regresses more than the p50 limit or the
+median p99 regresses more than the p99 limit. Exit code 0 means pass, 1 means a
+performance or count regression, and 2 means invalid input. The JSON report
+contains the per-group medians and percentage changes.
+
+The benchmark itself still enforces correctness: it exits nonzero on RPC count
+mismatch, RPC errors, or replica validation failures. The gate compares
+performance only after both sides finish successfully.
 
 ## Scope and limits
 
