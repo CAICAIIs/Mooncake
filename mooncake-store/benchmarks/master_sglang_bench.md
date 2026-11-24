@@ -87,22 +87,22 @@ phase,rpc,batch_keys,rpcs,items,p50_ms,p95_ms,p99_ms,max_ms
 
 One node on the dgx host (2x EPYC 7742, 1007 GiB RAM, TCP), Master with 16 RPC
 threads, 8 x 128 GiB synthetic segments, offset allocator, eviction disabled:
-40,320 business RPCs in 48.68 s, 828.3 RPC/s; 409,600/409,600 objects validated;
+40,320 business RPCs in 48.69 s, 828.1 RPC/s; 409,600/409,600 objects validated;
 zero RPC errors.
 
 | phase | rpc | batch keys | RPCs | p50 ms | p99 ms |
 | --- | --- | ---: | ---: | ---: | ---: |
-| get | BatchGetReplicaList | 64 | 1,920 | 0.591 | 2.388 |
-| get | BatchGetReplicaList | 128 | 1,280 | 0.897 | 2.925 |
-| get | BatchGetReplicaList | 192 | 1,280 | 1.283 | 3.147 |
-| get | BatchGetReplicaList | 256 | 5,120 | 1.589 | 3.750 |
-| prefix | BatchExistKey | 64 | 1,920 | 0.514 | 1.735 |
-| prefix | BatchExistKey | 128 | 1,920 | 0.873 | 2.357 |
-| prefix | BatchExistKey | 192 | 1,280 | 1.298 | 2.588 |
-| prefix | BatchExistKey | 256 | 6,400 | 1.753 | 4.414 |
-| prewrite | BatchExistKey | 64 | 6,400 | 0.343 | 2.477 |
-| put_end | BatchPutEnd | 64 | 6,400 | 0.490 | 2.358 |
-| put_start | BatchPutStart | 64 | 6,400 | 2.761 | 4.795 |
+| get | BatchGetReplicaList | 64 | 1,920 | 0.600 | 2.327 |
+| get | BatchGetReplicaList | 128 | 1,280 | 0.927 | 3.042 |
+| get | BatchGetReplicaList | 192 | 1,280 | 1.303 | 3.119 |
+| get | BatchGetReplicaList | 256 | 5,120 | 1.598 | 3.658 |
+| prefix | BatchExistKey | 64 | 1,920 | 0.535 | 2.267 |
+| prefix | BatchExistKey | 128 | 1,920 | 0.887 | 2.188 |
+| prefix | BatchExistKey | 192 | 1,280 | 1.337 | 7.526 |
+| prefix | BatchExistKey | 256 | 6,400 | 1.748 | 3.923 |
+| prewrite | BatchExistKey | 64 | 6,400 | 0.356 | 2.609 |
+| put_end | BatchPutEnd | 64 | 6,400 | 0.501 | 2.625 |
+| put_start | BatchPutStart | 64 | 6,400 | 2.946 | 5.194 |
 
 ## Comparing a PR with its base
 
